@@ -1,0 +1,13 @@
+<<<<<<< HEAD
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/# secrets\n.env\n.env.*\n# venv\nenv/\n.env
+=======
+*.env
+.env
+.env.local
+.env.*.local
+>>>>>>> b42d421bade595c1fc38cf6d78f0afadd13d89cf
+.env
