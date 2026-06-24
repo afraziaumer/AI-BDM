@@ -1,13 +1,19 @@
-<<<<<<< HEAD
-.env
-__pycache__/
-*.pyc
-.venv/
-venv/# secrets\n.env\n.env.*\n# venv\nenv/\n.env
-=======
-*.env
+# secrets
 .env
 .env.local
 .env.*.local
->>>>>>> b42d421bade595c1fc38cf6d78f0afadd13d89cf
-.env
+*.env
+api.env
+
+# python
+__pycache__/
+*.pyc
+
+# virtualenvs
+.venv/
+venv/
+env/
+
+# pipeline output / caches
+scavenger_leads_cache.csv
+results.json
