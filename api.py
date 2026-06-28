@@ -48,6 +48,9 @@ class PipelineRequest(BaseModel):
 class LeadSummary(BaseModel):
     company_name: str
     website_url: str
+    page_url: str
+    page_title: str = ""
+    meta_description: str = ""
     email: str
     phone_number: str
     physical_address: str
@@ -69,6 +72,9 @@ def _read_leads(include_text: bool, limit: Optional[int]) -> List[Dict[str, Any]
                 {
                     "company_name": row.get("company_name", "N/A"),
                     "website_url": row.get("website_url", "N/A"),
+                    "page_url": row.get("page_url", row.get("website_url", "N/A")),
+                    "page_title": row.get("page_title", ""),
+                    "meta_description": row.get("meta_description", ""),
                     "email": row.get("email", "N/A"),
                     "phone_number": row.get("phone_number", "N/A"),
                     "physical_address": row.get("physical_address", "N/A"),
