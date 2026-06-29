@@ -102,6 +102,29 @@ management", "hubspot", "salesforce", "zoho crm", "pipedrive", etc.
   E. Detect POSITIVE constraints (must have / with / using / that offer) \
 -> include_keywords. Expand each.
   F. Decide intent: "find" if there are no constraints, else "find_and_filter".
+  G. Classify SEARCH TYPE into search_type:
+     - "specific": the request targets ONE named business or a website/domain \
+(e.g. "xyzmarina.com", "info on Blue Bay Marina", "is acme-marina.com using a \
+CRM?"). When a domain/URL is present, put the bare domain (no scheme, no path, \
+no www) in target_domain, e.g. "xyzmarina.com". If only a business name is given \
+with no domain, set target_domain to "".
+     - "general": a category + place that should return MANY businesses \
+(e.g. "marinas in Dubai", "give me 50 pizza shops in NYC"). Set target_domain "".
+  H. Determine country_code: ISO 3166-1 alpha-2 for the geo_location (e.g. "US", \
+"AE", "GB", "AU", "SG"). Use "" when unknown or multiple countries.
+  I. Generate phone_regex: a Python regex string (no flags, no re.compile wrapper) \
+that matches the standard phone formats for that specific country. Rules:
+     - Use look-around boundaries (?<!\\d) / (?!\\d) so zip codes or version \
+numbers cannot be mistaken for phone numbers. A digit-only blob like "77586" \
+or "1998-2026" must NOT match.
+     - Handle the optional country prefix AND the local format (with/without the \
+leading zero or area code in parentheses).
+     - Cover mobile AND landline formats for that country.
+     - US  : r"(?:(?:\\+1|1)[\\s.\\-]?)?(?<!\\d)(?:\\([2-9]\\d{2}\\)|[2-9]\\d{2})[\\s.\\-]?[2-9]\\d{2}[\\s.\\-]?\\d{4}(?!\\d)"
+     - UAE : r"(?:\\+971|00971|0)[\\s.\\-]?(?:2|3|4|6|7|9|5[024568])[\\s.\\-]?\\d{3}[\\s.\\-]?\\d{4}(?!\\d)"
+     - UK  : r"(?:\\+44|0)[\\s.\\-]?(?:7\\d{9}|[1-9]\\d{8,9})(?!\\d)"
+     (The double-backslash is required because these are JSON string values.)
+     The regex will be compiled with re.IGNORECASE | re.MULTILINE by the pipeline.
 
 Output rules: respond with ONLY a single valid JSON object. No markdown, no prose.
 """
@@ -112,7 +135,11 @@ PLANNER_EXAMPLE = {
     "broad_industry": "marina",
     "search_query": "marinas in Miami",
     "result_limit": 20,
+    "search_type": "general",
+    "target_domain": "",
     "intent": "find_and_filter",
+    "country_code": "US",
+    "phone_regex": r"(?:(?:\+1|1)[\s.\-]?)?(?<!\d)(?:\([2-9]\d{2}\)|[2-9]\d{2})[\s.\-]?[2-9]\d{2}[\s.\-]?\d{4}(?!\d)",
     "exclude_keywords": [
         "smart monitoring", "remote monitoring", "real-time monitoring",
         "iot", "internet of things", "sensors", "telemetry",
@@ -136,7 +163,11 @@ def plan_query(user_query: str) -> Dict[str, Any]:
       broad_industry    - singular business category to search for
       search_query      - natural Google web-search query for Serper discovery
       result_limit      - how many businesses to pull (from the query; default 20)
+      search_type       - "general" (category+place) or "specific" (one business)
+      target_domain     - bare domain for a specific search, else ""
       intent            - "find" or "find_and_filter"
+      country_code      - ISO 3166-1 alpha-2 for the location ("US", "AE", …)
+      phone_regex       - Python regex matching that country's phone formats
       exclude_keywords  - expanded lowercase phrases that DISqualify a lead
       include_keywords  - expanded lowercase phrases that a lead should mention
       reasoning         - short note on how the query was interpreted

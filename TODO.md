@@ -1,3 +1,15 @@
+## Scrap.do + data governance + search behavior (latest)
+- [x] Scrap.do as Tier-2 (token/url/render/super), reads `scrapedo` or `zenrows`; verified live
+- [x] CSV schema: added `date_added` (ISO-8601 UTC) and separate `raw_html` column
+- [x] Planner: `search_type` (general|specific) + `target_domain`; domain-in-query fallback
+- [x] General search excludes existing DB domains -> finds NEW businesses each run
+- [x] Specific search (domain) is DB-first -> returns existing record without re-scraping
+- [x] New data_pipeline.py: profiling, cleaning, dedup, transform, exploration, governance
+      -> canonical store + leads_clean.csv (readable) + leads_quarantine.csv + report.txt
+- [x] Migrated/cleaned the existing store (188 raw -> 159 valid businesses; .bak kept)
+- [ ] Discovery noise: stock-photo/webcam/hotel pages still slip in (relevance filter OFF).
+      Flip LEAD_FILTERING_ENABLED=True in phase1_pipeline.py to LLM-filter them.
+
 ## LLM_planner.py
 - [x] Move Groq calls under CLI entrypoints (get_client) to prevent import-time execution
 - [x] Add CLI flags: --test-api and --plan "<query>"
