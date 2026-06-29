@@ -77,12 +77,12 @@ SCRAPEDO_URL = "https://api.scrape.do/"
 
 # Tunable operational parameters (kept as named constants, not magic numbers).
 DEFAULT_RESULT_LIMIT = 20        # used when the query/plan specifies no count
-MAX_SEARCH_PAGES = 12            # cap on Serper web-search pagination
+MAX_SEARCH_PAGES = 10            # always sweep the top 10 Google (Serper) pages
 SEARCH_RESULTS_PER_PAGE = 10     # Serper returns ~10 organic results per page
 MAX_DIRECTORIES_TO_HARVEST = 6   # cap directory pages we crawl for outbound links
 SERPER_TIMEOUT_S = 15            # discovery requests
 NATIVE_FETCH_TIMEOUT_S = 12      # Tier-1 free request
-SCRAPEDO_TIMEOUT_S = 45          # Tier-2 proxied + JS render (slower by design)
+SCRAPEDO_TIMEOUT_S = 30          # Tier-2 proxied + JS render (give up if slower)
 HTTP_OK = (200, 201)
 HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 
@@ -94,8 +94,8 @@ MAX_CRAWL_DEPTH = 2              # homepage = depth 0; how many link-hops deep
 # Over-discovery: the requested count is a target of QUALIFIED leads, not raw
 # candidates. Since shops/aggregators/failures get filtered out, pull a larger
 # candidate pool and stop once enough real leads are collected.
-CANDIDATE_OVERFETCH = 3          # discover up to this many candidates per wanted lead
-MAX_CANDIDATE_POOL = 60          # absolute cap on candidates processed (safety)
+CANDIDATE_OVERFETCH = 3          # (unused while top-10-pages sweep is on)
+MAX_CANDIDATE_POOL = 100         # absolute cap on candidates scraped per run (safety)
 
 # Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
 # the LLM relevance classifier (Step 5.5). Turned OFF for now: we want the most
@@ -492,8 +492,11 @@ async def execute_scavenger_scrape(
                 return {"html": body, "method": "SCRAPEDO"}
             logger.error("Tier-2 Scrape.do failed (status=%s): %s", resp.status, target_url)
             return {"html": "", "method": "FAILED"}
+    except asyncio.TimeoutError:
+        logger.error("Tier-2 Scrape.do timed out (>%ss): %s", SCRAPEDO_TIMEOUT_S, target_url)
+        return {"html": "", "method": "FAILED"}
     except Exception as exc:  # noqa: BLE001
-        logger.error("Tier-2 Scrape.do error for %s: %s", target_url, exc)
+        logger.error("Tier-2 Scrape.do error for %s: %s", target_url, repr(exc))
         return {"html": "", "method": "FAILED"}
 
 
@@ -585,6 +588,28 @@ async def crawl_site(
 
 
 # === Step 4: Local CSV storage =============================================
+_MOJIBAKE_MARKERS = ("Ã", "Ð", "Ñ", "Â", "â€", "Å", "Ÿ")
+
+
+def _fix_mojibake(text: str) -> str:
+    """Repair double-encoded text (e.g. 'Ð¡Ñ‚Ð°Ñ‚Ð¸Ð¸' -> 'Статии').
+
+    Some sites serve UTF-8 text that was already mis-decoded as Windows-1252,
+    producing garbled accented/Cyrillic characters. This reverses that by
+    re-encoding to cp1252 and decoding as UTF-8 — but only keeps the result if
+    it actually reduces the mojibake, so clean text is never corrupted.
+    """
+    if not text or not any(m in text for m in _MOJIBAKE_MARKERS):
+        return text
+    try:
+        repaired = text.encode("cp1252", "ignore").decode("utf-8", "ignore")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    before = sum(text.count(m) for m in _MOJIBAKE_MARKERS)
+    after = sum(repaired.count(m) for m in _MOJIBAKE_MARKERS)
+    return repaired if after < before else text
+
+
 def extract_page_fields(html: str) -> Dict[str, str]:
     """Extract a page's content WITHOUT dropping anything useful.
 
@@ -617,11 +642,19 @@ def extract_page_fields(html: str) -> Dict[str, str]:
     for tag in soup(_NOISE_TAGS):
         tag.decompose()
 
-    page_text = " ".join(soup.get_text(separator=" ").split())
+    # Keep line structure so callers can de-duplicate the boilerplate that
+    # repeats across a site's pages (menu/header/footer). Blanks dropped.
+    # Each line is repaired for mojibake (double-encoded UTF-8) along the way.
+    lines = [
+        _fix_mojibake(" ".join(ln.split()))
+        for ln in soup.get_text(separator="\n").split("\n")
+        if ln.strip()
+    ]
     return {
-        "page_title": title,
-        "meta_description": meta_desc,
-        "page_text": page_text,
+        "page_title": _fix_mojibake(title),
+        "meta_description": _fix_mojibake(meta_desc),
+        "page_text": " ".join(lines),
+        "lines": lines,
     }
 
 
@@ -753,6 +786,37 @@ def _lead_to_row(lead: Dict[str, Any]) -> List[str]:
         lead.get("scrape_source_method", "FAILED"),
         str(lead.get("page_text", "")),
     ]
+
+
+def _dedupe_shared_lines(
+    page_records: List[Dict[str, Any]], page_lines: List[List[str]]
+) -> None:
+    """Strip boilerplate (menu/header/footer) that repeats across a site's pages.
+
+    A line that appears on at least half of the pages is treated as shared
+    template text. It's removed from every page EXCEPT the first (homepage),
+    which keeps the full text — so the site's shared content is stored once
+    instead of duplicated on every page. Modifies page_records in place.
+    """
+    n = len(page_records)
+    if n < 3:  # too few pages for repetition to be a problem
+        return
+
+    from collections import Counter
+    doc_freq: Counter = Counter()
+    for lines in page_lines:
+        for line in set(lines):
+            doc_freq[line] += 1
+
+    threshold = max(2, (n + 1) // 2)  # appears on >= ~half the pages
+    shared = {line for line, freq in doc_freq.items() if freq >= threshold}
+    if not shared:
+        return
+
+    # Homepage (index 0) keeps everything; subpages keep only unique lines.
+    for i in range(1, n):
+        unique = [line for line in page_lines[i] if line not in shared]
+        page_records[i]["page_text"] = " ".join(unique)
 
 
 def append_records_to_csv(records: List[Dict[str, Any]]) -> None:
@@ -963,9 +1027,10 @@ async def process_single_lead(
                     "method": "FAILED"}
         pages = await crawl_site(session, url, root["html"], root["method"])
 
-    # Build one row per page, then write them as a single contiguous block.
+    # Build one row per page (keeping each page's lines for de-duplication).
     combined_parts: List[str] = []
     page_records: List[Dict[str, Any]] = []
+    page_lines: List[List[str]] = []
     email = phone = None
     for page in pages:
         fields = extract_page_fields(page["html"])
@@ -989,12 +1054,19 @@ async def process_single_lead(
                 "page_text": page_text,
             }
         )
+        page_lines.append(fields["lines"])
         combined_parts.append(page_text)
 
     if not page_records:
         logger.warning("No readable content on any page of %s", url)
         return {"company_name": name, "website_url": url, "status": "failed",
                 "method": root["method"]}
+
+    # De-duplicate boilerplate: lines that repeat across most of a site's pages
+    # (menu/header/footer) are stripped from every page EXCEPT the homepage, so
+    # each row keeps only its unique content. The homepage keeps the full text,
+    # so nothing is lost — just no longer repeated 20x.
+    _dedupe_shared_lines(page_records, page_lines)
 
     # Evaluate BEFORE persisting. With filtering enabled, only real qualified
     # leads are stored; with it disabled, every scraped business is kept.
@@ -1066,10 +1138,10 @@ async def run_pipeline(
         query = plan.get("search_query") or (
             f"{plan.get('broad_industry', '')} in {plan.get('geo_location', '')}".strip()
         )
-        # Over-discover: pull a larger candidate pool because filtering will
-        # drop shops/aggregators/failures before we reach the wanted count.
-        pool_size = min(effective_limit * CANDIDATE_OVERFETCH, MAX_CANDIDATE_POOL)
-        targets = await discover_targets(session, query, pool_size)
+        # Always sweep the top 10 Google (Serper) pages for every query, so the
+        # candidate pool is as wide as possible regardless of the requested
+        # count. Capped at MAX_CANDIDATE_POOL for safety.
+        targets = await discover_targets(session, query, MAX_CANDIDATE_POOL)
         summary["discovered"] = len(targets)
         if not targets:
             logger.critical("No candidate businesses found. Halting pipeline.")
@@ -1086,18 +1158,12 @@ async def run_pipeline(
                 and (r.get("classification") or {}).get("category", "match") == "match"
             )
 
-        # Process the pool in concurrency-sized batches, stopping as soon as we
-        # have `effective_limit` real leads (so we don't scrape more than needed).
-        logger.info(
-            "Targeting %d qualified leads from a pool of %d candidates.",
-            effective_limit, len(targets),
-        )
+        # Scrape EVERY discovered candidate from the top search pages — no early
+        # stop on the requested count, for maximum coverage per query.
+        logger.info("Scraping all %d discovered candidates.", len(targets))
         results: List[Dict[str, Any]] = []
-        leads_found = 0
-        idx = 0
-        while idx < len(targets) and leads_found < effective_limit:
+        for idx in range(0, len(targets), concurrency):
             batch = targets[idx : idx + concurrency]
-            idx += len(batch)
             batch_results = await asyncio.gather(*[
                 process_single_lead(
                     session, semaphore, target, cache, exclude_keywords,
@@ -1106,17 +1172,10 @@ async def run_pipeline(
                 for target in batch
             ])
             results.extend(batch_results)
-            leads_found += sum(1 for r in batch_results if _is_lead(r))
             logger.info(
-                "Progress: %d/%d qualified leads after %d candidates processed.",
-                leads_found, effective_limit, len(results),
-            )
-
-        if leads_found < effective_limit:
-            logger.warning(
-                "Candidate pool exhausted: found %d of %d wanted leads "
-                "(only %d real businesses existed in this niche).",
-                leads_found, effective_limit, leads_found,
+                "Processed %d/%d candidates (%d qualified so far).",
+                len(results), len(targets),
+                sum(1 for r in results if _is_lead(r)),
             )
 
     summary["processed"] = len(results)
@@ -1126,10 +1185,8 @@ async def run_pipeline(
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     summary["counts"] = counts
 
-    # Step 5 + 5.5 — the deliverable: leads that passed keyword qualification
-    # AND were classified as a real single business ("match"), not a product
-    # shop / aggregator / unrelated site. Truncate to the requested count (the
-    # final batch may have pushed us a lead or two past the target).
+    # The deliverable: every candidate that passed (with filtering off, that's
+    # all successfully scraped businesses). No truncation — we keep them all.
     qualified = [
         {
             "company_name": r.get("company_name"),
@@ -1140,7 +1197,7 @@ async def run_pipeline(
         }
         for r in results
         if _is_lead(r)
-    ][:effective_limit]
+    ]
     summary["qualified"] = qualified
     summary["qualified_count"] = len(qualified)
     # Leads keyword-qualified but filtered out by the relevance classifier.
