@@ -172,6 +172,61 @@ def plan_query(user_query: str) -> Dict[str, Any]:
         raise
 
 
+VALID_CATEGORIES = ("match", "product_shop", "aggregator", "unrelated")
+
+
+def classify_business(
+    industry: str, geo: str, name: str, page_text: str
+) -> Dict[str, str]:
+    """Classify a scraped website by relevance to the lead request.
+
+    Returns {"category", "reason"} where category is one of:
+      match        - a single real `industry` business (a usable lead)
+      product_shop - primarily an online store selling products, not a service
+      aggregator   - a directory / marketplace / booking platform listing many
+      unrelated    - not an `industry` business at all
+
+    On any malformed/uncertain output we default to "match" so a classifier
+    hiccup never silently discards a real lead.
+    """
+    snippet = (page_text or "")[:1500]  # cap tokens; the gist is near the top
+    system = (
+        "You are the Lead Relevance Classifier for a B2B lead-generation "
+        f"pipeline. The salesperson wants individual '{industry}' businesses in "
+        f"'{geo}' that they can contact and sell to.\n\n"
+        "Classify the website into EXACTLY one category:\n"
+        f"  - \"match\": a single real {industry} business that provides its own "
+        "services at its own location(s) — a usable lead.\n"
+        "  - \"product_shop\": primarily an online store selling physical products "
+        "(cart, checkout, 'add to cart', shipping), not a service business.\n"
+        "  - \"aggregator\": a directory, marketplace, or booking platform that "
+        "lists or books MANY different businesses (e.g. 'find and book near you').\n"
+        f"  - \"unrelated\": not a {industry} business at all.\n\n"
+        'Respond with ONLY JSON: {"category": "...", "reason": "<one short line>"}.'
+    )
+    user = f"BUSINESS NAME: {name}\n\nWEBSITE TEXT:\n{snippet}"
+
+    client = get_client()
+    text = call_llm(
+        client,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+    )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        data = json.loads(text[start : end + 1]) if start != -1 and end > start else {}
+
+    category = str(data.get("category", "")).strip().lower()
+    if category not in VALID_CATEGORIES:
+        category = "match"
+    return {"category": category, "reason": str(data.get("reason", ""))}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LLM Planner: verify API + produce structured plans")
     parser.add_argument("--test-api", action="store_true", help="Run a minimal Groq API test")
