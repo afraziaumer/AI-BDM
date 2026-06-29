@@ -36,7 +36,7 @@ import re
 import sys
 import threading
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import aiohttp
 import tldextract
@@ -44,7 +44,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # Reuse the already-tested Step-1 planner instead of duplicating LLM logic.
-from LLM_planner import plan_query
+from LLM_planner import plan_query, classify_business
 
 # Raw HTML fields can exceed the default 128 KB CSV field limit; raise it so the
 # cache reader (load_cache) and any downstream reads don't crash.
@@ -62,23 +62,63 @@ logger = logging.getLogger("Phase1Engine")
 load_dotenv()
 
 SERPER_API_KEY = os.getenv("serper") or os.getenv("SERPER_API_KEY")
-ZENROWS_API_KEY = os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
+# Tier-2 scraping provider: Scrape.do (replaces ZenRows). Token is read from the
+# existing env field so .env needs no renaming — prefers `scrapedo`, but falls
+# back to the old `zenrows` field if the token still lives there.
+SCRAPEDO_API_KEY = (
+    os.getenv("scrapedo") or os.getenv("SCRAPEDO_API_KEY")
+    or os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
+)
 
 OUTPUT_CSV_FILE = "scavenger_leads_cache.csv"
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
-ZENROWS_URL = "https://api.zenrows.com/v1/"
+SCRAPEDO_URL = "https://api.scrape.do/"
 
 # Tunable operational parameters (kept as named constants, not magic numbers).
 DEFAULT_RESULT_LIMIT = 20        # used when the query/plan specifies no count
-MAX_SEARCH_PAGES = 12            # cap on Serper web-search pagination
+MAX_SEARCH_PAGES = 10            # always sweep the top 10 Google (Serper) pages
 SEARCH_RESULTS_PER_PAGE = 10     # Serper returns ~10 organic results per page
 MAX_DIRECTORIES_TO_HARVEST = 6   # cap directory pages we crawl for outbound links
 SERPER_TIMEOUT_S = 15            # discovery requests
 NATIVE_FETCH_TIMEOUT_S = 12      # Tier-1 free request
-ZENROWS_TIMEOUT_S = 45           # Tier-2 proxied + JS render (slower by design)
+SCRAPEDO_TIMEOUT_S = 30          # Tier-2 proxied + JS render (give up if slower)
 HTTP_OK = (200, 201)
 HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
+
+# Whole-site crawl: from each business homepage, follow same-domain internal
+# links and scrape every page (capped so a large site can't run forever).
+MAX_PAGES_PER_SITE = 20          # hard cap on pages scraped per business
+MAX_CRAWL_DEPTH = 2              # homepage = depth 0; how many link-hops deep
+
+# Over-discovery: the requested count is a target of QUALIFIED leads, not raw
+# candidates. Since shops/aggregators/failures get filtered out, pull a larger
+# candidate pool and stop once enough real leads are collected.
+CANDIDATE_OVERFETCH = 3          # (unused while top-10-pages sweep is on)
+MAX_CANDIDATE_POOL = 100         # absolute cap on candidates scraped per run (safety)
+
+# Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
+# the LLM relevance classifier (Step 5.5). Turned OFF for now: we want the most
+# relevant results straight from discovery and will re-enable filtering later.
+# When False: every successfully scraped business is kept and stored, and NO
+# relevance LLM call is made (only the planner uses the LLM).
+LEAD_FILTERING_ENABLED = False
+
+# Volatile URL query params that change between runs (Google's srsltid, ad-click
+# ids, UTM campaign tags). Stripped before a URL is used as a cache key so the
+# same site isn't re-scraped just because its tracking tag changed.
+TRACKING_PARAMS = frozenset({
+    "srsltid", "gclid", "gclsrc", "dclid", "fbclid", "msclkid", "yclid",
+    "mc_eid", "igshid", "_ga", "ref", "ref_src",
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+})
+# File extensions that are assets, not readable pages — never crawled.
+SKIP_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp",
+    ".pdf", ".zip", ".rar", ".gz", ".mp4", ".mp3", ".avi", ".mov", ".wmv",
+    ".css", ".js", ".json", ".xml", ".rss", ".woff", ".woff2", ".ttf", ".eot",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv",
+)
 
 # Contact extraction.
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -147,12 +187,15 @@ ARTICLE_TITLE_RE = re.compile(
 
 CSV_HEADERS = [
     "company_name",
-    "website_url",
+    "website_url",           # root site (groups all pages of one business)
+    "page_url",              # the specific page this row was scraped from
+    "page_title",            # the page's <title>
+    "meta_description",      # the page's meta description (short clean summary)
     "email",
     "phone_number",
     "physical_address",
     "scrape_source_method",  # "NATIVE" or "ZENROWS"
-    "page_text",             # clean visible text (markup/scripts stripped)
+    "page_text",             # cleaned main content (nav/footer/cookie removed)
 ]
 
 # Tags whose contents are never useful page text and would pollute the store.
@@ -208,6 +251,24 @@ def _domain_key(url_or_host: str) -> str:
     return ext.registered_domain.lower() or ext.domain.lower()
 
 
+def _strip_tracking(url: str) -> str:
+    """Drop volatile tracking query params (srsltid, utm_*, gclid...) and the
+    fragment, giving one stable URL for the same page across runs. Without this
+    the cache misses whenever Google re-stamps a result with a new srsltid tag.
+    """
+    if not url:
+        return url
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return url
+    kept = [
+        (k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+        if k.lower() not in TRACKING_PARAMS
+    ]
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(kept), ""))
+
+
 def _is_utility_link(host: str, path: str, anchor: str) -> bool:
     """True if a harvested link is a sign-up/help/login/ad/CTA link, not a site."""
     subdomain = host.split(".")[0]
@@ -225,6 +286,18 @@ def _looks_like_article(title: str, path: str) -> bool:
     return bool(title and ARTICLE_TITLE_RE.match(title))
 
 
+async def _read_html(resp: aiohttp.ClientResponse) -> str:
+    """Decode a response body as UTF-8 first (most sites), falling back to the
+    declared charset only if that fails. Avoids the mojibake (â€™, Ã©) you get
+    when aiohttp trusts a wrong/missing charset header on a UTF-8 page.
+    """
+    raw = await resp.read()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(resp.charset or "latin-1", errors="replace")
+
+
 async def _native_get(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     """Cheap, best-effort native GET (no ZenRows). Returns HTML or None."""
     try:
@@ -233,7 +306,7 @@ async def _native_get(session: aiohttp.ClientSession, url: str) -> Optional[str]
             timeout=aiohttp.ClientTimeout(total=NATIVE_FETCH_TIMEOUT_S),
         ) as resp:
             if resp.status in HTTP_OK:
-                return await resp.text()
+                return await _read_html(resp)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Native GET failed for %s: %s", url, exc)
     return None
@@ -374,7 +447,7 @@ async def discover_targets(
 async def execute_scavenger_scrape(
     session: aiohttp.ClientSession, target_url: str
 ) -> Dict[str, Any]:
-    """Tier-1 native fetch; on block/error fail over to Tier-2 ZenRows."""
+    """Tier-1 native fetch; on block/error fail over to Tier-2 Scrape.do."""
     # --- Tier 1: low-cost native request ---
     try:
         logger.info("Tier-1 native fetch: %s", target_url)
@@ -383,7 +456,7 @@ async def execute_scavenger_scrape(
             headers=BROWSER_HEADERS,
             timeout=aiohttp.ClientTimeout(total=NATIVE_FETCH_TIMEOUT_S),
         ) as resp:
-            body = await resp.text()
+            body = await _read_html(resp)
             waf_detected = any(sig in body.lower() for sig in ANTI_BOT_SIGNATURES)
             if resp.status in HTTP_OK and not waf_detected:
                 logger.info("Tier-1 success: %s", target_url)
@@ -395,54 +468,223 @@ async def execute_scavenger_scrape(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Tier-1 connection failed for %s: %s", target_url, exc)
 
-    # --- Tier 2: ZenRows residential proxy + JS render ---
-    if not ZENROWS_API_KEY:
-        logger.error("ZenRows key missing; cannot escalate %s", target_url)
+    # --- Tier 2: Scrape.do (premium proxy + JS render) for blocked sites ---
+    if not SCRAPEDO_API_KEY:
+        logger.error("Scrape.do token missing; cannot escalate %s", target_url)
         return {"html": "", "method": "FAILED"}
 
-    logger.info("Tier-2 ZenRows escalation: %s", target_url)
+    logger.info("Tier-2 Scrape.do escalation: %s", target_url)
     params = {
-        "apikey": ZENROWS_API_KEY,
+        "token": SCRAPEDO_API_KEY,
         "url": target_url,
-        "js_render": "true",
-        "premium_proxy": "true",
+        "render": "true",   # render JS like a real browser
+        "super": "true",    # use premium / residential proxies
     }
     try:
         async with session.get(
-            ZENROWS_URL,
+            SCRAPEDO_URL,
             params=params,
-            timeout=aiohttp.ClientTimeout(total=ZENROWS_TIMEOUT_S),
+            timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
         ) as resp:
             if resp.status == 200:
-                body = await resp.text()
+                body = await _read_html(resp)
                 logger.info("Tier-2 success: %s", target_url)
-                return {"html": body, "method": "ZENROWS"}
-            logger.error("Tier-2 ZenRows failed (status=%s): %s", resp.status, target_url)
+                return {"html": body, "method": "SCRAPEDO"}
+            logger.error("Tier-2 Scrape.do failed (status=%s): %s", resp.status, target_url)
             return {"html": "", "method": "FAILED"}
+    except asyncio.TimeoutError:
+        logger.error("Tier-2 Scrape.do timed out (>%ss): %s", SCRAPEDO_TIMEOUT_S, target_url)
+        return {"html": "", "method": "FAILED"}
     except Exception as exc:  # noqa: BLE001
-        logger.error("Tier-2 ZenRows error for %s: %s", target_url, exc)
+        logger.error("Tier-2 Scrape.do error for %s: %s", target_url, repr(exc))
         return {"html": "", "method": "FAILED"}
 
 
-# === Step 4: Local CSV storage =============================================
-def extract_clean_text(html: str) -> str:
-    """Strip markup, scripts and styling; return collapsed visible text.
+# === Step 3.5: Whole-site crawl ============================================
+def _normalize_page_url(url: str) -> str:
+    """Canonical form for de-dup: drop fragment, lowercase host, trim trailing /."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.rstrip("/") or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme}://{host}{path}{query}"
 
-    Keeps the store readable and small, and yields exactly the content Step 5
-    needs for exclude/include keyword matching.
-    """
-    if not html:
-        return ""
+
+def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[str]:
+    """Return same-domain, crawlable page links found in `html`."""
     soup = BeautifulSoup(html, "lxml")
+    base = urlparse(base_url)
+    links: List[str] = []
+    seen: Set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        # Resolve relative links ("/about", "services/") against the page URL.
+        if href.startswith("//"):
+            href = f"{base.scheme}:{href}"
+        elif href.startswith("/"):
+            href = f"{base.scheme}://{base.netloc}{href}"
+        elif not href.lower().startswith("http"):
+            href = f"{base.scheme}://{base.netloc}/{href.lstrip('./')}"
+        parsed = urlparse(href)
+        if _domain_key(href) != root_domain:       # same business only
+            continue
+        if parsed.path.lower().endswith(SKIP_EXTENSIONS):  # assets, not pages
+            continue
+        if _is_utility_link(parsed.netloc.lower().removeprefix("www."),
+                            parsed.path, a.get_text(strip=True)):
+            continue
+        norm = _normalize_page_url(href)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        links.append(href)
+    return links
+
+
+async def crawl_site(
+    session: aiohttp.ClientSession,
+    root_url: str,
+    root_html: str,
+    root_method: str,
+) -> List[Dict[str, str]]:
+    """Breadth-first crawl of one business site, starting from an already-fetched
+    homepage. Internal pages are fetched natively (cheap); the expensive two-tier
+    scrape was already spent on the homepage. Returns one entry per page:
+    {page_url, html, method}, capped at MAX_PAGES_PER_SITE / MAX_CRAWL_DEPTH.
+    """
+    root_domain = _domain_key(root_url)
+    pages: List[Dict[str, str]] = [
+        {"page_url": root_url, "html": root_html, "method": root_method}
+    ]
+    visited: Set[str] = {_normalize_page_url(root_url)}
+
+    # Seed the queue with the homepage's internal links at depth 1.
+    queue: List[tuple[str, int]] = [
+        (link, 1) for link in _extract_internal_links(root_html, root_url, root_domain)
+    ]
+    head = 0
+    while head < len(queue) and len(pages) < MAX_PAGES_PER_SITE:
+        page_url, depth = queue[head]
+        head += 1
+        norm = _normalize_page_url(page_url)
+        if norm in visited or depth > MAX_CRAWL_DEPTH:
+            continue
+        visited.add(norm)
+
+        html = await _native_get(session, page_url)
+        if not html:
+            continue
+        pages.append({"page_url": page_url, "html": html, "method": "NATIVE"})
+
+        if depth < MAX_CRAWL_DEPTH:
+            for link in _extract_internal_links(html, page_url, root_domain):
+                if _normalize_page_url(link) not in visited:
+                    queue.append((link, depth + 1))
+
+    logger.info("Crawled %d page(s) of %s", len(pages), root_domain)
+    return pages
+
+
+# === Step 4: Local CSV storage =============================================
+_MOJIBAKE_MARKERS = ("Ã", "Ð", "Ñ", "Â", "â€", "Å", "Ÿ")
+
+
+def _fix_mojibake(text: str) -> str:
+    """Repair double-encoded text (e.g. 'Ð¡Ñ‚Ð°Ñ‚Ð¸Ð¸' -> 'Статии').
+
+    Some sites serve UTF-8 text that was already mis-decoded as Windows-1252,
+    producing garbled accented/Cyrillic characters. This reverses that by
+    re-encoding to cp1252 and decoding as UTF-8 — but only keeps the result if
+    it actually reduces the mojibake, so clean text is never corrupted.
+    """
+    if not text or not any(m in text for m in _MOJIBAKE_MARKERS):
+        return text
+    try:
+        repaired = text.encode("cp1252", "ignore").decode("utf-8", "ignore")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    before = sum(text.count(m) for m in _MOJIBAKE_MARKERS)
+    after = sum(repaired.count(m) for m in _MOJIBAKE_MARKERS)
+    return repaired if after < before else text
+
+
+def extract_page_fields(html: str) -> Dict[str, str]:
+    """Extract a page's content WITHOUT dropping anything useful.
+
+    Returns {page_title, meta_description, page_text}. We add the title and meta
+    description as their own clean fields (organization), but page_text keeps the
+    FULL visible text — including footers/nav where emails, phone numbers and
+    addresses live. Only truly invisible tags (script/style/head) are removed.
+    """
+    empty = {"page_title": "", "meta_description": "", "page_text": ""}
+    if not html:
+        return empty
+    soup = BeautifulSoup(html, "lxml")
+
+    # Capture title + meta description before stripping the <head>.
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    meta = (
+        soup.find("meta", attrs={"name": "description"})
+        or soup.find("meta", attrs={"property": "og:description"})
+    )
+    meta_desc = (meta.get("content", "") if meta else "").strip()
+
+    # Replace Cloudflare-obfuscated email placeholders with the real address so
+    # "[email protected]" doesn't pollute the text and the email is recoverable.
+    for el in soup.find_all(attrs={"data-cfemail": True}):
+        real = _decode_cf_email(el.get("data-cfemail", ""))
+        if real:
+            el.replace_with(real)
+
+    # Remove only non-visible tags; keep ALL real content (nav/footer included).
     for tag in soup(_NOISE_TAGS):
         tag.decompose()
-    return " ".join(soup.get_text(separator=" ").split())
+
+    # Keep line structure so callers can de-duplicate the boilerplate that
+    # repeats across a site's pages (menu/header/footer). Blanks dropped.
+    # Each line is repaired for mojibake (double-encoded UTF-8) along the way.
+    lines = [
+        _fix_mojibake(" ".join(ln.split()))
+        for ln in soup.get_text(separator="\n").split("\n")
+        if ln.strip()
+    ]
+    return {
+        "page_title": _fix_mojibake(title),
+        "meta_description": _fix_mojibake(meta_desc),
+        "page_text": " ".join(lines),
+        "lines": lines,
+    }
+
+
+def extract_clean_text(html: str) -> str:
+    """Back-compat shim: just the cleaned body text (see extract_page_fields)."""
+    return extract_page_fields(html)["page_text"]
 
 
 def _valid_email(candidate: str) -> bool:
     """Reject asset filenames, placeholders and tracker pseudo-emails."""
     low = candidate.lower()
     return "@" in low and not any(h in low for h in JUNK_EMAIL_HINTS)
+
+
+def _decode_cf_email(encoded: str) -> Optional[str]:
+    """Decode a Cloudflare-obfuscated email (its data-cfemail hex string).
+
+    Cloudflare replaces real emails on the page with a placeholder that reads
+    "[email protected]" and stashes the real address XOR-encoded in a
+    `data-cfemail` attribute. This reverses that so we recover the real email.
+    """
+    try:
+        key = int(encoded[:2], 16)
+        decoded = "".join(
+            chr(int(encoded[i:i + 2], 16) ^ key)
+            for i in range(2, len(encoded), 2)
+        )
+        return decoded if "@" in decoded else None
+    except (ValueError, IndexError):
+        return None
 
 
 def _clean_phone(candidate: str) -> Optional[str]:
@@ -460,86 +702,208 @@ def _clean_phone(candidate: str) -> Optional[str]:
 def extract_contacts(html: str, text: str) -> Dict[str, Optional[str]]:
     """Best-effort email + phone extraction from a scraped page.
 
-    Prefers explicit mailto:/tel: links (most reliable), then falls back to
-    regex over the visible text. Returns {"email": ..., "phone": ...}.
+    Email: Cloudflare-decoded address first, then mailto:, then regex.
+    Phone: a "+"-prefixed number shown in the text wins (that's the salon's real
+    line), then a tel: link, then any other number — so booking-widget toll-free
+    tel: links don't shadow the real local number. Returns {email, phone}.
     """
     email: Optional[str] = None
     phone: Optional[str] = None
-
     soup = BeautifulSoup(html or "", "lxml")
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        low = href.lower()
-        if low.startswith("mailto:") and email is None:
-            cand = href[len("mailto:"):].split("?")[0].strip()
-            if _valid_email(cand):
-                email = cand
-        elif low.startswith("tel:") and phone is None:
-            cand = _clean_phone(href[len("tel:"):])
-            if cand:
-                phone = cand
-        if email and phone:
-            break
 
+    # --- Email: Cloudflare-protected -> mailto: -> regex over visible text. ---
+    for el in soup.find_all(attrs={"data-cfemail": True}):
+        real = _decode_cf_email(el.get("data-cfemail", ""))
+        if real and _valid_email(real):
+            email = real
+            break
+    if email is None:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href.lower().startswith("mailto:"):
+                cand = href[len("mailto:"):].split("?")[0].strip()
+                if _valid_email(cand):
+                    email = cand
+                    break
     if email is None:
         for match in EMAIL_RE.findall(text or ""):
             if _valid_email(match):
                 email = match
                 break
 
+    # --- Phone: prefer a "+"-format number in the text, then tel:, then any. ---
+    text_phones = [
+        c for c in (_clean_phone(m) for m in PHONE_RE.findall(text or "")) if c
+    ]
+    phone = next((p for p in text_phones if p.lstrip().startswith("+")), None)
     if phone is None:
-        for match in PHONE_RE.findall(text or ""):
-            cleaned = _clean_phone(match)
-            if cleaned:
-                phone = cleaned
-                break
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href.lower().startswith("tel:"):
+                cand = _clean_phone(href[len("tel:"):])
+                if cand:
+                    phone = cand
+                    break
+    if phone is None and text_phones:
+        phone = text_phones[0]
 
     return {"email": email, "phone": phone}
 
 
 def initialize_csv_storage_layer() -> None:
-    """Create the CSV with headers if it does not exist yet."""
+    """Create the CSV with headers if missing; repair a stale/empty header.
+
+    If the file exists but its header doesn't match CSV_HEADERS (e.g. the older
+    schema without `page_url`) and it holds no data rows, rewrite the header so
+    the new per-page layout lines up. A file that already has data is left as-is.
+    """
     if not os.path.exists(OUTPUT_CSV_FILE):
         logger.info("Initializing CSV archive: %s", OUTPUT_CSV_FILE)
         with open(OUTPUT_CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(CSV_HEADERS)
+        return
+    with open(OUTPUT_CSV_FILE, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    header = rows[0] if rows else []
+    data_rows = rows[1:]
+    if header != CSV_HEADERS and not any(any(c.strip() for c in r) for r in data_rows):
+        logger.info("Upgrading empty CSV to new per-page schema (added page_url).")
+        with open(OUTPUT_CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_HEADERS)
 
 
-def append_lead_record_to_csv(lead: Dict[str, Any]) -> None:
-    """Append one lead row. Lock-guarded; stores clean page text only."""
-    page_text = str(lead.get("page_text", ""))
+def _lead_to_row(lead: Dict[str, Any]) -> List[str]:
+    """Flatten a lead/page dict into a CSV row matching CSV_HEADERS order."""
+    return [
+        lead.get("company_name", "N/A"),
+        lead.get("website_url", "N/A"),
+        lead.get("page_url", lead.get("website_url", "N/A")),
+        lead.get("page_title", ""),
+        lead.get("meta_description", ""),
+        lead.get("email", "N/A"),
+        lead.get("phone_number", "N/A"),
+        lead.get("physical_address", "N/A"),
+        lead.get("scrape_source_method", "FAILED"),
+        str(lead.get("page_text", "")),
+    ]
+
+
+def _dedupe_shared_lines(
+    page_records: List[Dict[str, Any]], page_lines: List[List[str]]
+) -> None:
+    """Strip boilerplate (menu/header/footer) that repeats across a site's pages.
+
+    A line that appears on at least half of the pages is treated as shared
+    template text. It's removed from every page EXCEPT the first (homepage),
+    which keeps the full text — so the site's shared content is stored once
+    instead of duplicated on every page. Modifies page_records in place.
+    """
+    n = len(page_records)
+    if n < 3:  # too few pages for repetition to be a problem
+        return
+
+    from collections import Counter
+    doc_freq: Counter = Counter()
+    for lines in page_lines:
+        for line in set(lines):
+            doc_freq[line] += 1
+
+    threshold = max(2, (n + 1) // 2)  # appears on >= ~half the pages
+    shared = {line for line, freq in doc_freq.items() if freq >= threshold}
+    if not shared:
+        return
+
+    # Homepage (index 0) keeps everything; subpages keep only unique lines.
+    for i in range(1, n):
+        unique = [line for line in page_lines[i] if line not in shared]
+        page_records[i]["page_text"] = " ".join(unique)
+
+
+def append_records_to_csv(records: List[Dict[str, Any]]) -> None:
+    """Append a batch of page rows in one locked write, so all pages of a
+    business land contiguously in the store (homepage first, then crawl order)."""
+    if not records:
+        return
     with _csv_lock:
         with open(OUTPUT_CSV_FILE, mode="a", newline="", encoding="utf-8") as f:
-            # csv.writer already quotes/escapes embedded commas and quotes.
-            csv.writer(f).writerow(
-                [
-                    lead.get("company_name", "N/A"),
-                    lead.get("website_url", "N/A"),
-                    lead.get("email", "N/A"),
-                    lead.get("phone_number", "N/A"),
-                    lead.get("physical_address", "N/A"),
-                    lead.get("scrape_source_method", "FAILED"),
-                    page_text,
-                ]
-            )
-    logger.info("Saved lead: %s", lead.get("company_name"))
+            writer = csv.writer(f)  # quotes/escapes embedded commas + quotes
+            for lead in records:
+                writer.writerow(_lead_to_row(lead))
+    logger.debug("Saved %d page row(s) for %s",
+                 len(records), records[0].get("company_name"))
 
 
-def load_cache() -> Dict[str, Dict[str, str]]:
-    """Return previously-analyzed leads keyed by website URL (CSV dev cache).
+def reorganize_csv() -> Dict[str, int]:
+    """Tidy the store so it's easy to read: drop duplicate pages, group every
+    business's pages into one contiguous block (homepage first), and sort the
+    businesses alphabetically. Backs the file up first. Returns row counts.
+    """
+    if not os.path.exists(OUTPUT_CSV_FILE):
+        return {"before": 0, "after": 0, "businesses": 0}
 
-    Stands in for the MongoDB Atlas cache lookup. Holds the full row (including
-    page_text and contacts) so cache hits can still be qualified in Step 5
-    without re-scraping.
+    with open(OUTPUT_CSV_FILE, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    before = len(rows)
+
+    # Dedupe by canonical (site, page); keep the last (most recent) copy.
+    deduped: Dict[tuple, Dict[str, str]] = {}
+    for row in rows:
+        site = _strip_tracking(row.get("website_url", "") or "")
+        page = _strip_tracking(row.get("page_url", "") or site)
+        deduped[(site, page)] = row
+
+    # Group pages under their business.
+    groups: Dict[str, List[Dict[str, str]]] = {}
+    for (site, _page), row in deduped.items():
+        groups.setdefault(site, []).append(row)
+
+    def _page_sort_key(row: Dict[str, str]) -> tuple:
+        # Homepage (empty/root path) sorts first, then alphabetical by URL.
+        page = _strip_tracking(row.get("page_url", "") or "")
+        path = urlparse(page).path.rstrip("/")
+        return (path != "", path, page)
+
+    ordered_sites = sorted(
+        groups, key=lambda s: (groups[s][0].get("company_name") or "").lower()
+    )
+
+    after = 0
+    with open(OUTPUT_CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer.writeheader()
+        for site in ordered_sites:
+            for row in sorted(groups[site], key=_page_sort_key):
+                out = {k: row.get(k, "") for k in CSV_HEADERS}
+                # Normalize stored URLs too, so the file matches the cache keys.
+                out["website_url"] = site
+                out["page_url"] = _strip_tracking(out.get("page_url", "") or site)
+                writer.writerow(out)
+                after += 1
+
+    logger.info(
+        "Reorganized store: %d -> %d rows across %d businesses (deduped %d).",
+        before, after, len(groups), before - after,
+    )
+    return {"before": before, "after": after, "businesses": len(groups)}
+
+
+def load_cache() -> Dict[str, List[Dict[str, str]]]:
+    """Return previously-analyzed businesses keyed by root website URL.
+
+    Each value is the list of that site's stored page rows. Stands in for the
+    MongoDB Atlas cache: a business already in the store is skipped (not
+    re-crawled), and its pages are aggregated to re-qualify without re-scraping.
     """
     if not os.path.exists(OUTPUT_CSV_FILE):
         return {}
-    cached: Dict[str, Dict[str, str]] = {}
+    cached: Dict[str, List[Dict[str, str]]] = {}
     with open(OUTPUT_CSV_FILE, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            url = row.get("website_url")
-            if url and url != "N/A":
-                cached[url] = row
+            site = row.get("website_url")
+            if site and site != "N/A":
+                # Key on the tracking-stripped URL so rows stored under different
+                # srsltid tags collapse to one business and match this run's URL.
+                cached.setdefault(_strip_tracking(site), []).append(row)
     return cached
 
 
@@ -573,61 +937,162 @@ def qualify_lead(
             "matched_exclude": [], "matched_include": matched_include}
 
 
+async def classify_relevance(
+    industry: str, geo: str, name: str, page_text: str
+) -> Dict[str, str]:
+    """Step 5.5 — LLM relevance check (single business vs shop/aggregator).
+
+    Runs off the event loop. Never raises: on any failure it returns 'match' so
+    a classifier outage degrades to the old keyword-only behaviour, never
+    silently dropping leads.
+    """
+    try:
+        return await asyncio.to_thread(
+            classify_business, industry or "", geo or "", name or "", page_text
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Relevance classification failed for %s: %s", name, exc)
+        return {"category": "match", "reason": "classifier_unavailable"}
+
+
+async def _evaluate_lead(
+    industry: str, geo: str, name: str, combined: str,
+    exclude_keywords: List[str], include_keywords: List[str],
+) -> tuple[Dict[str, Any], Optional[Dict[str, str]]]:
+    """Return (qualification, classification) for a business.
+
+    When LEAD_FILTERING_ENABLED is False (current default), filtering is skipped
+    entirely: the business passes as qualified and NO relevance LLM call is made,
+    so discovery alone decides relevance. Flip the flag to re-enable filtering.
+    """
+    if not LEAD_FILTERING_ENABLED:
+        passthrough = {"qualified": True, "reason": "filtering_disabled",
+                       "matched_exclude": [], "matched_include": []}
+        return passthrough, None
+
+    qualification = qualify_lead(combined, exclude_keywords, include_keywords)
+    classification = None
+    if qualification.get("qualified"):
+        classification = await classify_relevance(industry, geo, name, combined)
+    return qualification, classification
+
+
 # === Orchestration =========================================================
 async def process_single_lead(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
     target: Dict[str, Any],
-    cache: Dict[str, Dict[str, str]],
+    cache: Dict[str, List[Dict[str, str]]],
     exclude_keywords: List[str],
     include_keywords: List[str],
+    industry: str = "",
+    geo: str = "",
 ) -> Dict[str, Any]:
-    """Cache-check, scrape, extract contacts, persist, then qualify (Step 5)."""
+    """Cache-check, crawl the whole site, persist every page, then qualify the
+    business across all of its pages combined (Step 5) and classify its
+    relevance (Step 5.5: single business vs product shop / aggregator)."""
     name = target.get("title")
-    url = target.get("website")
+    # Canonicalize: strip srsltid/utm/etc so re-runs hit the cache instead of
+    # re-scraping. The stripped URL still fetches fine (sites ignore those tags).
+    url = _strip_tracking(target.get("website"))
 
     if not url:
         return {"company_name": name, "website_url": None, "status": "no_website"}
 
-    # Step 2.1 — cache check (CSV dev cache substitutes for MongoDB Atlas).
+    # Cache check: a business already in the store is not re-crawled. Its stored
+    # pages are aggregated and re-qualified against the (possibly new) keywords.
     if url in cache:
-        logger.info("Cache HIT for %s — qualifying from cache.", url)
-        row = cache[url]
-        qualification = qualify_lead(
-            row.get("page_text", ""), exclude_keywords, include_keywords
+        rows = cache[url]
+        logger.info("Cache HIT for %s (%d page(s)) — qualifying from cache.", url, len(rows))
+        combined = " ".join(r.get("page_text", "") for r in rows)
+        email = next((r.get("email") for r in rows
+                      if r.get("email") not in (None, "", "N/A")), "N/A")
+        phone = next((r.get("phone_number") for r in rows
+                      if r.get("phone_number") not in (None, "", "N/A")), "N/A")
+        qualification, classification = await _evaluate_lead(
+            industry, geo, name, combined, exclude_keywords, include_keywords
         )
         return {"company_name": name, "website_url": url, "status": "cache_hit",
-                "method": "CACHE", "email": row.get("email"),
-                "phone": row.get("phone_number"), "qualification": qualification}
+                "method": "CACHE", "pages": len(rows), "email": email,
+                "phone": phone, "qualification": qualification,
+                "classification": classification}
 
+    # Scrape the homepage with the full two-tier scrape, then crawl the rest of
+    # the site from it (internal pages fetched natively).
     async with semaphore:
-        result = await execute_scavenger_scrape(session, url)
+        root = await execute_scavenger_scrape(session, url)
+        if root["method"] == "FAILED" or not root["html"]:
+            logger.warning("No content resolved for %s", url)
+            return {"company_name": name, "website_url": url, "status": "failed",
+                    "method": "FAILED"}
+        pages = await crawl_site(session, url, root["html"], root["method"])
 
-    if result["method"] != "FAILED" and result["html"]:
-        page_text = extract_clean_text(result["html"])
-        contacts = extract_contacts(result["html"], page_text)
-        append_lead_record_to_csv(
+    # Build one row per page (keeping each page's lines for de-duplication).
+    combined_parts: List[str] = []
+    page_records: List[Dict[str, Any]] = []
+    page_lines: List[List[str]] = []
+    email = phone = None
+    for page in pages:
+        fields = extract_page_fields(page["html"])
+        page_text = fields["page_text"]
+        if not page_text.strip():
+            continue
+        contacts = extract_contacts(page["html"], page_text)
+        email = email or contacts["email"]
+        phone = phone or contacts["phone"]
+        page_records.append(
             {
                 "company_name": name,
                 "website_url": url,
+                "page_url": page["page_url"],
+                "page_title": fields["page_title"],
+                "meta_description": fields["meta_description"],
                 "email": contacts["email"] or "N/A",
                 "phone_number": contacts["phone"] or "N/A",
                 "physical_address": "N/A",  # web-search discovery has no address
-                "scrape_source_method": result["method"],
+                "scrape_source_method": page["method"],
                 "page_text": page_text,
             }
         )
-        cache[url] = {"website_url": url, "email": contacts["email"] or "N/A",
-                      "phone_number": contacts["phone"] or "N/A", "page_text": page_text}
-        qualification = qualify_lead(page_text, exclude_keywords, include_keywords)
-        return {"company_name": name, "website_url": url, "status": "scraped",
-                "method": result["method"], "text_len": len(page_text),
-                "email": contacts["email"], "phone": contacts["phone"],
-                "qualification": qualification}
+        page_lines.append(fields["lines"])
+        combined_parts.append(page_text)
 
-    logger.warning("No content resolved for %s", url)
-    return {"company_name": name, "website_url": url, "status": "failed",
-            "method": "FAILED"}
+    if not page_records:
+        logger.warning("No readable content on any page of %s", url)
+        return {"company_name": name, "website_url": url, "status": "failed",
+                "method": root["method"]}
+
+    # De-duplicate boilerplate: lines that repeat across most of a site's pages
+    # (menu/header/footer) are stripped from every page EXCEPT the homepage, so
+    # each row keeps only its unique content. The homepage keeps the full text,
+    # so nothing is lost — just no longer repeated 20x.
+    _dedupe_shared_lines(page_records, page_lines)
+
+    # Evaluate BEFORE persisting. With filtering enabled, only real qualified
+    # leads are stored; with it disabled, every scraped business is kept.
+    combined = " ".join(combined_parts)
+    qualification, classification = await _evaluate_lead(
+        industry, geo, name, combined, exclude_keywords, include_keywords
+    )
+    is_lead = bool(
+        qualification.get("qualified")
+        and (classification or {}).get("category", "match") == "match"
+    )
+
+    if is_lead:
+        append_records_to_csv(page_records)  # contiguous block, homepage first
+        cache[url] = [{"website_url": url, "page_text": combined,
+                       "email": email or "N/A", "phone_number": phone or "N/A"}]
+        logger.info("Saved %d page(s) for %s", len(page_records), name)
+    else:
+        reason = (classification or {}).get("category") or qualification.get("reason")
+        logger.info("Not stored (%s): %s", reason, name)
+
+    return {"company_name": name, "website_url": url, "status": "scraped",
+            "method": root["method"], "pages": len(page_records),
+            "stored": is_lead, "text_len": len(combined),
+            "email": email, "phone": phone, "qualification": qualification,
+            "classification": classification}
 
 
 async def run_pipeline(
@@ -673,7 +1138,10 @@ async def run_pipeline(
         query = plan.get("search_query") or (
             f"{plan.get('broad_industry', '')} in {plan.get('geo_location', '')}".strip()
         )
-        targets = await discover_targets(session, query, effective_limit)
+        # Always sweep the top 10 Google (Serper) pages for every query, so the
+        # candidate pool is as wide as possible regardless of the requested
+        # count. Capped at MAX_CANDIDATE_POOL for safety.
+        targets = await discover_targets(session, query, MAX_CANDIDATE_POOL)
         summary["discovered"] = len(targets)
         if not targets:
             logger.critical("No candidate businesses found. Halting pipeline.")
@@ -681,23 +1149,44 @@ async def run_pipeline(
 
         exclude_keywords = plan.get("exclude_keywords", []) or []
         include_keywords = plan.get("include_keywords", []) or []
+        industry = plan.get("broad_industry", "") or ""
+        geo = plan.get("geo_location", "") or ""
 
-        logger.info("Processing %d discovered businesses.", len(targets))
-        tasks = [
-            process_single_lead(
-                session, semaphore, target, cache, exclude_keywords, include_keywords
+        def _is_lead(r: Dict[str, Any]) -> bool:
+            return bool(
+                r.get("qualification", {}).get("qualified")
+                and (r.get("classification") or {}).get("category", "match") == "match"
             )
-            for target in targets
-        ]
-        results = await asyncio.gather(*tasks)
 
+        # Scrape EVERY discovered candidate from the top search pages — no early
+        # stop on the requested count, for maximum coverage per query.
+        logger.info("Scraping all %d discovered candidates.", len(targets))
+        results: List[Dict[str, Any]] = []
+        for idx in range(0, len(targets), concurrency):
+            batch = targets[idx : idx + concurrency]
+            batch_results = await asyncio.gather(*[
+                process_single_lead(
+                    session, semaphore, target, cache, exclude_keywords,
+                    include_keywords, industry, geo,
+                )
+                for target in batch
+            ])
+            results.extend(batch_results)
+            logger.info(
+                "Processed %d/%d candidates (%d qualified so far).",
+                len(results), len(targets),
+                sum(1 for r in results if _is_lead(r)),
+            )
+
+    summary["processed"] = len(results)
     summary["results"] = results
     counts: Dict[str, int] = {}
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     summary["counts"] = counts
 
-    # Step 5 — the deliverable: leads that passed qualification.
+    # The deliverable: every candidate that passed (with filtering off, that's
+    # all successfully scraped businesses). No truncation — we keep them all.
     qualified = [
         {
             "company_name": r.get("company_name"),
@@ -707,10 +1196,18 @@ async def run_pipeline(
             "matched_include": r["qualification"].get("matched_include", []),
         }
         for r in results
-        if r.get("qualification", {}).get("qualified")
+        if _is_lead(r)
     ]
     summary["qualified"] = qualified
     summary["qualified_count"] = len(qualified)
+    # Leads keyword-qualified but filtered out by the relevance classifier.
+    summary["filtered_out"] = [
+        {"company_name": r.get("company_name"),
+         "category": (r.get("classification") or {}).get("category"),
+         "reason": (r.get("classification") or {}).get("reason")}
+        for r in results
+        if r.get("qualification", {}).get("qualified") and not _is_lead(r)
+    ]
 
     logger.info(
         "Phase 1 complete. %d qualified leads (of %d processed). Store: %s",
@@ -726,22 +1223,38 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print("=" * 64)
     print(f"Query      : {summary['query']}")
     print(f"Plan       : {json.dumps(summary['plan'], ensure_ascii=False)}")
-    print(f"Limit      : {summary.get('limit')}  |  Discovered : {summary['discovered']}")
+    print(
+        f"Target leads: {summary.get('limit')}  |  Discovered : {summary['discovered']}"
+        f"  |  Processed : {summary.get('processed', len(summary['results']))}"
+    )
     print(f"Counts     : {summary['counts']}")
     print("-" * 64)
     for r in summary["results"]:
         method = r.get("method", "-")
+        pages = r.get("pages")
+        pages_tag = f" {pages}p" if pages else ""
         q = r.get("qualification") or {}
+        cls = r.get("classification") or {}
         verdict = ""
         if q:
             if q.get("qualified"):
-                verdict = "  [QUALIFIED]"
+                cat = cls.get("category")
+                if cat and cat != "match":
+                    verdict = f"  [~ {cat}]"        # keyword-OK but not a real lead
+                else:
+                    verdict = "  [QUALIFIED]"
             else:
                 reason = q.get("reason")
                 hit = q.get("matched_exclude")
                 verdict = f"  [x {reason}]" + (f" ({hit[0]})" if hit else "")
-        print(f"  [{r['status']:<10}] {method:<7} {r.get('company_name')}{verdict}")
+        print(f"  [{r['status']:<10}] {method:<7}{pages_tag:<5} {r.get('company_name')}{verdict}")
     print("-" * 64)
+    filtered = summary.get("filtered_out", [])
+    if filtered:
+        print(f"FILTERED BY RELEVANCE ({len(filtered)}) — keyword-OK but not real leads:")
+        for f in filtered:
+            print(f"  ~ [{f.get('category')}] {f.get('company_name')} — {f.get('reason')}")
+        print("-" * 64)
     print(f"QUALIFIED LEADS ({summary.get('qualified_count', 0)}):")
     for lead in summary.get("qualified", []):
         print(f"  • {lead['company_name']}")
@@ -752,6 +1265,14 @@ def print_summary(summary: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    # Windows consoles default to cp1252 and crash on Unicode (e.g. a non-break
+    # hyphen) when printing the summary. Force UTF-8 output where supported.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="AI BDM Phase 1 pipeline")
     parser.add_argument(
         "--query",
@@ -762,7 +1283,20 @@ def main() -> None:
     parser.add_argument(
         "--concurrency", type=int, default=5, help="Concurrent scrape workers."
     )
+    parser.add_argument(
+        "--reorganize", action="store_true",
+        help="Tidy the CSV store (dedupe + group by business + sort) and exit.",
+    )
     args = parser.parse_args()
+
+    if args.reorganize:
+        stats = reorganize_csv()
+        print(
+            f"Store reorganized: {stats['before']} -> {stats['after']} rows "
+            f"across {stats['businesses']} businesses "
+            f"(removed {stats['before'] - stats['after']} duplicates)."
+        )
+        return
 
     summary = asyncio.run(
         run_pipeline(args.query, concurrency=args.concurrency)
