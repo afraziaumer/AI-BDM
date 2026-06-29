@@ -62,12 +62,18 @@ logger = logging.getLogger("Phase1Engine")
 load_dotenv()
 
 SERPER_API_KEY = os.getenv("serper") or os.getenv("SERPER_API_KEY")
-ZENROWS_API_KEY = os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
+# Tier-2 scraping provider: Scrape.do (replaces ZenRows). Token is read from the
+# existing env field so .env needs no renaming — prefers `scrapedo`, but falls
+# back to the old `zenrows` field if the token still lives there.
+SCRAPEDO_API_KEY = (
+    os.getenv("scrapedo") or os.getenv("SCRAPEDO_API_KEY")
+    or os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
+)
 
 OUTPUT_CSV_FILE = "scavenger_leads_cache.csv"
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
-ZENROWS_URL = "https://api.zenrows.com/v1/"
+SCRAPEDO_URL = "https://api.scrape.do/"
 
 # Tunable operational parameters (kept as named constants, not magic numbers).
 DEFAULT_RESULT_LIMIT = 20        # used when the query/plan specifies no count
@@ -76,7 +82,7 @@ SEARCH_RESULTS_PER_PAGE = 10     # Serper returns ~10 organic results per page
 MAX_DIRECTORIES_TO_HARVEST = 6   # cap directory pages we crawl for outbound links
 SERPER_TIMEOUT_S = 15            # discovery requests
 NATIVE_FETCH_TIMEOUT_S = 12      # Tier-1 free request
-ZENROWS_TIMEOUT_S = 45           # Tier-2 proxied + JS render (slower by design)
+SCRAPEDO_TIMEOUT_S = 45          # Tier-2 proxied + JS render (slower by design)
 HTTP_OK = (200, 201)
 HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 
@@ -90,6 +96,13 @@ MAX_CRAWL_DEPTH = 2              # homepage = depth 0; how many link-hops deep
 # candidate pool and stop once enough real leads are collected.
 CANDIDATE_OVERFETCH = 3          # discover up to this many candidates per wanted lead
 MAX_CANDIDATE_POOL = 60          # absolute cap on candidates processed (safety)
+
+# Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
+# the LLM relevance classifier (Step 5.5). Turned OFF for now: we want the most
+# relevant results straight from discovery and will re-enable filtering later.
+# When False: every successfully scraped business is kept and stored, and NO
+# relevance LLM call is made (only the planner uses the LLM).
+LEAD_FILTERING_ENABLED = False
 
 # Volatile URL query params that change between runs (Google's srsltid, ad-click
 # ids, UTM campaign tags). Stripped before a URL is used as a cache key so the
@@ -434,7 +447,7 @@ async def discover_targets(
 async def execute_scavenger_scrape(
     session: aiohttp.ClientSession, target_url: str
 ) -> Dict[str, Any]:
-    """Tier-1 native fetch; on block/error fail over to Tier-2 ZenRows."""
+    """Tier-1 native fetch; on block/error fail over to Tier-2 Scrape.do."""
     # --- Tier 1: low-cost native request ---
     try:
         logger.info("Tier-1 native fetch: %s", target_url)
@@ -455,32 +468,32 @@ async def execute_scavenger_scrape(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Tier-1 connection failed for %s: %s", target_url, exc)
 
-    # --- Tier 2: ZenRows residential proxy + JS render ---
-    if not ZENROWS_API_KEY:
-        logger.error("ZenRows key missing; cannot escalate %s", target_url)
+    # --- Tier 2: Scrape.do (premium proxy + JS render) for blocked sites ---
+    if not SCRAPEDO_API_KEY:
+        logger.error("Scrape.do token missing; cannot escalate %s", target_url)
         return {"html": "", "method": "FAILED"}
 
-    logger.info("Tier-2 ZenRows escalation: %s", target_url)
+    logger.info("Tier-2 Scrape.do escalation: %s", target_url)
     params = {
-        "apikey": ZENROWS_API_KEY,
+        "token": SCRAPEDO_API_KEY,
         "url": target_url,
-        "js_render": "true",
-        "premium_proxy": "true",
+        "render": "true",   # render JS like a real browser
+        "super": "true",    # use premium / residential proxies
     }
     try:
         async with session.get(
-            ZENROWS_URL,
+            SCRAPEDO_URL,
             params=params,
-            timeout=aiohttp.ClientTimeout(total=ZENROWS_TIMEOUT_S),
+            timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
         ) as resp:
             if resp.status == 200:
                 body = await _read_html(resp)
                 logger.info("Tier-2 success: %s", target_url)
-                return {"html": body, "method": "ZENROWS"}
-            logger.error("Tier-2 ZenRows failed (status=%s): %s", resp.status, target_url)
+                return {"html": body, "method": "SCRAPEDO"}
+            logger.error("Tier-2 Scrape.do failed (status=%s): %s", resp.status, target_url)
             return {"html": "", "method": "FAILED"}
     except Exception as exc:  # noqa: BLE001
-        logger.error("Tier-2 ZenRows error for %s: %s", target_url, exc)
+        logger.error("Tier-2 Scrape.do error for %s: %s", target_url, exc)
         return {"html": "", "method": "FAILED"}
 
 
@@ -878,6 +891,28 @@ async def classify_relevance(
         return {"category": "match", "reason": "classifier_unavailable"}
 
 
+async def _evaluate_lead(
+    industry: str, geo: str, name: str, combined: str,
+    exclude_keywords: List[str], include_keywords: List[str],
+) -> tuple[Dict[str, Any], Optional[Dict[str, str]]]:
+    """Return (qualification, classification) for a business.
+
+    When LEAD_FILTERING_ENABLED is False (current default), filtering is skipped
+    entirely: the business passes as qualified and NO relevance LLM call is made,
+    so discovery alone decides relevance. Flip the flag to re-enable filtering.
+    """
+    if not LEAD_FILTERING_ENABLED:
+        passthrough = {"qualified": True, "reason": "filtering_disabled",
+                       "matched_exclude": [], "matched_include": []}
+        return passthrough, None
+
+    qualification = qualify_lead(combined, exclude_keywords, include_keywords)
+    classification = None
+    if qualification.get("qualified"):
+        classification = await classify_relevance(industry, geo, name, combined)
+    return qualification, classification
+
+
 # === Orchestration =========================================================
 async def process_single_lead(
     session: aiohttp.ClientSession,
@@ -910,10 +945,9 @@ async def process_single_lead(
                       if r.get("email") not in (None, "", "N/A")), "N/A")
         phone = next((r.get("phone_number") for r in rows
                       if r.get("phone_number") not in (None, "", "N/A")), "N/A")
-        qualification = qualify_lead(combined, exclude_keywords, include_keywords)
-        classification = None
-        if qualification.get("qualified"):
-            classification = await classify_relevance(industry, geo, name, combined)
+        qualification, classification = await _evaluate_lead(
+            industry, geo, name, combined, exclude_keywords, include_keywords
+        )
         return {"company_name": name, "website_url": url, "status": "cache_hit",
                 "method": "CACHE", "pages": len(rows), "email": email,
                 "phone": phone, "qualification": qualification,
@@ -962,14 +996,12 @@ async def process_single_lead(
         return {"company_name": name, "website_url": url, "status": "failed",
                 "method": root["method"]}
 
-    # Qualify + classify BEFORE persisting, so only real salon leads are stored.
-    # Product shops, aggregators, unrelated sites and keyword-excluded businesses
-    # are crawled but NOT written to the database.
+    # Evaluate BEFORE persisting. With filtering enabled, only real qualified
+    # leads are stored; with it disabled, every scraped business is kept.
     combined = " ".join(combined_parts)
-    qualification = qualify_lead(combined, exclude_keywords, include_keywords)
-    classification = None
-    if qualification.get("qualified"):
-        classification = await classify_relevance(industry, geo, name, combined)
+    qualification, classification = await _evaluate_lead(
+        industry, geo, name, combined, exclude_keywords, include_keywords
+    )
     is_lead = bool(
         qualification.get("qualified")
         and (classification or {}).get("category", "match") == "match"
