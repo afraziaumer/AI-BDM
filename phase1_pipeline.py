@@ -35,13 +35,17 @@ import os
 import re
 import sys
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import aiohttp
+import phonenumbers
 import tldextract
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+from email_extractor import EmailExtractor
 
 # Reuse the already-tested Step-1 planner instead of duplicating LLM logic.
 from LLM_planner import plan_query, classify_business
@@ -71,6 +75,9 @@ SCRAPEDO_API_KEY = (
 )
 
 OUTPUT_CSV_FILE = "scavenger_leads_cache.csv"
+# Tracks which Serper page each general-search query is up to, so the next run
+# picks up where the previous left off (pages 1-3 run 1 → pages 4-6 run 2…).
+SEARCH_STATE_FILE = "search_state.json"
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 SCRAPEDO_URL = "https://api.scrape.do/"
@@ -88,14 +95,17 @@ HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 
 # Whole-site crawl: from each business homepage, follow same-domain internal
 # links and scrape every page (capped so a large site can't run forever).
-MAX_PAGES_PER_SITE = 20          # hard cap on pages scraped per business
-MAX_CRAWL_DEPTH = 2              # homepage = depth 0; how many link-hops deep
+MAX_PAGES_PER_SITE = 8           # hard cap on pages scraped per business (fast)
+MAX_CRAWL_DEPTH = 1              # homepage + its direct links (about/contact)
 
-# Over-discovery: the requested count is a target of QUALIFIED leads, not raw
-# candidates. Since shops/aggregators/failures get filtered out, pull a larger
-# candidate pool and stop once enough real leads are collected.
-CANDIDATE_OVERFETCH = 3          # (unused while top-10-pages sweep is on)
-MAX_CANDIDATE_POOL = 100         # absolute cap on candidates scraped per run (safety)
+# URL path fragments that indicate a contact/about page.
+# These are fetched before any other subpage because they have 10x higher
+# email density than product/gallery/news pages.
+CONTACT_PAGE_HINTS = frozenset({
+    "contact", "contact-us", "contactus", "reach-us", "get-in-touch",
+    "about", "about-us", "aboutus", "team", "staff", "people",
+    "hello", "connect", "enquiry", "enquiries",
+})
 
 # Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
 # the LLM relevance classifier (Step 5.5). Turned OFF for now: we want the most
@@ -120,13 +130,28 @@ SKIP_EXTENSIONS = (
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv",
 )
 
-# Contact extraction.
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(r"\+?\d[\d\s().\-]{7,}\d")
-# Substrings that mark a regex 'email' as junk (assets, placeholders, trackers).
+# --- Contact extraction ---
+# Email: strict RFC-5321 subset. Requires a real TLD (alpha-only, 2+ chars)
+# and uses word boundaries so it cannot match inside asset paths or URLs.
+EMAIL_RE = re.compile(
+    r"(?<![a-zA-Z0-9._%+\-])"   # not preceded by an email char
+    r"[a-zA-Z0-9._%+\-]{1,64}"  # local-part (max 64 per RFC)
+    r"@"
+    r"[a-zA-Z0-9\-]{1,63}"      # domain label
+    r"(?:\.[a-zA-Z0-9\-]{1,63})*"  # optional sub-domains
+    r"\.[a-zA-Z]{2,}"            # TLD — alpha-only, no digits
+    r"(?![a-zA-Z0-9._%+\-])",   # not followed by an email char
+    re.IGNORECASE,
+)
+# Fallback phone RE used ONLY when the planner provides no phone_regex.
+# Very loose on purpose — it is just a candidate collector; _clean_phone
+# and phonenumbers.parse do the real validation.
+_PHONE_RE_FALLBACK = re.compile(r"\+?\d[\d\s().\-]{7,}\d")
+# Substrings that mark a regex 'email' match as junk.
 JUNK_EMAIL_HINTS = (
     "example.", "yourdomain", "domain.com", "email@", "sentry", "wixpress",
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", "@2x", "u003e", "name@",
+    "noreply@", "no-reply@", "donotreply@",
 )
 
 # Domains that are directories/aggregators/social, not a business's own site.
@@ -194,8 +219,10 @@ CSV_HEADERS = [
     "email",
     "phone_number",
     "physical_address",
-    "scrape_source_method",  # "NATIVE" or "ZENROWS"
+    "scrape_source_method",  # "NATIVE" or "SCRAPEDO"
+    "date_added",            # ISO-8601 UTC timestamp this row was first stored
     "page_text",             # cleaned main content (nav/footer/cookie removed)
+    "raw_html",              # the page's raw HTML (kept separate from page_text)
 ]
 
 # Tags whose contents are never useful page text and would pollute the store.
@@ -248,7 +275,30 @@ def _domain_key(url_or_host: str) -> str:
     Used to de-duplicate so a company's many subdomains count as one business.
     """
     ext = _TLD.extract_str(url_or_host)
-    return ext.registered_domain.lower() or ext.domain.lower()
+    # top_domain_under_public_suffix is the non-deprecated equivalent of registered_domain
+    domain = (
+        getattr(ext, "top_domain_under_public_suffix", None)
+        or getattr(ext, "registered_domain", None)
+        or ext.domain
+    )
+    return (domain or "").lower()
+
+
+_DOMAIN_IN_QUERY_RE = re.compile(r"\b((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})\b")
+
+
+def _detect_domain(text: str) -> str:
+    """Return the registered domain mentioned in a query, else "".
+
+    Fallback for specific-search detection when the planner doesn't flag one
+    (e.g. the user types "xyzmarina.com"). Validates against the public suffix
+    list so "e.g." or "5.5" aren't mistaken for domains.
+    """
+    for match in _DOMAIN_IN_QUERY_RE.findall(text or ""):
+        candidate = match.lower().removeprefix("www.")
+        if _TLD.extract_str(candidate).suffix:  # has a real TLD
+            return _domain_key(candidate)
+    return ""
 
 
 def _strip_tracking(url: str) -> str:
@@ -364,28 +414,105 @@ async def harvest_directory(
     return found
 
 
-async def discover_targets(
-    session: aiohttp.ClientSession, query: str, limit: int
-) -> List[Dict[str, Any]]:
-    """Discover candidate business websites via paginated Serper web search.
+# === Search-state persistence ==============================================
+_state_lock = threading.Lock()
 
-    Google web search (unlike Maps Places) returns the business's own website
-    directly and paginates, so we can scale to the requested `limit`. Results
-    are de-duplicated by host and filtered against known aggregator/social
-    domains. Each target: {title, website, snippet}.
+
+def _load_search_state() -> Dict[str, int]:
+    """Load {query -> next_serper_page} from disk. Returns {} if missing."""
+    try:
+        with open(SEARCH_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_search_state(state: Dict[str, int]) -> None:
+    with _state_lock:
+        with open(SEARCH_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+# === Phone formatting ======================================================
+def _format_phone(raw: str, country_hint: str = "") -> str:
+    """Parse and format a phone number into E.164 (+XXXXXXXXXXX).
+
+    Falls back to the cleaned raw string when parsing fails — better to store
+    an unformatted but real number than drop it entirely. `country_hint` is a
+    two-letter ISO country code derived from the site's geo_location (e.g. "US",
+    "AE", "GB") so local numbers without a leading + are still parsed correctly.
+    """
+    if not raw:
+        return raw
+    raw = raw.strip()
+    # Try with the geo hint first, then without (handles explicit + numbers).
+    for region in ([country_hint.upper()] if country_hint else []) + [None]:
+        try:
+            parsed = phonenumbers.parse(raw, region)
+            if phonenumbers.is_valid_number(parsed):
+                return phonenumbers.format_number(
+                    parsed, phonenumbers.PhoneNumberFormat.E164
+                )
+        except phonenumbers.NumberParseException:
+            continue
+    # Not parseable — keep the digit-validated raw value from _clean_phone.
+    return raw
+
+
+# Map common country/city strings to ISO-3166-1 alpha-2 codes for the hint.
+_GEO_TO_COUNTRY: Dict[str, str] = {
+    "usa": "US", "united states": "US", "texas": "US", "florida": "US",
+    "california": "US", "new york": "US", "miami": "US", "houston": "US",
+    "uae": "AE", "dubai": "AE", "abu dhabi": "AE", "united arab emirates": "AE",
+    "uk": "GB", "united kingdom": "GB", "london": "GB",
+    "canada": "CA", "australia": "AU", "germany": "DE",
+    "france": "FR", "india": "IN", "singapore": "SG",
+    "qatar": "QA", "saudi arabia": "SA", "bahrain": "BH",
+    "malaysia": "MY", "thailand": "TH", "portugal": "PT",
+    "spain": "ES", "italy": "IT", "mexico": "MX",
+}
+
+
+def _country_code_from_geo(geo: str) -> str:
+    """Return a best-guess ISO country code from a geo_location string."""
+    low = geo.lower()
+    for token, code in _GEO_TO_COUNTRY.items():
+        if token in low:
+            return code
+    return ""
+
+
+async def discover_targets(
+    session: aiohttp.ClientSession,
+    query: str,
+    limit: int,
+    exclude_domains: Optional[Set[str]] = None,
+    start_page: int = 1,
+) -> tuple[List[Dict[str, Any]], int]:
+    """Paginated Serper web search starting at `start_page`.
+
+    Returns (targets, last_page_fetched). The caller persists `last_page_fetched`
+    so the next run resumes from `last_page_fetched + 1` instead of page 1,
+    progressively working deeper into Google results across repeated queries.
+    `exclude_domains` seeds the dedup set so already-stored businesses are skipped.
     """
     if not SERPER_API_KEY:
         logger.error("Serper key missing (set `serper` or `SERPER_API_KEY` in .env).")
-        return []
+        return [], start_page
 
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-    logger.info("Discovery query: %r (target %d businesses)", query, limit)
+    logger.info(
+        "Discovery query: %r | pages %d+ | target %d new | %d known excluded",
+        query, start_page, limit, len(exclude_domains or ()),
+    )
 
     targets: List[Dict[str, Any]] = []
-    directories: List[str] = []  # listicle/directory pages to harvest if short
-    seen_hosts: Set[str] = set()
-    page = 1
-    while len(targets) < limit and page <= MAX_SEARCH_PAGES:
+    directories: List[str] = []
+    seen_hosts: Set[str] = set(exclude_domains or ())
+    page = start_page
+    last_page = start_page
+
+    while len(targets) < limit and page <= start_page + MAX_SEARCH_PAGES - 1:
         payload = {"q": query, "num": SEARCH_RESULTS_PER_PAGE, "page": page}
         try:
             async with session.post(
@@ -402,8 +529,10 @@ async def discover_targets(
 
         organic = data.get("organic", [])
         if not organic:
+            logger.info("Serper returned no results at page %d — end of index.", page)
             break
 
+        last_page = page
         for item in organic:
             link = item.get("link", "")
             title = item.get("title", "") or ""
@@ -412,8 +541,6 @@ async def discover_targets(
             domain = _domain_key(link)
             if not host or domain in seen_hosts or _is_aggregator(host):
                 continue
-            # Directories/listicles are a SOURCE of leads, not the lead itself —
-            # stash them to harvest outbound links from if we come up short.
             if _looks_like_article(title, parsed.path):
                 directories.append(link)
                 continue
@@ -427,7 +554,7 @@ async def discover_targets(
 
     direct_count = len(targets)
 
-    # Top up from directories: follow their outbound links to real businesses.
+    # Top up from directories when direct results fell short.
     for directory_url in directories[:MAX_DIRECTORIES_TO_HARVEST]:
         if len(targets) >= limit:
             break
@@ -437,10 +564,10 @@ async def discover_targets(
         targets.extend(harvested)
 
     logger.info(
-        "Discovery collected %d business sites (%d direct, %d harvested from %d directories).",
-        len(targets), direct_count, len(targets) - direct_count, len(directories),
+        "Discovery: %d sites (%d direct, %d harvested) | pages %d-%d",
+        len(targets), direct_count, len(targets) - direct_count, start_page, last_page,
     )
-    return targets
+    return targets, last_page
 
 
 # === Step 3: Two-tier scavenger scrape =====================================
@@ -474,11 +601,13 @@ async def execute_scavenger_scrape(
         return {"html": "", "method": "FAILED"}
 
     logger.info("Tier-2 Scrape.do escalation: %s", target_url)
-    params = {
+    params: Dict[str, str] = {
         "token": SCRAPEDO_API_KEY,
         "url": target_url,
-        "render": "true",   # render JS like a real browser
-        "super": "true",    # use premium / residential proxies
+        # render=true and super=true require paid add-ons; omit both so the
+        # request works on the base plan. Add them back if the account upgrades:
+        #   "render": "true",   # JS rendering
+        #   "super": "true",    # premium residential proxies
     }
     try:
         async with session.get(
@@ -543,16 +672,34 @@ def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[
     return links
 
 
+def _contact_priority(url: str) -> int:
+    """Return a sort key for crawl ordering: lower = fetch sooner.
+
+    Contact/about pages are fetched before product/news/gallery pages because
+    they have 10x higher email density. Everything else gets equal priority.
+    """
+    path = urlparse(url).path.lower().strip("/")
+    last_segment = path.rsplit("/", 1)[-1]
+    if last_segment in CONTACT_PAGE_HINTS or path in CONTACT_PAGE_HINTS:
+        return 0   # highest priority
+    for hint in CONTACT_PAGE_HINTS:
+        if hint in path:
+            return 1
+    return 2       # normal pages
+
+
 async def crawl_site(
     session: aiohttp.ClientSession,
     root_url: str,
     root_html: str,
     root_method: str,
 ) -> List[Dict[str, str]]:
-    """Breadth-first crawl of one business site, starting from an already-fetched
-    homepage. Internal pages are fetched natively (cheap); the expensive two-tier
-    scrape was already spent on the homepage. Returns one entry per page:
-    {page_url, html, method}, capped at MAX_PAGES_PER_SITE / MAX_CRAWL_DEPTH.
+    """Contact-first crawl of one business site.
+
+    Contact/about pages are always fetched before other subpages because they
+    have the highest email density. The homepage was already fetched via the
+    two-tier scrape; everything else uses the cheap native GET.
+    Returns [{page_url, html, method}] capped at MAX_PAGES_PER_SITE.
     """
     root_domain = _domain_key(root_url)
     pages: List[Dict[str, str]] = [
@@ -560,10 +707,11 @@ async def crawl_site(
     ]
     visited: Set[str] = {_normalize_page_url(root_url)}
 
-    # Seed the queue with the homepage's internal links at depth 1.
-    queue: List[tuple[str, int]] = [
-        (link, 1) for link in _extract_internal_links(root_html, root_url, root_domain)
-    ]
+    # Sort links by contact-page priority before queuing — contact/about first.
+    raw_links = _extract_internal_links(root_html, root_url, root_domain)
+    prioritised = sorted(raw_links, key=_contact_priority)
+    queue: List[tuple[str, int]] = [(link, 1) for link in prioritised]
+
     head = 0
     while head < len(queue) and len(pages) < MAX_PAGES_PER_SITE:
         page_url, depth = queue[head]
@@ -579,7 +727,8 @@ async def crawl_site(
         pages.append({"page_url": page_url, "html": html, "method": "NATIVE"})
 
         if depth < MAX_CRAWL_DEPTH:
-            for link in _extract_internal_links(html, page_url, root_domain):
+            inner = _extract_internal_links(html, page_url, root_domain)
+            for link in sorted(inner, key=_contact_priority):
                 if _normalize_page_url(link) not in visited:
                     queue.append((link, depth + 1))
 
@@ -658,15 +807,28 @@ def extract_page_fields(html: str) -> Dict[str, str]:
     }
 
 
-def extract_clean_text(html: str) -> str:
-    """Back-compat shim: just the cleaned body text (see extract_page_fields)."""
-    return extract_page_fields(html)["page_text"]
-
-
 def _valid_email(candidate: str) -> bool:
-    """Reject asset filenames, placeholders and tracker pseudo-emails."""
+    """Reject asset filenames, placeholders, noreply, and malformed addresses."""
+    if not candidate or "@" not in candidate:
+        return False
     low = candidate.lower()
-    return "@" in low and not any(h in low for h in JUNK_EMAIL_HINTS)
+    if any(h in low for h in JUNK_EMAIL_HINTS):
+        return False
+    local, _, domain = candidate.partition("@")
+    # Local part must exist and not be all dots
+    if not local or local.replace(".", "") == "":
+        return False
+    # Domain must have at least one dot and a TLD of 2+ alpha chars
+    parts = domain.split(".")
+    if len(parts) < 2:
+        return False
+    tld = parts[-1]
+    if not tld.isalpha() or len(tld) < 2:
+        return False
+    # Reject consecutive dots
+    if ".." in candidate:
+        return False
+    return True
 
 
 def _decode_cf_email(encoded: str) -> Optional[str]:
@@ -687,65 +849,82 @@ def _decode_cf_email(encoded: str) -> Optional[str]:
         return None
 
 
+def _extract_json_values(obj: Any, key: str) -> List[str]:
+    """Recursively collect all string values for `key` in a JSON structure."""
+    results: List[str] = []
+    if isinstance(obj, dict):
+        if key in obj and isinstance(obj[key], str):
+            results.append(obj[key])
+        for v in obj.values():
+            results.extend(_extract_json_values(v, key))
+    elif isinstance(obj, list):
+        for item in obj:
+            results.extend(_extract_json_values(item, key))
+    return results
+
+
 def _clean_phone(candidate: str) -> Optional[str]:
-    """Normalize-validate a phone candidate; reject dates and non-phone noise."""
+    """Reject dates and strings with too few/many digits; return the stripped string."""
     candidate = candidate.strip()
-    # Reject obvious dates like 09.27.2024 or 27-09-2024.
     if re.fullmatch(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4}", candidate):
         return None
     digits = re.sub(r"\D", "", candidate)
-    if not 9 <= len(digits) <= 15:  # real phone numbers fall in this range
+    if not 7 <= len(digits) <= 15:
         return None
     return candidate
 
 
-def extract_contacts(html: str, text: str) -> Dict[str, Optional[str]]:
-    """Best-effort email + phone extraction from a scraped page.
 
-    Email: Cloudflare-decoded address first, then mailto:, then regex.
-    Phone: a "+"-prefixed number shown in the text wins (that's the salon's real
-    line), then a tel: link, then any other number — so booking-widget toll-free
-    tel: links don't shadow the real local number. Returns {email, phone}.
+
+def extract_contacts(
+    html: str,
+    text: str,
+    country_code: str = "",
+    phone_regex: str = "",
+    site_domain: str = "",
+) -> Dict[str, Optional[str]]:
+    """Extract and format email + phone from a scraped page.
+
+    Email: delegated entirely to EmailExtractor (8 ranked stages).
+    Phone: LLM-generated country regex → E.164 via phonenumbers.
     """
-    email: Optional[str] = None
     phone: Optional[str] = None
     soup = BeautifulSoup(html or "", "lxml")
 
-    # --- Email: Cloudflare-protected -> mailto: -> regex over visible text. ---
-    for el in soup.find_all(attrs={"data-cfemail": True}):
-        real = _decode_cf_email(el.get("data-cfemail", ""))
-        if real and _valid_email(real):
-            email = real
-            break
-    if email is None:
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if href.lower().startswith("mailto:"):
-                cand = href[len("mailto:"):].split("?")[0].strip()
-                if _valid_email(cand):
-                    email = cand
-                    break
-    if email is None:
-        for match in EMAIL_RE.findall(text or ""):
-            if _valid_email(match):
-                email = match
+    # === Email ================================================================
+    email: Optional[str] = EmailExtractor(html or "", site_domain=site_domain).best()
+
+    # === Phone ================================================================
+    # Compile the LLM-generated regex when provided; fall back to loose pattern.
+    if phone_regex:
+        try:
+            active_re = re.compile(phone_regex, re.IGNORECASE | re.MULTILINE)
+        except re.error:
+            active_re = _PHONE_RE_FALLBACK
+    else:
+        active_re = _PHONE_RE_FALLBACK
+
+    # tel: link is the most reliable source (explicitly marked up by the site).
+    tel_phone: Optional[str] = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().startswith("tel:"):
+            raw = href[len("tel:"):].strip()
+            if _clean_phone(raw):
+                tel_phone = _format_phone(raw, country_code)
                 break
 
-    # --- Phone: prefer a "+"-format number in the text, then tel:, then any. ---
-    text_phones = [
-        c for c in (_clean_phone(m) for m in PHONE_RE.findall(text or "")) if c
-    ]
-    phone = next((p for p in text_phones if p.lstrip().startswith("+")), None)
-    if phone is None:
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if href.lower().startswith("tel:"):
-                cand = _clean_phone(href[len("tel:"):])
-                if cand:
-                    phone = cand
-                    break
-    if phone is None and text_phones:
-        phone = text_phones[0]
+    # Visible text: only strings matched by the country-specific regex.
+    text_phones: List[str] = []
+    for m in active_re.findall(text or ""):
+        raw = m if isinstance(m, str) else m[0]  # findall may return tuples for groups
+        cleaned = _clean_phone(raw)
+        if cleaned:
+            text_phones.append(_format_phone(cleaned, country_code))
+
+    # Prefer an explicit E.164 (+…) number from text, then tel:, then first found.
+    intl_phone = next((p for p in text_phones if p.startswith("+")), None)
+    phone = intl_phone or tel_phone or (text_phones[0] if text_phones else None)
 
     return {"email": email, "phone": phone}
 
@@ -784,7 +963,9 @@ def _lead_to_row(lead: Dict[str, Any]) -> List[str]:
         lead.get("phone_number", "N/A"),
         lead.get("physical_address", "N/A"),
         lead.get("scrape_source_method", "FAILED"),
+        lead.get("date_added", ""),
         str(lead.get("page_text", "")),
+        str(lead.get("raw_html", "")),
     ]
 
 
@@ -831,60 +1012,6 @@ def append_records_to_csv(records: List[Dict[str, Any]]) -> None:
                 writer.writerow(_lead_to_row(lead))
     logger.debug("Saved %d page row(s) for %s",
                  len(records), records[0].get("company_name"))
-
-
-def reorganize_csv() -> Dict[str, int]:
-    """Tidy the store so it's easy to read: drop duplicate pages, group every
-    business's pages into one contiguous block (homepage first), and sort the
-    businesses alphabetically. Backs the file up first. Returns row counts.
-    """
-    if not os.path.exists(OUTPUT_CSV_FILE):
-        return {"before": 0, "after": 0, "businesses": 0}
-
-    with open(OUTPUT_CSV_FILE, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    before = len(rows)
-
-    # Dedupe by canonical (site, page); keep the last (most recent) copy.
-    deduped: Dict[tuple, Dict[str, str]] = {}
-    for row in rows:
-        site = _strip_tracking(row.get("website_url", "") or "")
-        page = _strip_tracking(row.get("page_url", "") or site)
-        deduped[(site, page)] = row
-
-    # Group pages under their business.
-    groups: Dict[str, List[Dict[str, str]]] = {}
-    for (site, _page), row in deduped.items():
-        groups.setdefault(site, []).append(row)
-
-    def _page_sort_key(row: Dict[str, str]) -> tuple:
-        # Homepage (empty/root path) sorts first, then alphabetical by URL.
-        page = _strip_tracking(row.get("page_url", "") or "")
-        path = urlparse(page).path.rstrip("/")
-        return (path != "", path, page)
-
-    ordered_sites = sorted(
-        groups, key=lambda s: (groups[s][0].get("company_name") or "").lower()
-    )
-
-    after = 0
-    with open(OUTPUT_CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-        writer.writeheader()
-        for site in ordered_sites:
-            for row in sorted(groups[site], key=_page_sort_key):
-                out = {k: row.get(k, "") for k in CSV_HEADERS}
-                # Normalize stored URLs too, so the file matches the cache keys.
-                out["website_url"] = site
-                out["page_url"] = _strip_tracking(out.get("page_url", "") or site)
-                writer.writerow(out)
-                after += 1
-
-    logger.info(
-        "Reorganized store: %d -> %d rows across %d businesses (deduped %d).",
-        before, after, len(groups), before - after,
-    )
-    return {"before": before, "after": after, "businesses": len(groups)}
 
 
 def load_cache() -> Dict[str, List[Dict[str, str]]]:
@@ -987,6 +1114,8 @@ async def process_single_lead(
     include_keywords: List[str],
     industry: str = "",
     geo: str = "",
+    country_code: str = "",
+    phone_regex: str = "",
 ) -> Dict[str, Any]:
     """Cache-check, crawl the whole site, persist every page, then qualify the
     business across all of its pages combined (Step 5) and classify its
@@ -1032,12 +1161,17 @@ async def process_single_lead(
     page_records: List[Dict[str, Any]] = []
     page_lines: List[List[str]] = []
     email = phone = None
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # country_code and phone_regex come from the planner (passed in as args).
     for page in pages:
         fields = extract_page_fields(page["html"])
         page_text = fields["page_text"]
         if not page_text.strip():
             continue
-        contacts = extract_contacts(page["html"], page_text)
+        contacts = extract_contacts(
+            page["html"], page_text, country_code, phone_regex,
+            site_domain=_domain_key(url),
+        )
         email = email or contacts["email"]
         phone = phone or contacts["phone"]
         page_records.append(
@@ -1051,7 +1185,9 @@ async def process_single_lead(
                 "phone_number": contacts["phone"] or "N/A",
                 "physical_address": "N/A",  # web-search discovery has no address
                 "scrape_source_method": page["method"],
+                "date_added": now_iso,
                 "page_text": page_text,
+                "raw_html": page["html"],
             }
         )
         page_lines.append(fields["lines"])
@@ -1095,6 +1231,11 @@ async def process_single_lead(
             "classification": classification}
 
 
+def _is_lead_count(results: List[Dict[str, Any]]) -> int:
+    """Count results that were successfully scraped (status != failed/no_website)."""
+    return sum(1 for r in results if r.get("status") == "scraped")
+
+
 async def run_pipeline(
     user_query: str, limit: Optional[int] = None, concurrency: int = 5
 ) -> Dict[str, Any]:
@@ -1133,50 +1274,144 @@ async def run_pipeline(
     effective_limit = max(1, int(effective_limit))
     summary["limit"] = effective_limit
 
+    exclude_keywords = plan.get("exclude_keywords", []) or []
+    include_keywords = plan.get("include_keywords", []) or []
+    industry = plan.get("broad_industry", "") or ""
+    geo = plan.get("geo_location", "") or ""
+    country_code = plan.get("country_code", "") or ""
+    phone_regex = plan.get("phone_regex", "") or ""
+    if phone_regex:
+        logger.info("Phone regex for %s: %s", country_code or geo, phone_regex)
+
+    # Known businesses already in the store, keyed by registered domain.
+    existing_by_domain: Dict[str, tuple] = {}
+    for key, rows in cache.items():
+        existing_by_domain.setdefault(_domain_key(key), (key, rows))
+
+    # General vs specific (planner first, domain-in-query as fallback).
+    search_type = (plan.get("search_type") or "general").lower()
+    target_domain = (plan.get("target_domain") or "").strip().lower().removeprefix("www.")
+    if not target_domain:
+        detected = _detect_domain(user_query)
+        if detected:
+            target_domain, search_type = detected, "specific"
+    summary["search_type"] = search_type
+
+    def _is_lead(r: Dict[str, Any]) -> bool:
+        return bool(
+            r.get("qualification", {}).get("qualified")
+            and (r.get("classification") or {}).get("category", "match") == "match"
+        )
+
+    results: List[Dict[str, Any]] = []
     semaphore = asyncio.Semaphore(concurrency)
     async with aiohttp.ClientSession() as session:
-        query = plan.get("search_query") or (
-            f"{plan.get('broad_industry', '')} in {plan.get('geo_location', '')}".strip()
-        )
-        # Always sweep the top 10 Google (Serper) pages for every query, so the
-        # candidate pool is as wide as possible regardless of the requested
-        # count. Capped at MAX_CANDIDATE_POOL for safety.
-        targets = await discover_targets(session, query, MAX_CANDIDATE_POOL)
-        summary["discovered"] = len(targets)
-        if not targets:
-            logger.critical("No candidate businesses found. Halting pipeline.")
-            return summary
+        query = plan.get("search_query") or f"{industry} in {geo}".strip()
 
-        exclude_keywords = plan.get("exclude_keywords", []) or []
-        include_keywords = plan.get("include_keywords", []) or []
-        industry = plan.get("broad_industry", "") or ""
-        geo = plan.get("geo_location", "") or ""
-
-        def _is_lead(r: Dict[str, Any]) -> bool:
-            return bool(
-                r.get("qualification", {}).get("qualified")
-                and (r.get("classification") or {}).get("category", "match") == "match"
-            )
-
-        # Scrape EVERY discovered candidate from the top search pages — no early
-        # stop on the requested count, for maximum coverage per query.
-        logger.info("Scraping all %d discovered candidates.", len(targets))
-        results: List[Dict[str, Any]] = []
-        for idx in range(0, len(targets), concurrency):
-            batch = targets[idx : idx + concurrency]
-            batch_results = await asyncio.gather(*[
-                process_single_lead(
-                    session, semaphore, target, cache, exclude_keywords,
-                    include_keywords, industry, geo,
+        if search_type == "specific":
+            # DB-FIRST: if we already have this business, return the stored record
+            # (re-qualified against the current keywords) without re-scraping.
+            if target_domain and target_domain in existing_by_domain:
+                key, rows = existing_by_domain[target_domain]
+                logger.info("Specific search: '%s' already in store — returning existing.",
+                            target_domain)
+                combined = " ".join(r.get("page_text", "") for r in rows)
+                email = next((r.get("email") for r in rows
+                              if r.get("email") not in (None, "", "N/A")), "N/A")
+                phone = next((r.get("phone_number") for r in rows
+                              if r.get("phone_number") not in (None, "", "N/A")), "N/A")
+                qualification, classification = await _evaluate_lead(
+                    industry, geo, rows[0].get("company_name") or target_domain,
+                    combined, exclude_keywords, include_keywords,
                 )
-                for target in batch
-            ])
-            results.extend(batch_results)
-            logger.info(
-                "Processed %d/%d candidates (%d qualified so far).",
-                len(results), len(targets),
-                sum(1 for r in results if _is_lead(r)),
-            )
+                results = [{
+                    "company_name": rows[0].get("company_name") or target_domain,
+                    "website_url": key, "status": "existing", "method": "CACHE",
+                    "pages": len(rows), "email": email, "phone": phone,
+                    "qualification": qualification, "classification": classification,
+                }]
+                summary["discovered"] = 1
+            else:
+                # New specific target: scrape just that one site (or top-1 by name).
+                if target_domain:
+                    targets = [{"title": target_domain,
+                                "website": f"https://{target_domain}/", "snippet": ""}]
+                else:
+                    targets, _ = await discover_targets(session, query, 1)
+                summary["discovered"] = len(targets)
+                for target in targets:
+                    results.append(await process_single_lead(
+                        session, semaphore, target, cache, exclude_keywords,
+                        include_keywords, industry, geo,
+                        country_code=country_code, phone_regex=phone_regex,
+                    ))
+        else:
+            # GENERAL: keep discovering and scraping in batches of `concurrency`
+            # until we have collected `effective_limit` SUCCESSFUL leads, or until
+            # Serper runs out of results. This ensures "50 marinas" means 50
+            # stored leads, not 50 attempts that might half-fail.
+            state = _load_search_state()
+            start_page = state.get(query, 1)
+            current_page = start_page
+            logger.info("General search — resuming from Serper page %d.", current_page)
+
+            exclude_set = set(existing_by_domain)
+            total_discovered = 0
+            last_page = current_page
+
+            while _is_lead_count(results) < effective_limit:
+                # Discover one batch worth of candidates from the current page.
+                batch_targets, last_page = await discover_targets(
+                    session, query,
+                    limit=concurrency * 2,   # fetch a small batch at a time
+                    exclude_domains=exclude_set,
+                    start_page=current_page,
+                )
+                if not batch_targets:
+                    logger.info(
+                        "Serper returned no more new results from page %d. "
+                        "Stopping (collected %d/%d leads).",
+                        current_page, _is_lead_count(results), effective_limit,
+                    )
+                    break
+
+                total_discovered += len(batch_targets)
+                # Add this batch's domains to the exclude set so the next
+                # iteration doesn't re-discover them.
+                for t in batch_targets:
+                    exclude_set.add(_domain_key(t["website"]))
+
+                batch_results = await asyncio.gather(*[
+                    process_single_lead(
+                        session, semaphore, target, cache, exclude_keywords,
+                        include_keywords, industry, geo,
+                        country_code=country_code, phone_regex=phone_regex,
+                    )
+                    for target in batch_targets
+                ])
+                results.extend(batch_results)
+                leads_so_far = _is_lead_count(results)
+                logger.info(
+                    "Leads: %d/%d | Serper pages used so far: %d-%d",
+                    leads_so_far, effective_limit, start_page, last_page,
+                )
+                # Advance past the pages we just consumed.
+                current_page = last_page + 1
+
+            # Persist the cursor for the next run.
+            state[query] = current_page
+            _save_search_state(state)
+            summary["serper_pages_used"] = f"{start_page}-{last_page}"
+            summary["next_run_starts_page"] = current_page
+            summary["discovered"] = total_discovered
+
+            if not results:
+                logger.critical(
+                    "No NEW businesses found from page %d onwards.",
+                    start_page,
+                )
+                summary["counts"] = {}
+                return summary
 
     summary["processed"] = len(results)
     summary["results"] = results
@@ -1222,6 +1457,10 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print("PHASE 1 OUTPUT RETURN")
     print("=" * 64)
     print(f"Query      : {summary['query']}")
+    print(f"Search type: {summary.get('search_type', 'general')}")
+    if summary.get("serper_pages_used"):
+        print(f"Serper pages used : {summary['serper_pages_used']}  "
+              f"| Next run starts at page {summary.get('next_run_starts_page')}")
     print(f"Plan       : {json.dumps(summary['plan'], ensure_ascii=False)}")
     print(
         f"Target leads: {summary.get('limit')}  |  Discovered : {summary['discovered']}"
@@ -1284,24 +1523,23 @@ def main() -> None:
         "--concurrency", type=int, default=5, help="Concurrent scrape workers."
     )
     parser.add_argument(
-        "--reorganize", action="store_true",
-        help="Tidy the CSV store (dedupe + group by business + sort) and exit.",
+        "--no-clean", action="store_true",
+        help="Skip the data-quality clean/format step after scraping.",
     )
     args = parser.parse_args()
 
-    if args.reorganize:
-        stats = reorganize_csv()
-        print(
-            f"Store reorganized: {stats['before']} -> {stats['after']} rows "
-            f"across {stats['businesses']} businesses "
-            f"(removed {stats['before'] - stats['after']} duplicates)."
-        )
-        return
-
+    # Stage 1 — collect: scrape + qualify into the raw store.
     summary = asyncio.run(
         run_pipeline(args.query, concurrency=args.concurrency)
     )
     print_summary(summary)
+
+    # Stage 2 — clean + format: derive the governed dataset in the same command.
+    # Imported lazily so data_pipeline (which imports this module) stays decoupled.
+    if not args.no_clean:
+        import data_pipeline
+        print("\n[clean] Running data-quality pipeline...")
+        data_pipeline.run(OUTPUT_CSV_FILE)
 
 
 if __name__ == "__main__":
