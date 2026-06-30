@@ -21,3 +21,4 @@ leads_clean.csv
 leads_quarantine.csv
 data_quality_report.txt
 results.json
+*.log
