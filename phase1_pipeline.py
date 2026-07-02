@@ -37,7 +37,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote
 
 import aiohttp
 import phonenumbers
@@ -78,6 +78,10 @@ OUTPUT_CSV_FILE = "scavenger_leads_cache.csv"
 # Tracks which Serper page each general-search query is up to, so the next run
 # picks up where the previous left off (pages 1-3 run 1 → pages 4-6 run 2…).
 SEARCH_STATE_FILE = "search_state.json"
+# Records the most recent query and the set of businesses it touched, so the
+# data-quality pipeline can scope its report to just the latest query instead of
+# the whole (cumulative) raw store.
+LAST_RUN_FILE = "last_run.json"
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 SCRAPEDO_URL = "https://api.scrape.do/"
@@ -95,17 +99,49 @@ HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 
 # Whole-site crawl: from each business homepage, follow same-domain internal
 # links and scrape every page (capped so a large site can't run forever).
-MAX_PAGES_PER_SITE = 8           # hard cap on pages scraped per business (fast)
+MAX_PAGES_PER_SITE = 12          # hard cap on pages scraped per business
 MAX_CRAWL_DEPTH = 1              # homepage + its direct links (about/contact)
+# Hard cap on fetch ATTEMPTS per site (successful or 404). Bounds the cost of
+# probing contact-path candidates that may not exist on a given site.
+MAX_FETCH_ATTEMPTS = 24
 
-# URL path fragments that indicate a contact/about page.
-# These are fetched before any other subpage because they have 10x higher
-# email density than product/gallery/news pages.
+# URL path fragments that indicate a contact/about page. Fetched before any
+# other subpage (10x higher email density) and used to filter sitemap URLs.
+# Multilingual: emails on EU sites live on Impressum/Kontakt/Contatti/etc., and
+# Germany/Austria/Switzerland legally MANDATE an Impressum page with contact data.
 CONTACT_PAGE_HINTS = frozenset({
+    # English
     "contact", "contact-us", "contactus", "reach-us", "get-in-touch",
     "about", "about-us", "aboutus", "team", "staff", "people",
-    "hello", "connect", "enquiry", "enquiries",
+    "hello", "connect", "enquiry", "enquiries", "imprint", "legal",
+    # German (impressum = legally required contact page)
+    "impressum", "kontakt", "ueber-uns", "uber-uns",
+    # French
+    "contactez-nous", "nous-contacter", "mentions-legales", "a-propos",
+    # Italian / Spanish / Portuguese / Dutch
+    "contatti", "chi-siamo", "contacto", "contactanos", "contato",
+    "quienes-somos", "sobre-nosotros",
 })
+
+# Explicit contact-page paths probed directly even when the homepage doesn't
+# link to them (unlinked /impressum, /contact pages are common).
+CONTACT_PATH_CANDIDATES = (
+    "/contact", "/contact-us", "/contactus", "/get-in-touch", "/reach-us",
+    "/about", "/about-us", "/team",
+    "/impressum", "/kontakt",            # DE/AT/CH
+    "/contatti",                          # IT
+    "/contacto",                          # ES
+    "/contato",                           # PT
+    "/contact-nl",                        # NL fallback
+    "/mentions-legales", "/nous-contacter",  # FR
+)
+
+# Where to look for an XML sitemap when robots.txt doesn't name one.
+SITEMAP_CANDIDATES = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml")
+MAX_SITEMAP_CONTACT_URLS = 20    # cap contact URLs harvested from sitemaps
+MAX_CHILD_SITEMAPS = 8           # cap nested sitemaps followed from an index
+_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
+_ROBOTS_SITEMAP_RE = re.compile(r"(?im)^\s*sitemap:\s*(\S+)\s*$")
 
 # Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
 # the LLM relevance classifier (Step 5.5). Turned OFF for now: we want the most
@@ -113,6 +149,21 @@ CONTACT_PAGE_HINTS = frozenset({
 # When False: every successfully scraped business is kept and stored, and NO
 # relevance LLM call is made (only the planner uses the LLM).
 LEAD_FILTERING_ENABLED = False
+
+# When True, each chosen email's domain is MX-validated (DNS only, no mail sent)
+# before it is accepted. Undeliverable/dead domains are dropped, so stored emails
+# are deliverable. Results are cached per domain so re-checks are free.
+VERIFY_EMAIL_MX = True
+
+# Confidence floor for accepting an email. An on-domain business address scores
+# ~100+; a business's own gmail clears this; a lone off-domain template/demo
+# address (e.g. "here@sota.my" on a .ae site) scores below it and is dropped —
+# storing no email is better than storing a wrong one.
+EMAIL_MIN_SCORE = 40
+
+# Separator used to pack multiple emails/phones into a single CSV cell, e.g.
+# "info@x.com | sales@x.com". Chosen so it never collides with an email/phone.
+CONTACT_SEP = " | "
 
 # Volatile URL query params that change between runs (Google's srsltid, ad-click
 # ids, UTM campaign tags). Stripped before a URL is used as a cache key so the
@@ -433,17 +484,50 @@ def _save_search_state(state: Dict[str, int]) -> None:
             json.dump(state, f, indent=2, ensure_ascii=False)
 
 
+def _save_last_run(query: str, results: List[Dict[str, Any]]) -> None:
+    """Record the latest query and the registered domains of the businesses it
+    touched, so the data-quality pipeline can scope its report to this run only.
+
+    Skipped when the run produced no results so a failed/empty run never wipes
+    the previous (still-valid) scope.
+    """
+    domains = sorted({
+        _domain_key(r.get("website_url") or "")
+        for r in results
+        if r.get("website_url")
+    } - {""})
+    if not domains:
+        return
+    payload = {
+        "query": query,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "domains": domains,
+    }
+    with open(LAST_RUN_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def load_last_run() -> Dict[str, Any]:
+    """Return the most recent run's scope ({query, timestamp, domains}) or {}."""
+    try:
+        with open(LAST_RUN_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 # === Phone formatting ======================================================
 def _format_phone(raw: str, country_hint: str = "") -> str:
     """Parse and format a phone number into E.164 (+XXXXXXXXXXX).
 
-    Falls back to the cleaned raw string when parsing fails — better to store
-    an unformatted but real number than drop it entirely. `country_hint` is a
-    two-letter ISO country code derived from the site's geo_location (e.g. "US",
-    "AE", "GB") so local numbers without a leading + are still parsed correctly.
+    Prefer a genuinely valid number formatted as E.164; if none of the regions
+    yields a valid number, keep the cleaned raw value rather than dropping it
+    (recall first — a possibly-messy real number beats an empty cell).
+    `country_hint` is a two-letter ISO code from the site's geo (e.g. "AE") so
+    local numbers without a leading + still parse.
     """
     if not raw:
-        return raw
+        return ""
     raw = raw.strip()
     # Try with the geo hint first, then without (handles explicit + numbers).
     for region in ([country_hint.upper()] if country_hint else []) + [None]:
@@ -455,8 +539,10 @@ def _format_phone(raw: str, country_hint: str = "") -> str:
                 )
         except phonenumbers.NumberParseException:
             continue
-    # Not parseable — keep the digit-validated raw value from _clean_phone.
-    return raw
+    # Not a valid number. Keep it ONLY if it explicitly carries an international
+    # "+" prefix (a real number we just can't validate); otherwise it's a stray
+    # digit run the regex mis-caught (e.g. "212206612192") — drop it.
+    return raw if raw.startswith("+") else ""
 
 
 # Map common country/city strings to ISO-3166-1 alpha-2 codes for the hint.
@@ -688,6 +774,87 @@ def _contact_priority(url: str) -> int:
     return 2       # normal pages
 
 
+def _path_is_contactish(url: str) -> bool:
+    """True if a URL's path looks like a contact/about/legal page (any language)."""
+    path = urlparse(url).path.lower()
+    return any(hint in path for hint in CONTACT_PAGE_HINTS)
+
+
+async def _discover_contact_urls(
+    session: aiohttp.ClientSession, root_url: str, root_domain: str
+) -> List[str]:
+    """Find the pages where emails actually live — via robots.txt, the XML
+    sitemap, and a fixed list of likely contact paths — WITHOUT fetching the
+    pages themselves. Returns ordered, deduped, same-domain absolute URLs.
+
+    This is the single biggest recall lever: contact data clusters on a handful
+    of predictable pages (contact/about/team/impressum), and the sitemap usually
+    hands us their exact URLs instead of us having to crawl and hope.
+    """
+    base = urlparse(root_url)
+    origin = f"{base.scheme}://{base.netloc}"
+    found: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(url: str) -> None:
+        if _domain_key(url) != root_domain:
+            return
+        norm = _normalize_page_url(url)
+        if norm not in seen:
+            seen.add(norm)
+            found.append(url)
+
+    # 1) Fixed probe list — deterministic, language-aware, catches UNLINKED pages.
+    for path in CONTACT_PATH_CANDIDATES:
+        _add(f"{origin}{path}")
+
+    # 2) robots.txt → authoritative Sitemap: locations (+ common defaults).
+    sitemap_urls: List[str] = []
+    robots = await _native_get(session, f"{origin}/robots.txt")
+    if robots:
+        sitemap_urls.extend(_ROBOTS_SITEMAP_RE.findall(robots))
+    sitemap_urls.extend(f"{origin}{p}" for p in SITEMAP_CANDIDATES)
+
+    # 3) Fetch sitemaps (following one level of sitemap-index nesting) and keep
+    #    only the contact-ish URLs.
+    harvested = 0
+    checked: Set[str] = set()
+    for sm in sitemap_urls:
+        if harvested >= MAX_SITEMAP_CONTACT_URLS:
+            break
+        sm_norm = _normalize_page_url(sm)
+        if sm_norm in checked or _domain_key(sm) != root_domain:
+            continue
+        checked.add(sm_norm)
+        xml = await _native_get(session, sm)
+        if not xml:
+            continue
+        locs = _LOC_RE.findall(xml)
+        # A sitemap index points to more sitemaps; follow them once.
+        if locs and all(loc.lower().endswith(".xml") for loc in locs[:3]):
+            for child in locs[:MAX_CHILD_SITEMAPS]:
+                if harvested >= MAX_SITEMAP_CONTACT_URLS:
+                    break
+                child_norm = _normalize_page_url(child)
+                if child_norm in checked or _domain_key(child) != root_domain:
+                    continue
+                checked.add(child_norm)
+                child_xml = await _native_get(session, child)
+                if not child_xml:
+                    continue
+                for loc in _LOC_RE.findall(child_xml):
+                    if _path_is_contactish(loc):
+                        _add(loc)
+                        harvested += 1
+        else:
+            for loc in locs:
+                if _path_is_contactish(loc):
+                    _add(loc)
+                    harvested += 1
+
+    return found
+
+
 async def crawl_site(
     session: aiohttp.ClientSession,
     root_url: str,
@@ -696,10 +863,15 @@ async def crawl_site(
 ) -> List[Dict[str, str]]:
     """Contact-first crawl of one business site.
 
-    Contact/about pages are always fetched before other subpages because they
-    have the highest email density. The homepage was already fetched via the
-    two-tier scrape; everything else uses the cheap native GET.
-    Returns [{page_url, html, method}] capped at MAX_PAGES_PER_SITE.
+    Order of attack:
+      1. Probe known contact pages discovered via robots.txt / sitemap / a fixed
+         path list (where emails actually live — including unlinked pages).
+      2. Then follow the homepage's own internal links, contact/about first.
+
+    The homepage was already fetched via the two-tier scrape; everything else
+    uses the cheap native GET. Bounded by MAX_PAGES_PER_SITE (pages kept) and
+    MAX_FETCH_ATTEMPTS (total fetches, so missing probes can't run up the cost).
+    Returns [{page_url, html, method}].
     """
     root_domain = _domain_key(root_url)
     pages: List[Dict[str, str]] = [
@@ -707,13 +879,24 @@ async def crawl_site(
     ]
     visited: Set[str] = {_normalize_page_url(root_url)}
 
-    # Sort links by contact-page priority before queuing — contact/about first.
-    raw_links = _extract_internal_links(root_html, root_url, root_domain)
-    prioritised = sorted(raw_links, key=_contact_priority)
-    queue: List[tuple[str, int]] = [(link, 1) for link in prioritised]
+    # High-value contact pages first (sitemap/robots/probe), then homepage links.
+    priority_urls = await _discover_contact_urls(session, root_url, root_domain)
+    homepage_links = sorted(
+        _extract_internal_links(root_html, root_url, root_domain),
+        key=_contact_priority,
+    )
+    # Priority URLs at depth 1; homepage links at depth 1 too, but after probes.
+    queue: List[tuple[str, int]] = (
+        [(u, 1) for u in priority_urls] + [(u, 1) for u in homepage_links]
+    )
 
     head = 0
-    while head < len(queue) and len(pages) < MAX_PAGES_PER_SITE:
+    attempts = 0
+    while (
+        head < len(queue)
+        and len(pages) < MAX_PAGES_PER_SITE
+        and attempts < MAX_FETCH_ATTEMPTS
+    ):
         page_url, depth = queue[head]
         head += 1
         norm = _normalize_page_url(page_url)
@@ -721,6 +904,7 @@ async def crawl_site(
             continue
         visited.add(norm)
 
+        attempts += 1
         html = await _native_get(session, page_url)
         if not html:
             continue
@@ -732,7 +916,10 @@ async def crawl_site(
                 if _normalize_page_url(link) not in visited:
                     queue.append((link, depth + 1))
 
-    logger.info("Crawled %d page(s) of %s", len(pages), root_domain)
+    logger.info(
+        "Crawled %d page(s) of %s (%d fetches, %d priority candidates)",
+        len(pages), root_domain, attempts, len(priority_urls),
+    )
     return pages
 
 
@@ -882,20 +1069,32 @@ def extract_contacts(
     country_code: str = "",
     phone_regex: str = "",
     site_domain: str = "",
-) -> Dict[str, Optional[str]]:
-    """Extract and format email + phone from a scraped page.
+    verify_mx: bool = False,
+    email_min_score: int = 0,
+) -> Dict[str, Any]:
+    """Extract ALL contact info from a scraped page: every email, every phone,
+    and the physical address.
 
-    Email: delegated entirely to EmailExtractor (8 ranked stages).
-    Phone: LLM-generated country regex → E.164 via phonenumbers.
+    Returns a dict with:
+      emails  : list[str] — all trustworthy addresses (on-domain/free first)
+      phones  : list[str] — all valid unique numbers (E.164 where possible)
+      address : str       — physical address (schema.org / <address>) or ""
+      email   : str|None  — the single best email (back-compat)
+      phone   : str|None  — the single best phone (back-compat)
+
+    Sync (BeautifulSoup + optional DNS) — call off the event loop via
+    asyncio.to_thread from async code.
     """
-    phone: Optional[str] = None
     soup = BeautifulSoup(html or "", "lxml")
 
-    # === Email ================================================================
-    email: Optional[str] = EmailExtractor(html or "", site_domain=site_domain).best()
+    # === Emails (all of them) ================================================
+    extractor = EmailExtractor(html or "", site_domain=site_domain)
+    emails = extractor.all_addresses(verify_mx=verify_mx)
+    # Keep a single "best" for back-compat / ranking display.
+    best_email = extractor.best(verify_mx=verify_mx, min_score=email_min_score) \
+        or (emails[0] if emails else None)
 
-    # === Phone ================================================================
-    # Compile the LLM-generated regex when provided; fall back to loose pattern.
+    # === Phones (all valid, deduped) =========================================
     if phone_regex:
         try:
             active_re = re.compile(phone_regex, re.IGNORECASE | re.MULTILINE)
@@ -904,29 +1103,197 @@ def extract_contacts(
     else:
         active_re = _PHONE_RE_FALLBACK
 
-    # tel: link is the most reliable source (explicitly marked up by the site).
-    tel_phone: Optional[str] = None
+    phones: List[str] = []
+    seen_phones: set = set()
+
+    def _add_phone(candidate: str) -> None:
+        cleaned = _clean_phone(candidate)
+        if not cleaned:
+            return
+        formatted = _format_phone(cleaned, country_code)
+        if formatted and formatted not in seen_phones:
+            seen_phones.add(formatted)
+            phones.append(formatted)
+
+    # tel: links first (explicitly marked up; most reliable). URL-decode so a
+    # link like tel:(212)%20752-1163 parses correctly instead of storing "%20".
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if href.lower().startswith("tel:"):
-            raw = href[len("tel:"):].strip()
-            if _clean_phone(raw):
-                tel_phone = _format_phone(raw, country_code)
-                break
-
-    # Visible text: only strings matched by the country-specific regex.
-    text_phones: List[str] = []
+            _add_phone(unquote(href[len("tel:"):]).strip())
+    # Then every number matched in the visible text.
     for m in active_re.findall(text or ""):
-        raw = m if isinstance(m, str) else m[0]  # findall may return tuples for groups
-        cleaned = _clean_phone(raw)
-        if cleaned:
-            text_phones.append(_format_phone(cleaned, country_code))
+        raw = m if isinstance(m, str) else m[0]
+        _add_phone(raw)
 
-    # Prefer an explicit E.164 (+…) number from text, then tel:, then first found.
-    intl_phone = next((p for p in text_phones if p.startswith("+")), None)
-    phone = intl_phone or tel_phone or (text_phones[0] if text_phones else None)
+    # Prefer a validated international (+…) number as the single "best".
+    best_phone = (
+        next((p for p in phones if p.startswith("+")), None)
+        or (phones[0] if phones else None)
+    )
 
-    return {"email": email, "phone": phone}
+    # === Physical address ====================================================
+    address = _extract_address(soup, text)
+
+    return {
+        "emails": emails,
+        "phones": phones,
+        "address": address,
+        "email": best_email,
+        "phone": best_phone,
+    }
+
+
+# Street-type words that anchor a US/'/UK-style street address in free text.
+_STREET_SUFFIX = (
+    r"(?:street|st|avenue|ave|boulevard|blvd|road|rd|drive|dr|lane|ln|way|"
+    r"place|pl|court|ct|square|sq|plaza|parkway|pkwy|highway|hwy|terrace|"
+    r"suite|ste|floor|fl|unit)"
+)
+# "123 Main St, New York, NY 10001" — number + words + street-type + tail.
+_ADDRESS_RE = re.compile(
+    r"\d{1,6}\s+[A-Za-z0-9.\-'#, ]{2,45}?\b" + _STREET_SUFFIX +
+    r"\b\.?[A-Za-z0-9.,\-#/'’ ]{0,70}",
+    re.IGNORECASE,
+)
+_ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b|\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b")
+
+
+def _extract_address(soup: BeautifulSoup, text: str = "") -> str:
+    """Extract a physical address, trying the most reliable sources first:
+    schema.org JSON-LD → microdata → <address> tag → hCard → free-text pattern.
+    Returns "" when none is found."""
+    # 1) schema.org JSON-LD PostalAddress (most local-business sites)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        found = _find_postal_address(data)
+        if found:
+            return found
+    # 2) HTML5 microdata (itemprop="streetAddress" …)
+    md = _address_from_props(soup, "itemprop")
+    if md:
+        return md
+    # 3) <address> element
+    tag = soup.find("address")
+    if tag:
+        txt = " ".join(tag.get_text(" ", strip=True).split())
+        if len(txt) >= 8:
+            return txt
+    # 4) hCard microformat (class="adr" / "street-address" …)
+    hcard = _address_from_hcard(soup)
+    if hcard:
+        return hcard
+    # 5) Free-text fallback: a street-address pattern in the visible text.
+    return _address_from_text(text or soup.get_text(" "))
+
+
+def _address_from_props(soup: BeautifulSoup, attr: str) -> str:
+    """Assemble an address from elements tagged with schema address properties
+    (works for both microdata `itemprop` and RDFa-ish `property`)."""
+    parts: List[str] = []
+    for prop in ("streetAddress", "addressLocality", "addressRegion", "postalCode"):
+        el = soup.find(attrs={attr: re.compile(prop, re.IGNORECASE)})
+        if el:
+            val = el.get("content") or el.get_text(" ", strip=True)
+            if val and val.strip():
+                parts.append(val.strip())
+    return ", ".join(dict.fromkeys(parts)) if len(parts) >= 2 else ""
+
+
+def _address_from_hcard(soup: BeautifulSoup) -> str:
+    """Assemble an address from hCard microformat classes."""
+    adr = soup.find(class_=re.compile(r"\b(adr|address|vcard)\b", re.IGNORECASE))
+    if not adr:
+        return ""
+    parts: List[str] = []
+    for cls in ("street-address", "locality", "region", "postal-code"):
+        el = adr.find(class_=re.compile(cls, re.IGNORECASE))
+        if el:
+            t = el.get_text(" ", strip=True)
+            if t:
+                parts.append(t)
+    if len(parts) >= 2:
+        return ", ".join(dict.fromkeys(parts))
+    # Fall back to the whole hCard block's text if it looks address-like.
+    txt = " ".join(adr.get_text(" ", strip=True).split())
+    return txt if (8 <= len(txt) <= 120 and _ZIP_RE.search(txt)) else ""
+
+
+def _address_from_text(text: str) -> str:
+    """Last-resort: find a street-address pattern in visible text. Prefers a
+    match that also contains a ZIP/postcode (higher confidence)."""
+    if not text:
+        return ""
+    matches = [m.group(0).strip(" .,-") for m in _ADDRESS_RE.finditer(text)]
+    if not matches:
+        return ""
+    # Prefer a match that includes a postal code; else the first reasonable one.
+    with_zip = [m for m in matches if _ZIP_RE.search(m)]
+    best = " ".join((with_zip or matches)[0].split())
+    # If it ends in a ZIP, trim any trailing prose after it ("… 10065 today" →
+    # "… 10065") so the stored address is clean.
+    zip_hits = list(_ZIP_RE.finditer(best))
+    if zip_hits:
+        best = best[: zip_hits[-1].end()].strip(" .,-")
+    return best if 8 <= len(best) <= 120 else ""
+
+
+def _assemble_postal(d: Dict[str, Any]) -> str:
+    """Join the parts of a schema.org PostalAddress into one line."""
+    keys = ("streetAddress", "addressLocality", "addressRegion",
+            "postalCode", "addressCountry")
+    parts: List[str] = []
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, dict):          # addressCountry can be {name: "US"}
+            v = v.get("name", "")
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip())
+    return ", ".join(parts)
+
+
+def _find_postal_address(obj: Any) -> str:
+    """Recursively locate a PostalAddress (or an 'address' field) in JSON-LD."""
+    if isinstance(obj, dict):
+        t = obj.get("@type", "")
+        is_postal = (t == "PostalAddress"
+                     or (isinstance(t, list) and "PostalAddress" in t))
+        if is_postal:
+            assembled = _assemble_postal(obj)
+            if assembled:
+                return assembled
+        if "address" in obj:
+            addr = obj["address"]
+            if isinstance(addr, str) and len(addr.strip()) >= 8:
+                return addr.strip()
+            nested = _find_postal_address(addr)
+            if nested:
+                return nested
+        for v in obj.values():
+            nested = _find_postal_address(v)
+            if nested:
+                return nested
+    elif isinstance(obj, list):
+        for item in obj:
+            nested = _find_postal_address(item)
+            if nested:
+                return nested
+    return ""
+
+
+def _union_contacts(rows: List[Dict[str, Any]], field: str) -> List[str]:
+    """Collect all unique non-N/A values of `field` (which may hold several
+    values joined by CONTACT_SEP) across a set of stored page rows."""
+    out: List[str] = []
+    for r in rows:
+        for v in (r.get(field) or "").split(CONTACT_SEP):
+            v = v.strip()
+            if v and v != "N/A" and v not in out:
+                out.append(v)
+    return out
 
 
 def initialize_csv_storage_layer() -> None:
@@ -1134,10 +1501,8 @@ async def process_single_lead(
         rows = cache[url]
         logger.info("Cache HIT for %s (%d page(s)) — qualifying from cache.", url, len(rows))
         combined = " ".join(r.get("page_text", "") for r in rows)
-        email = next((r.get("email") for r in rows
-                      if r.get("email") not in (None, "", "N/A")), "N/A")
-        phone = next((r.get("phone_number") for r in rows
-                      if r.get("phone_number") not in (None, "", "N/A")), "N/A")
+        email = CONTACT_SEP.join(_union_contacts(rows, "email")) or "N/A"
+        phone = CONTACT_SEP.join(_union_contacts(rows, "phone_number")) or "N/A"
         qualification, classification = await _evaluate_lead(
             industry, geo, name, combined, exclude_keywords, include_keywords
         )
@@ -1160,7 +1525,10 @@ async def process_single_lead(
     combined_parts: List[str] = []
     page_records: List[Dict[str, Any]] = []
     page_lines: List[List[str]] = []
-    email = phone = None
+    # Accumulate ALL unique contacts across the whole site (order-preserving).
+    all_emails: List[str] = []
+    all_phones: List[str] = []
+    site_address = ""
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     # country_code and phone_regex come from the planner (passed in as args).
     for page in pages:
@@ -1168,12 +1536,23 @@ async def process_single_lead(
         page_text = fields["page_text"]
         if not page_text.strip():
             continue
-        contacts = extract_contacts(
+        # Run off the event loop: BeautifulSoup parsing is CPU-bound and MX
+        # verification does DNS I/O, neither of which should block other scrapes.
+        contacts = await asyncio.to_thread(
+            extract_contacts,
             page["html"], page_text, country_code, phone_regex,
-            site_domain=_domain_key(url),
+            _domain_key(url), VERIFY_EMAIL_MX, EMAIL_MIN_SCORE,
         )
-        email = email or contacts["email"]
-        phone = phone or contacts["phone"]
+        page_emails = contacts["emails"]
+        page_phones = contacts["phones"]
+        for e in page_emails:
+            if e not in all_emails:
+                all_emails.append(e)
+        for p in page_phones:
+            if p not in all_phones:
+                all_phones.append(p)
+        if not site_address and contacts["address"]:
+            site_address = contacts["address"]
         page_records.append(
             {
                 "company_name": name,
@@ -1181,9 +1560,9 @@ async def process_single_lead(
                 "page_url": page["page_url"],
                 "page_title": fields["page_title"],
                 "meta_description": fields["meta_description"],
-                "email": contacts["email"] or "N/A",
-                "phone_number": contacts["phone"] or "N/A",
-                "physical_address": "N/A",  # web-search discovery has no address
+                "email": CONTACT_SEP.join(page_emails) if page_emails else "N/A",
+                "phone_number": CONTACT_SEP.join(page_phones) if page_phones else "N/A",
+                "physical_address": contacts["address"] or "N/A",
                 "scrape_source_method": page["method"],
                 "date_added": now_iso,
                 "page_text": page_text,
@@ -1192,6 +1571,10 @@ async def process_single_lead(
         )
         page_lines.append(fields["lines"])
         combined_parts.append(page_text)
+
+    # Site-wide aggregated contacts (joined) for the cache + result summary.
+    email = CONTACT_SEP.join(all_emails) if all_emails else None
+    phone = CONTACT_SEP.join(all_phones) if all_phones else None
 
     if not page_records:
         logger.warning("No readable content on any page of %s", url)
@@ -1218,7 +1601,8 @@ async def process_single_lead(
     if is_lead:
         append_records_to_csv(page_records)  # contiguous block, homepage first
         cache[url] = [{"website_url": url, "page_text": combined,
-                       "email": email or "N/A", "phone_number": phone or "N/A"}]
+                       "email": email or "N/A", "phone_number": phone or "N/A",
+                       "physical_address": site_address or "N/A"}]
         logger.info("Saved %d page(s) for %s", len(page_records), name)
     else:
         reason = (classification or {}).get("category") or qualification.get("reason")
@@ -1316,10 +1700,8 @@ async def run_pipeline(
                 logger.info("Specific search: '%s' already in store — returning existing.",
                             target_domain)
                 combined = " ".join(r.get("page_text", "") for r in rows)
-                email = next((r.get("email") for r in rows
-                              if r.get("email") not in (None, "", "N/A")), "N/A")
-                phone = next((r.get("phone_number") for r in rows
-                              if r.get("phone_number") not in (None, "", "N/A")), "N/A")
+                email = CONTACT_SEP.join(_union_contacts(rows, "email")) or "N/A"
+                phone = CONTACT_SEP.join(_union_contacts(rows, "phone_number")) or "N/A"
                 qualification, classification = await _evaluate_lead(
                     industry, geo, rows[0].get("company_name") or target_domain,
                     combined, exclude_keywords, include_keywords,
@@ -1448,6 +1830,9 @@ async def run_pipeline(
         "Phase 1 complete. %d qualified leads (of %d processed). Store: %s",
         len(qualified), len(results), OUTPUT_CSV_FILE,
     )
+    # Record this query's scope so the data-quality report covers only the
+    # latest query, not the whole cumulative store.
+    _save_last_run(user_query, results)
     return summary
 
 
@@ -1526,6 +1911,10 @@ def main() -> None:
         "--no-clean", action="store_true",
         help="Skip the data-quality clean/format step after scraping.",
     )
+    parser.add_argument(
+        "--no-linkedin", action="store_true",
+        help="Skip finding each business's LinkedIn page after cleaning.",
+    )
     args = parser.parse_args()
 
     # Stage 1 — collect: scrape + qualify into the raw store.
@@ -1540,6 +1929,18 @@ def main() -> None:
         import data_pipeline
         print("\n[clean] Running data-quality pipeline...")
         data_pipeline.run(OUTPUT_CSV_FILE)
+
+        # Stage 3 — enrich: add each business's LinkedIn page to the same sheet.
+        if not args.no_linkedin:
+            import linkedin_finder
+            geo = (summary.get("plan") or {}).get("geo_location", "") or ""
+            print("\n[linkedin] Finding LinkedIn pages...")
+            try:
+                asyncio.run(linkedin_finder.enrich(
+                    data_pipeline.CLEAN_EXPORT, data_pipeline.CLEAN_EXPORT, geo
+                ))
+            except Exception as exc:  # noqa: BLE001 - enrichment is best-effort
+                logger.error("LinkedIn enrichment failed: %s", exc)
 
 
 if __name__ == "__main__":

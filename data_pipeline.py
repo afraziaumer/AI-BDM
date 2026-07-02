@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import phase1_pipeline as pp
+import email_extractor as ee
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
@@ -55,8 +56,17 @@ REPORT = "data_quality_report.txt"
 CLEAN_COLUMNS = [
     "company_name", "domain", "website_url", "email", "phone_number",
     "physical_address", "num_pages", "date_added", "page_title", "description",
+    "pages_scraped",
 ]
 DESCRIPTION_WIDTH = 280   # chars kept for the readable one-line description
+MAX_PHONES_PER_BUSINESS = 8   # cap the phone list (a bigger list = directory page)
+
+
+def _email_is_own(email: str, biz_domain: str) -> bool:
+    """True if an email is on the business's own registered domain or is a
+    free-webmail address (both are legitimate business contacts)."""
+    dom = email.split("@")[-1].lower().removeprefix("www.")
+    return pp._domain_key(dom) == biz_domain or dom in ee._FREE_PROVIDERS
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +125,21 @@ def _clean_cell(value: str) -> str:
     return pp._fix_mojibake(" ".join((value or "").split()))
 
 
+def _clean_multi(raw: str, is_valid, lower: bool = False) -> str:
+    """Clean a possibly-multi-valued cell (values joined by CONTACT_SEP): split,
+    validate each value, dedupe, and rejoin. Returns 'N/A' if none survive."""
+    out: List[str] = []
+    for v in (raw or "").split(pp.CONTACT_SEP):
+        v = v.strip()
+        if not v or v == "N/A":
+            continue
+        if lower:
+            v = v.lower()
+        if is_valid(v) and v not in out:
+            out.append(v)
+    return pp.CONTACT_SEP.join(out) if out else "N/A"
+
+
 def clean_rows(
     rows: List[Dict[str, str]]
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
@@ -139,9 +164,13 @@ def clean_rows(
             continue
 
         page_text = _clean_cell(r.get("page_text", ""))
-        email = (r.get("email", "") or "").strip()
-        email = email if (email and email != "N/A" and pp._valid_email(email)) else "N/A"
-        phone = pp._clean_phone(r.get("phone_number", "") or "") or "N/A"
+        # email / phone cells may hold several values joined by CONTACT_SEP.
+        email = _clean_multi(r.get("email", ""), pp._valid_email, lower=True)
+        # A phone is kept only if it validates or carries an international "+",
+        # so stray digit runs (e.g. "212206612192") are dropped here too.
+        phone = _clean_multi(
+            r.get("phone_number", ""), lambda p: bool(pp._format_phone(p))
+        )
 
         # A page with no text AND no contact carries no value -> drop.
         if not page_text and email == "N/A" and phone == "N/A":
@@ -154,7 +183,7 @@ def clean_rows(
             "page_url": pp._strip_tracking(r.get("page_url", "") or site),
             "page_title": _clean_cell(r.get("page_title", "")),
             "meta_description": _clean_cell(r.get("meta_description", "")),
-            "email": email.lower() if email != "N/A" else "N/A",
+            "email": email,
             "phone_number": phone,
             "physical_address": _clean_cell(r.get("physical_address", "")) or "N/A",
             "scrape_source_method": (r.get("scrape_source_method", "") or "").strip() or "N/A",
@@ -204,13 +233,28 @@ def to_business_level(pages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         home = rows_sorted[0]  # shortest path == homepage
 
         names = Counter(r["company_name"] for r in rows if r["company_name"])
-        email = next((r["email"] for r in rows if r["email"] != "N/A"), "N/A")
-        phone = next((r["phone_number"] for r in rows if r["phone_number"] != "N/A"), "N/A")
+        # Union every unique email / phone found across all of the site's pages.
+        emails = pp._union_contacts(rows, "email")
+        phones = pp._union_contacts(rows, "phone_number")
+        # Prefer the business's own-domain / free-webmail addresses: if any
+        # exist, drop off-domain leaks (e.g. "health@home.ms" mis-parsed from a
+        # "health at home" phrase). Only keep off-domain when there's nothing else.
+        preferred = [e for e in emails if _email_is_own(e, domain)]
+        emails = preferred if preferred else emails
+        # A single business rarely has 20 numbers — a huge list means a
+        # directory/locations page. Cap it (homepage/main number stays first).
+        phones = phones[:MAX_PHONES_PER_BUSINESS]
+        email = pp.CONTACT_SEP.join(emails) if emails else "N/A"
+        phone = pp.CONTACT_SEP.join(phones) if phones else "N/A"
         addr = next((r["physical_address"] for r in rows if r["physical_address"] != "N/A"), "N/A")
         dates = sorted(d for d in (r.get("date_added", "") for r in rows) if d)
 
         desc_source = home.get("meta_description") or home.get("page_text", "")
         description = _clean_cell(desc_source)[:DESCRIPTION_WIDTH]
+        # All pages we actually scraped for this business, so coverage is visible.
+        page_urls = list(dict.fromkeys(
+            r.get("page_url", "") for r in rows_sorted if r.get("page_url")
+        ))
 
         businesses.append({
             "company_name": names.most_common(1)[0][0] if names else domain,
@@ -223,6 +267,7 @@ def to_business_level(pages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
             "date_added": dates[0] if dates else "",
             "page_title": home.get("page_title", ""),
             "description": description,
+            "pages_scraped": pp.CONTACT_SEP.join(page_urls),
         })
 
     businesses.sort(key=lambda b: b["company_name"].lower())
@@ -260,8 +305,11 @@ def govern(
         problems = []
         if not b["domain"]:
             problems.append("missing_domain")
-        if b["email"] != "N/A" and not pp._valid_email(b["email"]):
-            problems.append("bad_email")
+        # email may hold several values joined by CONTACT_SEP; valid if any is.
+        if b["email"] != "N/A":
+            addrs = [e.strip() for e in b["email"].split(pp.CONTACT_SEP) if e.strip()]
+            if not any(pp._valid_email(e) for e in addrs):
+                problems.append("bad_email")
         if b["num_pages"] < 1:
             problems.append("no_pages")
         if b["email"] == "N/A" and b["phone_number"] == "N/A":
@@ -305,12 +353,20 @@ def write_quarantine(rejected_pages: List[Dict[str, str]],
 
 def write_report(prof: Dict[str, Any], stats: Dict[str, Any],
                  valid: List[Dict[str, Any]], rejected_n: int,
-                 invalid_n: int, path: str) -> None:
+                 invalid_n: int, path: str,
+                 last_run: Optional[Dict[str, Any]] = None) -> None:
     """Write a human-readable, wrapped data-quality report."""
+    last_run = last_run or {}
     lines: List[str] = []
     lines.append("=" * 70)
     lines.append("AI BDM — DATA QUALITY REPORT")
     lines.append(f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    if last_run.get("query"):
+        lines.append(f"Query    : {last_run['query']}")
+        lines.append(f"Scope    : latest query only "
+                     f"({len(last_run.get('domains') or [])} businesses)")
+    else:
+        lines.append("Scope    : entire store (all queries)")
     lines.append("=" * 70)
 
     lines.append("\n[1] PROFILING (raw store)")
@@ -356,11 +412,47 @@ def write_report(prof: Dict[str, Any], stats: Dict[str, Any],
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-def run(path: str = RAW_STORE, dry_run: bool = False) -> Dict[str, Any]:
-    """Run the full data-quality pipeline and write the outputs."""
+def scope_to_last_run(
+    rows: List[Dict[str, str]]
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """Filter raw rows to just the businesses touched by the most recent query.
+
+    Reads `last_run.json` (written by phase1_pipeline). If it's missing or names
+    no domains, returns the rows unchanged so the pipeline still works on a raw
+    store produced before this feature existed.
+    """
+    last = pp.load_last_run()
+    domains = set(last.get("domains") or [])
+    if not domains:
+        return rows, last
+    scoped = [
+        r for r in rows
+        if pp._domain_key(pp._strip_tracking(r.get("website_url", "") or "")) in domains
+    ]
+    return scoped, last
+
+
+def run(path: str = RAW_STORE, dry_run: bool = False,
+        scope_all: bool = False) -> Dict[str, Any]:
+    """Run the full data-quality pipeline and write the outputs.
+
+    By default the report covers only the latest query (per `last_run.json`).
+    Pass `scope_all=True` to process the entire cumulative store instead.
+    """
     raw = load_raw(path)
     if not raw:
         return {}
+
+    last_run: Dict[str, Any] = {}
+    if not scope_all:
+        scoped, last_run = scope_to_last_run(raw)
+        if last_run.get("domains"):
+            print(f"[scope]   latest query: {last_run.get('query', '?')!r} "
+                  f"-> {len(scoped)} of {len(raw)} rows "
+                  f"({len(last_run['domains'])} businesses)")
+            raw = scoped
+        else:
+            print("[scope]   no last_run.json found — processing entire store.")
 
     prof = profile(raw)
     clean, rejected = clean_rows(raw)
@@ -378,14 +470,14 @@ def run(path: str = RAW_STORE, dry_run: bool = False) -> Dict[str, Any]:
 
     if dry_run:
         print("[dry-run] no files written.")
-        write_report(prof, stats, valid, len(rejected), len(invalid), REPORT)
+        write_report(prof, stats, valid, len(rejected), len(invalid), REPORT, last_run)
         print(f"[report]  {REPORT}")
         return {"valid": len(valid), "invalid": len(invalid)}
 
     # Derive (read-only on the raw store): clean export, quarantine, report.
     write_clean_export(valid, CLEAN_EXPORT)
     write_quarantine(rejected, invalid, QUARANTINE)
-    write_report(prof, stats, valid, len(rejected), len(invalid), REPORT)
+    write_report(prof, stats, valid, len(rejected), len(invalid), REPORT, last_run)
 
     print(f"[write]   clean export -> {CLEAN_EXPORT}  ({len(valid)} businesses)")
     print(f"[write]   quarantine   -> {QUARANTINE}  ({len(rejected)} rows)")
@@ -399,8 +491,11 @@ def main() -> None:
     parser.add_argument("--store", default=RAW_STORE, help="CSV store to clean.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Profile + report only; write no output files.")
+    parser.add_argument("--all", action="store_true",
+                        help="Process the entire store instead of just the "
+                             "latest query (default: latest query only).")
     args = parser.parse_args()
-    run(args.store, dry_run=args.dry_run)
+    run(args.store, dry_run=args.dry_run, scope_all=args.all)
 
 
 if __name__ == "__main__":

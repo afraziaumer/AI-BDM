@@ -42,11 +42,33 @@ import base64
 import html as html_stdlib
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
 from urllib.parse import urlparse
 
+import tldextract
 from bs4 import BeautifulSoup
+
+# Offline public-suffix check (bundled snapshot; no network). Used to reject
+# fake-TLD placeholder addresses like "look@you.there" or "x@mt.sinai" that get
+# mis-parsed out of marketing prose ("look… you there", "feel at ease").
+_TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
+
+
+def _has_real_tld(domain: str) -> bool:
+    """True only if `domain` ends in a real registered public suffix (.com,
+    .org, .ae, .co.uk…). Rejects invented TLDs (.there, .sinai, .known)."""
+    ext = _TLD_EXTRACT(domain)
+    return bool(ext.domain and ext.suffix)
+
+# DNS is used only for the optional MX-validation step. The extractor still works
+# (extraction only, no validation) if dnspython is not installed.
+try:
+    import dns.resolver  # type: ignore
+    _DNS_AVAILABLE = True
+except ImportError:  # pragma: no cover - dnspython is a declared dependency
+    _DNS_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +80,7 @@ class EmailResult:
     address: str        # lowercased, validated e-mail address
     source: str         # extraction method that found it
     score: int          # higher = more likely to be the primary business email
+    mx_ok: Optional[bool] = None   # True/False after MX check; None = not checked
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, EmailResult) and self.address == other.address
@@ -84,6 +107,34 @@ _DEPRIORITISED_PREFIXES: Set[str] = {
     "postmaster", "abuse", "spam", "webmaster", "auto", "automated",
     "notification", "newsletter", "unsubscribe", "billing",
 }
+
+# Free webmail providers. A legitimate (small) business may use one, so these are
+# never rejected — only down-weighted vs an address on the business's own domain.
+_FREE_PROVIDERS: Set[str] = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "ymail.com",
+    "hotmail.com", "hotmail.co.uk", "outlook.com", "live.com", "msn.com",
+    "aol.com", "icloud.com", "me.com", "mac.com", "gmx.com", "gmx.net",
+    "gmx.de", "web.de", "mail.com", "protonmail.com", "proton.me", "zoho.com",
+    "yandex.com", "yandex.ru", "qq.com", "163.com", "126.com", "naver.com",
+}
+
+# Disposable / throwaway domains. An address here is worthless as a lead, so it
+# is hard-rejected during validation.
+_DISPOSABLE_DOMAINS: Set[str] = {
+    "mailinator.com", "guerrillamail.com", "10minutemail.com", "tempmail.com",
+    "temp-mail.org", "throwawaymail.com", "yopmail.com", "trashmail.com",
+    "getnada.com", "maildrop.cc", "dispostable.com", "fakeinbox.com",
+    "sharklasers.com", "guerrillamailblock.com", "mailnesia.com", "mintemail.com",
+    "spam4.me", "tempr.email", "discard.email", "33mail.com", "mailcatch.com",
+}
+
+# Looks like a person's name in the local part (john.smith, j.smith, jsmith).
+# Valuable for sales outreach; mild positive signal.
+_PERSON_LOCAL_RE = re.compile(r"^[a-z]+[._][a-z]+$|^[a-z]\.[a-z]+$")
+
+# --- MX cache (shared across pages/threads for the whole process) ---
+_mx_cache: dict = {}
+_mx_lock = threading.Lock()
 
 # HTML entities that represent the @ sign — very common in CMS anti-spam.
 _AT_ENTITIES = re.compile(
@@ -164,6 +215,8 @@ def _is_valid(address: str) -> bool:
     local, _, domain = low.partition("@")
     if not local or ".." in local or local.startswith(".") or local.endswith("."):
         return False
+    if domain in _DISPOSABLE_DOMAINS:        # throwaway address — useless as a lead
+        return False
     parts = domain.split(".")
     if len(parts) < 2:
         return False
@@ -175,7 +228,76 @@ def _is_valid(address: str) -> bool:
     # Reject numeric-only TLDs (version strings: "2.0.1")
     if all(c.isdigit() for c in tld):
         return False
+    # Reject invented TLDs (.there/.sinai/.known) mis-parsed from prose.
+    if not _has_real_tld(domain):
+        return False
     return True
+
+
+def domain_has_mx(domain: str, timeout: float = 3.0) -> Optional[bool]:
+    """Can this domain receive email? Returns True/False, or None if undecidable.
+
+    Checks MX records first; falls back to an A record (RFC 5321: a host with an
+    A record but no MX still accepts mail). Results are cached per domain for the
+    life of the process so the same domain is never looked up twice. Pure DNS —
+    no message is ever sent. Never raises.
+
+    None means "couldn't determine" (DNS timeout/error, or dnspython missing) —
+    callers should treat None as "keep, unverified", not as a failure.
+    """
+    domain = (domain or "").lower().strip().removeprefix("www.")
+    if not domain or "." not in domain:
+        return False
+    with _mx_lock:
+        if domain in _mx_cache:
+            return _mx_cache[domain]
+
+    result: Optional[bool] = None
+    if _DNS_AVAILABLE:
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = timeout
+            resolver.lifetime = timeout
+            try:
+                answers = resolver.resolve(domain, "MX")
+                result = len(answers) > 0
+            except dns.resolver.NoAnswer:
+                # No MX record — but an A record can still accept mail.
+                try:
+                    resolver.resolve(domain, "A")
+                    result = True
+                except Exception:  # noqa: BLE001
+                    result = False
+            except dns.resolver.NXDOMAIN:
+                result = False           # domain does not exist → undeliverable
+            except Exception:  # noqa: BLE001 - timeout / no nameservers / etc.
+                result = None            # undecidable, do not penalise
+        except Exception:  # noqa: BLE001
+            result = None
+
+    with _mx_lock:
+        _mx_cache[domain] = result
+    return result
+
+
+def _apply_mx_verification(results: List[EmailResult]) -> List[EmailResult]:
+    """Verify each candidate's domain can receive mail. Drops definitively
+    undeliverable addresses (NXDOMAIN / no MX & no A); annotates the rest.
+
+    Domains are looked up once (cached), so a page with five addresses on the
+    same domain costs one DNS round-trip.
+    """
+    kept: List[EmailResult] = []
+    for r in results:
+        domain = r.address.split("@", 1)[1]
+        mx = domain_has_mx(domain)
+        r.mx_ok = mx
+        if mx is False:
+            continue                     # undeliverable — discard
+        if mx is True:
+            r.score += 25                # confirmed deliverable
+        kept.append(r)
+    return kept
 
 
 def _normalise_obfuscated(raw: str) -> str:
@@ -228,6 +350,16 @@ def _decode_base64_email(s: str) -> Optional[str]:
     return None
 
 
+def _domains_match(addr_domain: str, site_domain: str) -> bool:
+    """True if an email domain belongs to the scraped site (same domain, or a
+    sub/parent domain of it). Handles info@mail.marina.com vs marina.com."""
+    a = addr_domain.lower().removeprefix("www.")
+    s = site_domain.lower().removeprefix("www.")
+    if not a or not s:
+        return False
+    return a == s or a.endswith("." + s) or s.endswith("." + a)
+
+
 def _score(address: str, site_domain: str) -> int:
     """Score an email address by business-contact quality (higher = better)."""
     score = 50  # base
@@ -236,18 +368,28 @@ def _score(address: str, site_domain: str) -> int:
     clean_site = site_domain.lower().removeprefix("www.")
 
     # Strong positive: domain matches the site we scraped
-    if addr_domain == clean_site or clean_site.endswith("." + addr_domain):
+    if _domains_match(addr_domain, clean_site):
         score += 50
+    # Negative: a free webmail address is weaker than one on the business domain
+    elif addr_domain in _FREE_PROVIDERS:
+        score -= 30
+    # Strong negative: an address on a DIFFERENT business domain (not the site's,
+    # not free webmail) is almost always a theme/template demo email, a payment
+    # processor, a CDN, or a partner — not the business's real contact.
+    elif clean_site:
+        score -= 40
 
-    # Positive: known business prefix
+    # Positive: known business/role prefix (info@, sales@, contact@…)
     if local in _BUSINESS_PREFIXES:
         score += 30
+    # Mild positive: looks like a real person (john.smith@) — good for outreach
+    elif _PERSON_LOCAL_RE.match(local):
+        score += 15
 
-    # Negative: deprioritised prefix
+    # Negative: deprioritised prefix (noreply@, bounce@, billing@…)
     if local in _DEPRIORITISED_PREFIXES:
         score -= 80
 
-    # Bonus: source reliability
     return score
 
 
@@ -297,8 +439,14 @@ class EmailExtractor:
     # Public API
     # ------------------------------------------------------------------ #
 
-    def extract(self) -> List[EmailResult]:
-        """Run all extraction stages and return scored, ranked results."""
+    def extract(self, verify_mx: bool = False) -> List[EmailResult]:
+        """Run all extraction stages and return scored, ranked results.
+
+        When ``verify_mx`` is True, each surviving address has its domain checked
+        for mail-receiving capability (MX/A record, cached); undeliverable
+        addresses are dropped and deliverable ones get a confidence bonus. This
+        does DNS I/O — call it off the event loop (e.g. via asyncio.to_thread).
+        """
         candidates: List[tuple[str, str, int]] = []
 
         # --- Tier A: Definitive sources (almost never wrong) ---
@@ -324,12 +472,62 @@ class EmailExtractor:
         for r in normalised:
             r.score += _score(r.address, self._site)
 
+        # Optional: drop undeliverable addresses and reward confirmed ones.
+        if verify_mx:
+            normalised = _apply_mx_verification(normalised)
+
         return sorted(normalised, key=lambda r: r.score, reverse=True)
 
-    def best(self) -> Optional[str]:
-        """Return the single best email address, or None."""
-        results = self.extract()
-        return results[0].address if results else None
+    def best(self, verify_mx: bool = False, min_score: int = 0) -> Optional[str]:
+        """Return the single best email address, or None if none were found.
+
+        Preference (recall first — nothing is dropped when a candidate exists):
+          1. an address on the business's own domain, or a free-webmail address
+             (a small business's gmail), that clears ``min_score``;
+          2. otherwise the top-ranked address overall — even an off-domain one
+             like a theme/template email — is still returned as a last resort.
+        """
+        results = self.extract(verify_mx=verify_mx)
+        if not results:
+            return None
+        clean_site = self._site.lower().removeprefix("www.")
+        # First pass: the trustworthy on-domain / free-webmail addresses.
+        if clean_site:
+            for r in results:
+                if r.score < min_score:
+                    continue
+                addr_domain = r.address.split("@", 1)[1]
+                if _domains_match(addr_domain, clean_site) or addr_domain in _FREE_PROVIDERS:
+                    return r.address
+        # Fallback: keep the best candidate we have rather than returning nothing.
+        return results[0].address
+
+    def all_addresses(self, verify_mx: bool = False, limit: int = 6) -> List[str]:
+        """Return ALL trustworthy email addresses on the page, ranked.
+
+        Includes every on-domain and free-webmail address (so a site's info@,
+        sales@ and appointments@ are all captured). Off-domain addresses (usually
+        template/partner leaks) are only included as a single last resort when no
+        on-domain/free address exists at all.
+        """
+        results = self.extract(verify_mx=verify_mx)
+        if not results:
+            return []
+        clean_site = self._site.lower().removeprefix("www.")
+        on_or_free: List[str] = []
+        off_domain: List[str] = []
+        for r in results:
+            addr_domain = r.address.split("@", 1)[1]
+            if (not clean_site or _domains_match(addr_domain, clean_site)
+                    or addr_domain in _FREE_PROVIDERS):
+                on_or_free.append(r.address)
+            else:
+                off_domain.append(r.address)
+        chosen = on_or_free if on_or_free else off_domain[:1]
+        # Dedupe, preserve rank order.
+        seen: Set[str] = set()
+        ordered = [a for a in chosen if not (a in seen or seen.add(a))]
+        return ordered[:limit]
 
     # ------------------------------------------------------------------ #
     # Extraction stages

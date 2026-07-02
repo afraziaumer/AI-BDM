@@ -17,8 +17,10 @@ env/
 # pipeline output / caches
 scavenger_leads_cache.csv
 search_state.json
+last_run.json
 leads_clean.csv
 leads_quarantine.csv
+leads_with_linkedin.csv
 data_quality_report.txt
 results.json
 *.log
