@@ -203,7 +203,9 @@ def plan_query(user_query: str) -> Dict[str, Any]:
         raise
 
 
-VALID_CATEGORIES = ("match", "product_shop", "aggregator", "unrelated")
+VALID_CATEGORIES = (
+    "match", "product_shop", "aggregator", "listicle", "unrelated", "wrong_location",
+)
 
 
 def classify_business(
@@ -211,28 +213,42 @@ def classify_business(
 ) -> Dict[str, str]:
     """Classify a scraped website by relevance to the lead request.
 
-    Returns {"category", "reason"} where category is one of:
-      match        - a single real `industry` business (a usable lead)
-      product_shop - primarily an online store selling products, not a service
-      aggregator   - a directory / marketplace / booking platform listing many
-      unrelated    - not an `industry` business at all
+    Returns {"category", "reason"}. Only "match" is a usable lead; every other
+    category is a reason to DROP the result:
+      match         - a single real `industry` business in the right place
+      product_shop  - an online store selling products, not a service business
+      aggregator    - a directory / marketplace / booking platform (many listings)
+      listicle      - a blog/article/ranking that lists many businesses
+      unrelated     - not an `industry` business at all
+      wrong_location- a real business but NOT in the requested location
 
-    On any malformed/uncertain output we default to "match" so a classifier
-    hiccup never silently discards a real lead.
+    On malformed/uncertain output we default to "match" so a classifier hiccup
+    never silently discards a real lead.
     """
-    snippet = (page_text or "")[:1500]  # cap tokens; the gist is near the top
+    snippet = (page_text or "")[:1800]  # cap tokens; the gist is near the top
     system = (
         "You are the Lead Relevance Classifier for a B2B lead-generation "
-        f"pipeline. The salesperson wants individual '{industry}' businesses in "
-        f"'{geo}' that they can contact and sell to.\n\n"
+        f"pipeline. The salesperson wants INDIVIDUAL '{industry}' businesses "
+        f"located in '{geo}' that they can contact and sell to. The single "
+        "correct answer for a usable lead is a real business's OWN official "
+        "website.\n\n"
         "Classify the website into EXACTLY one category:\n"
-        f"  - \"match\": a single real {industry} business that provides its own "
-        "services at its own location(s) — a usable lead.\n"
+        f"  - \"match\": ONE real {industry} business, its OWN official site, "
+        f"physically in/near '{geo}'. A usable lead.\n"
         "  - \"product_shop\": primarily an online store selling physical products "
-        "(cart, checkout, 'add to cart', shipping), not a service business.\n"
-        "  - \"aggregator\": a directory, marketplace, or booking platform that "
-        "lists or books MANY different businesses (e.g. 'find and book near you').\n"
-        f"  - \"unrelated\": not a {industry} business at all.\n\n"
+        "(cart, checkout, shipping), not a local service business.\n"
+        "  - \"aggregator\": a directory/marketplace/booking platform that lists or "
+        "books MANY businesses (Yelp, TripAdvisor, Zomato, Justdial, OpenTable…).\n"
+        "  - \"listicle\": a blog/news/article/ranking/'best of'/'guide' page that "
+        "describes or lists multiple businesses (titles like 'Best cafes in X', "
+        "'Top 10…', 'Exploring…', city blogs, WordPress/Medium posts).\n"
+        f"  - \"wrong_location\": a real {industry} business but NOT in '{geo}' "
+        "(e.g. a different city or country).\n"
+        f"  - \"unrelated\": not a {industry} business at all (app store, social "
+        "media, unrelated company, error page).\n\n"
+        "Be STRICT: if the page lists many different businesses, it is an "
+        "aggregator or listicle, never a match. When the location clearly differs "
+        f"from '{geo}', return wrong_location.\n"
         'Respond with ONLY JSON: {"category": "...", "reason": "<one short line>"}.'
     )
     user = f"BUSINESS NAME: {name}\n\nWEBSITE TEXT:\n{snippet}"

@@ -8,6 +8,7 @@ api.env
 # python
 __pycache__/
 *.pyc
+.tldextract-cache/
 
 # virtualenvs
 .venv/

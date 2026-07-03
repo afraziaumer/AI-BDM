@@ -57,6 +57,7 @@ CLEAN_COLUMNS = [
     "company_name", "domain", "website_url", "email", "phone_number",
     "physical_address", "num_pages", "date_added", "page_title", "description",
     "pages_scraped",
+    "high_intent_pages",   # Step 3 LLM-selected routes (JSON list of dicts)
 ]
 DESCRIPTION_WIDTH = 280   # chars kept for the readable one-line description
 MAX_PHONES_PER_BUSINESS = 8   # cap the phone list (a bigger list = directory page)
@@ -433,11 +434,16 @@ def scope_to_last_run(
 
 
 def run(path: str = RAW_STORE, dry_run: bool = False,
-        scope_all: bool = False) -> Dict[str, Any]:
+        scope_all: bool = False,
+        routes: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Run the full data-quality pipeline and write the outputs.
 
     By default the report covers only the latest query (per `last_run.json`).
     Pass `scope_all=True` to process the entire cumulative store instead.
+
+    `routes` optionally maps a business's registered domain -> a JSON string of
+    its Step 3 high-intent pages; when given, that value is written into the
+    `high_intent_pages` column.
     """
     raw = load_raw(path)
     if not raw:
@@ -458,6 +464,10 @@ def run(path: str = RAW_STORE, dry_run: bool = False,
     clean, rejected = clean_rows(raw)
     deduped = dedupe_pages(clean)
     businesses = to_business_level(deduped)
+    # Attach Step 3 high-intent pages (JSON list of routes) per business by domain.
+    routes = routes or {}
+    for b in businesses:
+        b["high_intent_pages"] = routes.get(b["domain"], "")
     stats = explore(businesses)
     valid, invalid = govern(businesses)
 

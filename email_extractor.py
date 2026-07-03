@@ -41,6 +41,7 @@ from __future__ import annotations
 import base64
 import html as html_stdlib
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -53,7 +54,10 @@ from bs4 import BeautifulSoup
 # Offline public-suffix check (bundled snapshot; no network). Used to reject
 # fake-TLD placeholder addresses like "look@you.there" or "x@mt.sinai" that get
 # mis-parsed out of marketing prose ("look… you there", "feel at ease").
-_TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
+_TLD_EXTRACT = tldextract.TLDExtract(
+    suffix_list_urls=(),
+    cache_dir=os.getenv("TLDEXTRACT_CACHE", ".tldextract-cache"),
+)
 
 
 def _has_real_tld(domain: str) -> bool:

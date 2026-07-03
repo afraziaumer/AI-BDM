@@ -33,11 +33,12 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote, urljoin
 
 import aiohttp
 import phonenumbers
@@ -62,6 +63,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Phase1Engine")
 
+# aiohttp logs the raw getaddrinfo tracebacks ("gaierror exception in shielded
+# future") at ERROR level when a DNS lookup blips. Our request code already
+# catches and handles those failures, so silence the noisy internal tracebacks.
+logging.getLogger("aiohttp.connector").setLevel(logging.CRITICAL)
+
+
+def _quiet_dns_exception_handler(loop, context) -> None:
+    """Swallow ONLY intermittent DNS-resolution noise from shielded futures.
+
+    aiohttp shields its DNS lookups; when one blips, the exception surfaces via
+    the event loop's default handler as a scary gaierror traceback even though
+    the request itself is caught and handled. Suppress just those; defer every
+    other error to the default handler so nothing real is hidden.
+    """
+    exc = context.get("exception")
+    if isinstance(exc, socket.gaierror):
+        return
+    loop.default_exception_handler(context)
+
+
+def _make_connector() -> "aiohttp.TCPConnector":
+    """Build a DNS-resilient aiohttp connector.
+
+    Two changes make this robust to the intermittent DNS blips seen on macOS /
+    sandboxed networks (`gaierror: nodename nor servname provided`):
+
+      * use_dns_cache + ttl_dns_cache: a host is resolved once and its IP reused
+        for 5 minutes, so a later blip on the same host doesn't fail the request.
+      * family=AF_INET: force IPv4 only. macOS getaddrinfo often attempts an IPv6
+        (AAAA) lookup that fails with exactly this error even when IPv4 works.
+    """
+    return aiohttp.TCPConnector(
+        use_dns_cache=True,
+        ttl_dns_cache=300,
+        family=socket.AF_INET,
+        limit=100,
+        limit_per_host=8,
+    )
+
+
 # --- Configuration ---------------------------------------------------------
 load_dotenv()
 
@@ -84,6 +125,7 @@ SEARCH_STATE_FILE = "search_state.json"
 LAST_RUN_FILE = "last_run.json"
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
+SERPER_PLACES_URL = "https://google.serper.dev/places"
 SCRAPEDO_URL = "https://api.scrape.do/"
 
 # Tunable operational parameters (kept as named constants, not magic numbers).
@@ -91,6 +133,7 @@ DEFAULT_RESULT_LIMIT = 20        # used when the query/plan specifies no count
 MAX_SEARCH_PAGES = 10            # always sweep the top 10 Google (Serper) pages
 SEARCH_RESULTS_PER_PAGE = 10     # Serper returns ~10 organic results per page
 MAX_DIRECTORIES_TO_HARVEST = 6   # cap directory pages we crawl for outbound links
+MAX_PLACES_PAGES = 8             # Google Maps (Places) pages to sweep for businesses
 SERPER_TIMEOUT_S = 15            # discovery requests
 NATIVE_FETCH_TIMEOUT_S = 12      # Tier-1 free request
 SCRAPEDO_TIMEOUT_S = 30          # Tier-2 proxied + JS render (give up if slower)
@@ -99,11 +142,12 @@ HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 
 # Whole-site crawl: from each business homepage, follow same-domain internal
 # links and scrape every page (capped so a large site can't run forever).
-MAX_PAGES_PER_SITE = 12          # hard cap on pages scraped per business
-MAX_CRAWL_DEPTH = 1              # homepage + its direct links (about/contact)
+MAX_PAGES_PER_SITE = 25          # hard cap on pages scraped per business
+MAX_CRAWL_DEPTH = 2              # homepage + direct links + one useful second hop
 # Hard cap on fetch ATTEMPTS per site (successful or 404). Bounds the cost of
 # probing contact-path candidates that may not exist on a given site.
-MAX_FETCH_ATTEMPTS = 24
+MAX_FETCH_ATTEMPTS = 60
+MIN_CACHED_PAGES_TO_TRUST = 3    # shallower cache entries are refreshed when links exist
 
 # URL path fragments that indicate a contact/about page. Fetched before any
 # other subpage (10x higher email density) and used to filter sitemap URLs.
@@ -144,11 +188,11 @@ _LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
 _ROBOTS_SITEMAP_RE = re.compile(r"(?im)^\s*sitemap:\s*(\S+)\s*$")
 
 # Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
-# the LLM relevance classifier (Step 5.5). Turned OFF for now: we want the most
-# relevant results straight from discovery and will re-enable filtering later.
-# When False: every successfully scraped business is kept and stored, and NO
-# relevance LLM call is made (only the planner uses the LLM).
-LEAD_FILTERING_ENABLED = False
+# the LLM relevance classifier (Step 5.5). ENABLED: discovery heuristics catch
+# obvious junk (directories/blogs/app-stores) but can't catch everything, so the
+# classifier is the semantic backstop that drops aggregators, product shops,
+# wrong-location and unrelated results before they're stored as leads.
+LEAD_FILTERING_ENABLED = True
 
 # When True, each chosen email's domain is MX-validated (DNS only, no mail sent)
 # before it is accepted. Undeliverable/dead domains are dropped, so stored emails
@@ -222,7 +266,38 @@ AGGREGATOR_DOMAINS = (
     # ad / tracker networks
     "reklam5.com", "doubleclick.net", "googlesyndication.com",
     "googleadservices.com", "taboola.com", "outbrain.com", "adnxs.com",
+    # social share / chat / link shorteners / app stores (exact)
+    "wa.me", "t.me", "bit.ly", "linktr.ee", "apps.apple.com", "itunes.apple.com",
+    "play.google.com", "m.me", "api.whatsapp.com",
 )
+
+# Brand-level blocklist (TLD-agnostic): matches the registered-domain LABEL, so
+# tripadvisor.com AND tripadvisor.be / yelp.co.uk / zomato.pk are ALL blocked.
+# These are review sites, directories, aggregators, listicles and Q&A sites —
+# never the official business website we want. (A real business named e.g.
+# "bookingmarina.com" is safe: its label is "bookingmarina", not "booking".)
+AGGREGATOR_BRANDS = frozenset({
+    # restaurant / food reviews + delivery + directories
+    "tripadvisor", "yelp", "zomato", "opentable", "foodpanda", "restaurantguru",
+    "wanderlog", "eater", "thefork", "grubhub", "ubereats", "deliveroo",
+    "doordash", "happycow", "timeout", "citysearch", "sirved", "menupix",
+    "pakistanfoodportal", "pakistanirestaurants", "restaurantji", "allmenus",
+    # travel / hotel aggregators + review
+    "booking", "expedia", "agoda", "trivago", "kayak", "hotels", "hostelworld",
+    "lonelyplanet", "getyourguide", "viator", "evendo",
+    # general directories / listings / Q&A / ranking
+    "yellowpages", "foursquare", "mapquest", "yell", "manta", "hotfrog",
+    "quora", "reddit", "wikipedia", "wikivoyage", "crunchbase", "glassdoor",
+    "indeed", "bbb", "clutch", "trustpilot", "sitejabber", "justdial",
+    "sulekha", "citypass", "cylex", "brownbook", "n49", "cybo",
+    # blog / publishing platforms (never an official business homepage)
+    "wordpress", "blogspot", "blogger", "medium", "substack", "tumblr",
+    "wix", "weebly", "squarespace", "godaddysites", "webador",
+    # app stores + social / chat + link shorteners (brand-level; short ones like
+    # wa.me / t.me / bit.ly are exact-matched in AGGREGATOR_DOMAINS instead).
+    "apple", "itunes", "microsoft", "whatsapp", "telegram",
+    "linktree", "tinyurl",
+})
 
 # Subdomains, anchor texts and paths that mark a link as a utility/CTA/footer
 # link (sign-up, help, login, ads...) rather than an actual business site.
@@ -246,7 +321,10 @@ UTILITY_PATH_HINTS = (
 )
 
 # Offline domain extractor (bundled public-suffix snapshot; no network fetch).
-_TLD = tldextract.TLDExtract(suffix_list_urls=())
+_TLD = tldextract.TLDExtract(
+    suffix_list_urls=(),
+    cache_dir=os.getenv("TLDEXTRACT_CACHE", ".tldextract-cache"),
+)
 
 # Path fragments and title patterns that mark a result as an article/listicle/
 # directory page rather than a single business homepage.
@@ -255,9 +333,20 @@ ARTICLE_PATH_HINTS = (
     "/region/", "/browse/", "/explore", "/wiki/", "/category/", "/list",
     "/directory", "/directories",
 )
+# Listicle / directory / review title signals — matched ANYWHERE in the title
+# (not just the start), since "Cafe Near Me - Best Coffee Shops in Islamabad"
+# and "Exploring the Best Cafes" are listicles too.
 ARTICLE_TITLE_RE = re.compile(
-    r"^\s*(\d+\s|the\s+best\b|best\b|top\s+\d+|a\s+guide\b|guide\s+to\b|"
-    r"ultimate\s+guide\b)",
+    r"\b("
+    r"\d+\s+best|best\s+\d+|top\s+\d+|\d+\s+(?:best|top|great|famous|popular)|"
+    r"the\s+best\b|best\b|top\b|"
+    r"a\s+guide\b|guide\s+to\b|ultimate\s+guide\b|complete\s+guide\b|"
+    r"exploring\b|near\s+me\b|"
+    # "<category> in <city>" listicle phrasing (cafes/coffee shops/restaurants in …)
+    r"(?:cafe|cafes|cafés?|coffee\s+shops?|restaurants?|hotels?|bars?|"
+    r"places?|things\s+to\s+do)\s+(?:in|near|around)\b|"
+    r"where\s+to\b|must[- ]?visit\b|reviews?\b|ranked\b|listings?\b|directory\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -316,8 +405,15 @@ async def deconstruct_intent(user_prompt: str) -> Dict[str, Any]:
 
 # === Step 2: Target footprint discovery ====================================
 def _is_aggregator(host: str) -> bool:
-    """True if host is a known directory/social domain (not a business site)."""
-    return any(host == d or host.endswith("." + d) for d in AGGREGATOR_DOMAINS)
+    """True if host is a review/directory/aggregator, not an official business.
+
+    Checks exact/suffix domains AND the TLD-agnostic brand label, so country
+    variants (tripadvisor.be, yelp.co.uk, zomato.pk) are all caught.
+    """
+    if any(host == d or host.endswith("." + d) for d in AGGREGATOR_DOMAINS):
+        return True
+    brand = _TLD.extract_str(host).domain.lower()
+    return brand in AGGREGATOR_BRANDS
 
 
 def _domain_key(url_or_host: str) -> str:
@@ -378,6 +474,26 @@ def _is_utility_link(host: str, path: str, anchor: str) -> bool:
     if any(hint in path.lower() for hint in UTILITY_PATH_HINTS):
         return True
     return bool(anchor and UTILITY_ANCHOR_RE.search(anchor))
+
+
+def _is_internal_crawl_noise(host: str, path: str) -> bool:
+    """True for same-site pages that are not useful crawl targets.
+
+    This intentionally does NOT inspect anchor text. Internal CTAs such as
+    "Contact Us", "Book Now", "Reserve", and "Menu" are exactly the pages the
+    extraction/routing stages need, even though those phrases are utility noise
+    when harvesting outbound links from a third-party directory.
+    """
+    subdomain = host.split(".")[0]
+    if subdomain in {"cdn", "static", "assets", "img", "images", "media"}:
+        return True
+    low = path.lower()
+    noisy_fragments = (
+        "/wp-admin", "/wp-login", "/wp-json", "/cdn-cgi", "/cart", "/wishlist",
+        "/privacy", "/terms", "/cookies", "/cookie-policy", "/sitemap",
+        "/robots.txt", "/feed", "/rss", "/tag/", "/author/", "/search",
+    )
+    return any(fragment in low for fragment in noisy_fragments)
 
 
 def _looks_like_article(title: str, path: str) -> bool:
@@ -568,6 +684,71 @@ def _country_code_from_geo(geo: str) -> str:
     return ""
 
 
+async def discover_places(
+    session: aiohttp.ClientSession,
+    query: str,
+    limit: int,
+    exclude_domains: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Google Maps (Serper Places) discovery — real individual businesses.
+
+    Organic web search for a query like "marinas in Argentina" returns
+    directories and blog listicles, not the marinas themselves. The Places
+    endpoint returns actual business listings (name, address, website), which is
+    the right source when the user wants "N businesses in a location". Only
+    listings that expose a website are returned, since we need a site to scrape.
+    """
+    if not SERPER_API_KEY:
+        logger.error("Serper key missing (set `serper` or `SERPER_API_KEY` in .env).")
+        return []
+
+    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+    targets: List[Dict[str, Any]] = []
+    seen_hosts: Set[str] = set(exclude_domains or ())
+
+    for page in range(1, MAX_PLACES_PAGES + 1):
+        if len(targets) >= limit:
+            break
+        payload = {"q": query, "page": page}
+        try:
+            async with session.post(
+                SERPER_PLACES_URL, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=SERPER_TIMEOUT_S),
+            ) as resp:
+                if resp.status != 200:
+                    logger.error("Serper places failed (status=%s).", resp.status)
+                    break
+                data = await resp.json()
+        except Exception as exc:  # noqa: BLE001 - network layer, log and degrade
+            logger.error("Serper places error (page %d): %s", page, exc)
+            break
+
+        places = data.get("places", [])
+        if not places:
+            break
+
+        for item in places:
+            website = (item.get("website") or "").strip()
+            if not website:
+                continue                         # need a site to scrape
+            host = urlparse(website).netloc.lower().removeprefix("www.")
+            domain = _domain_key(website)
+            if not host or domain in seen_hosts or _is_aggregator(host):
+                continue
+            seen_hosts.add(domain)
+            targets.append({
+                "title": item.get("title", "") or "",
+                "website": website,
+                "snippet": item.get("address", "") or "",
+            })
+            if len(targets) >= limit:
+                break
+
+    logger.info("Places discovery: %d businesses with websites for %r.",
+                len(targets), query)
+    return targets
+
+
 async def discover_targets(
     session: aiohttp.ClientSession,
     query: str,
@@ -728,27 +909,21 @@ def _normalize_page_url(url: str) -> str:
 def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[str]:
     """Return same-domain, crawlable page links found in `html`."""
     soup = BeautifulSoup(html, "lxml")
-    base = urlparse(base_url)
     links: List[str] = []
     seen: Set[str] = set()
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
             continue
-        # Resolve relative links ("/about", "services/") against the page URL.
-        if href.startswith("//"):
-            href = f"{base.scheme}:{href}"
-        elif href.startswith("/"):
-            href = f"{base.scheme}://{base.netloc}{href}"
-        elif not href.lower().startswith("http"):
-            href = f"{base.scheme}://{base.netloc}/{href.lstrip('./')}"
+        # Resolve relative links exactly as a browser would.
+        href = urljoin(base_url, href)
         parsed = urlparse(href)
         if _domain_key(href) != root_domain:       # same business only
             continue
         if parsed.path.lower().endswith(SKIP_EXTENSIONS):  # assets, not pages
             continue
-        if _is_utility_link(parsed.netloc.lower().removeprefix("www."),
-                            parsed.path, a.get_text(strip=True)):
+        if _is_internal_crawl_noise(parsed.netloc.lower().removeprefix("www."),
+                                    parsed.path):
             continue
         norm = _normalize_page_url(href)
         if norm in seen:
@@ -868,8 +1043,9 @@ async def crawl_site(
          path list (where emails actually live — including unlinked pages).
       2. Then follow the homepage's own internal links, contact/about first.
 
-    The homepage was already fetched via the two-tier scrape; everything else
-    uses the cheap native GET. Bounded by MAX_PAGES_PER_SITE (pages kept) and
+    The homepage was already fetched via the two-tier scrape; subpages use the
+    same native-then-Scrape.do fetch path so blocked internal pages do not
+    silently disappear. Bounded by MAX_PAGES_PER_SITE (pages kept) and
     MAX_FETCH_ATTEMPTS (total fetches, so missing probes can't run up the cost).
     Returns [{page_url, html, method}].
     """
@@ -905,10 +1081,15 @@ async def crawl_site(
         visited.add(norm)
 
         attempts += 1
-        html = await _native_get(session, page_url)
+        fetched = await execute_scavenger_scrape(session, page_url)
+        html = fetched.get("html") or ""
         if not html:
             continue
-        pages.append({"page_url": page_url, "html": html, "method": "NATIVE"})
+        pages.append({
+            "page_url": page_url,
+            "html": html,
+            "method": fetched.get("method", "FAILED"),
+        })
 
         if depth < MAX_CRAWL_DEPTH:
             inner = _extract_internal_links(html, page_url, root_domain)
@@ -1401,6 +1582,57 @@ def load_cache() -> Dict[str, List[Dict[str, str]]]:
     return cached
 
 
+def _cache_needs_recrawl(url: str, rows: List[Dict[str, str]]) -> bool:
+    """Return True when a cached site is too shallow for its visible links.
+
+    Older runs may have stored only the homepage. Without this guard, every
+    future run treats that one row as complete and never crawls the site's
+    contact/menu/service pages. We only refresh shallow entries when the cached
+    homepage actually exposes more same-site crawl targets.
+    """
+    if len(rows) >= MIN_CACHED_PAGES_TO_TRUST:
+        return False
+    homepage = ""
+    homepage_url = url
+    for row in rows:
+        page_url = row.get("page_url") or row.get("website_url") or url
+        if _normalize_page_url(page_url) == _normalize_page_url(url):
+            homepage = row.get("raw_html", "") or ""
+            homepage_url = page_url
+            break
+    if not homepage and rows:
+        homepage = rows[0].get("raw_html", "") or ""
+        homepage_url = rows[0].get("page_url") or rows[0].get("website_url") or url
+    if not homepage:
+        return True
+    existing = {
+        _normalize_page_url(r.get("page_url") or r.get("website_url") or "")
+        for r in rows
+    }
+    links = _extract_internal_links(homepage, homepage_url, _domain_key(url))
+    new_links = [
+        link for link in links
+        if _normalize_page_url(link) not in existing
+    ]
+    return bool(new_links)
+
+
+def _filter_new_page_records(
+    page_records: List[Dict[str, Any]], cached_rows: Optional[List[Dict[str, str]]]
+) -> List[Dict[str, Any]]:
+    """Keep only newly discovered page rows when refreshing a shallow cache."""
+    if not cached_rows:
+        return page_records
+    existing = {
+        _normalize_page_url(r.get("page_url") or r.get("website_url") or "")
+        for r in cached_rows
+    }
+    return [
+        record for record in page_records
+        if _normalize_page_url(record.get("page_url", "")) not in existing
+    ]
+
+
 # === Step 5: Lead qualification ============================================
 def qualify_lead(
     page_text: str,
@@ -1497,19 +1729,27 @@ async def process_single_lead(
 
     # Cache check: a business already in the store is not re-crawled. Its stored
     # pages are aggregated and re-qualified against the (possibly new) keywords.
-    if url in cache:
-        rows = cache[url]
-        logger.info("Cache HIT for %s (%d page(s)) — qualifying from cache.", url, len(rows))
-        combined = " ".join(r.get("page_text", "") for r in rows)
-        email = CONTACT_SEP.join(_union_contacts(rows, "email")) or "N/A"
-        phone = CONTACT_SEP.join(_union_contacts(rows, "phone_number")) or "N/A"
+    cached_rows = cache.get(url)
+    if cached_rows and not _cache_needs_recrawl(url, cached_rows):
+        logger.info(
+            "Cache HIT for %s (%d page(s)) — qualifying from cache.",
+            url, len(cached_rows),
+        )
+        combined = " ".join(r.get("page_text", "") for r in cached_rows)
+        email = CONTACT_SEP.join(_union_contacts(cached_rows, "email")) or "N/A"
+        phone = CONTACT_SEP.join(_union_contacts(cached_rows, "phone_number")) or "N/A"
         qualification, classification = await _evaluate_lead(
             industry, geo, name, combined, exclude_keywords, include_keywords
         )
         return {"company_name": name, "website_url": url, "status": "cache_hit",
-                "method": "CACHE", "pages": len(rows), "email": email,
+                "method": "CACHE", "pages": len(cached_rows), "email": email,
                 "phone": phone, "qualification": qualification,
                 "classification": classification}
+    if cached_rows:
+        logger.info(
+            "Cache refresh for %s: only %d cached page(s), more internal links visible.",
+            url, len(cached_rows),
+        )
 
     # Scrape the homepage with the full two-tier scrape, then crawl the rest of
     # the site from it (internal pages fetched natively).
@@ -1599,11 +1839,38 @@ async def process_single_lead(
     )
 
     if is_lead:
-        append_records_to_csv(page_records)  # contiguous block, homepage first
-        cache[url] = [{"website_url": url, "page_text": combined,
-                       "email": email or "N/A", "phone_number": phone or "N/A",
-                       "physical_address": site_address or "N/A"}]
-        logger.info("Saved %d page(s) for %s", len(page_records), name)
+        records_to_append = _filter_new_page_records(page_records, cached_rows)
+        append_records_to_csv(records_to_append)  # contiguous block, homepage first
+        if cached_rows:
+            cache[url] = cached_rows + [
+                {
+                    "website_url": record["website_url"],
+                    "page_url": record["page_url"],
+                    "page_text": record["page_text"],
+                    "raw_html": record["raw_html"],
+                    "email": record["email"],
+                    "phone_number": record["phone_number"],
+                    "physical_address": record["physical_address"],
+                }
+                for record in records_to_append
+            ]
+        else:
+            cache[url] = [
+                {
+                    "website_url": record["website_url"],
+                    "page_url": record["page_url"],
+                    "page_text": record["page_text"],
+                    "raw_html": record["raw_html"],
+                    "email": record["email"],
+                    "phone_number": record["phone_number"],
+                    "physical_address": record["physical_address"],
+                }
+                for record in page_records
+            ]
+        logger.info(
+            "Saved %d new page(s) for %s (%d total crawled)",
+            len(records_to_append), name, len(page_records),
+        )
     else:
         reason = (classification or {}).get("category") or qualification.get("reason")
         logger.info("Not stored (%s): %s", reason, name)
@@ -1611,13 +1878,26 @@ async def process_single_lead(
     return {"company_name": name, "website_url": url, "status": "scraped",
             "method": root["method"], "pages": len(page_records),
             "stored": is_lead, "text_len": len(combined),
-            "email": email, "phone": phone, "qualification": qualification,
+            "email": email, "phone": phone,
+            "qualification": qualification,
             "classification": classification}
 
 
+def _is_lead(r: Dict[str, Any]) -> bool:
+    """True only for a REAL qualified lead: keyword-qualified AND the relevance
+    classifier judged it an actual matching business (category == "match"), not
+    an aggregator / listicle / unrelated / wrong-location page."""
+    return bool(
+        r.get("qualification", {}).get("qualified")
+        and (r.get("classification") or {}).get("category", "match") == "match"
+    )
+
+
 def _is_lead_count(results: List[Dict[str, Any]]) -> int:
-    """Count results that were successfully scraped (status != failed/no_website)."""
-    return sum(1 for r in results if r.get("status") == "scraped")
+    """Number of REAL qualified leads collected so far. This drives the discovery
+    loop's stop condition, so it must count only genuine matches — otherwise the
+    loop would stop after merely scraping N pages that then all get rejected."""
+    return sum(1 for r in results if _is_lead(r))
 
 
 async def run_pipeline(
@@ -1629,6 +1909,12 @@ async def run_pipeline(
     from the planner's `result_limit` (which it reads from the query), defaulting
     to DEFAULT_RESULT_LIMIT.
     """
+    # Quiet the intermittent DNS-blip tracebacks from aiohttp's shielded futures.
+    try:
+        asyncio.get_running_loop().set_exception_handler(_quiet_dns_exception_handler)
+    except RuntimeError:  # pragma: no cover - not inside a loop (shouldn't happen)
+        pass
+
     initialize_csv_storage_layer()
     cache = load_cache()
     logger.info("Loaded %d previously-analyzed leads from cache.", len(cache))
@@ -1681,15 +1967,9 @@ async def run_pipeline(
             target_domain, search_type = detected, "specific"
     summary["search_type"] = search_type
 
-    def _is_lead(r: Dict[str, Any]) -> bool:
-        return bool(
-            r.get("qualification", {}).get("qualified")
-            and (r.get("classification") or {}).get("category", "match") == "match"
-        )
-
     results: List[Dict[str, Any]] = []
     semaphore = asyncio.Semaphore(concurrency)
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=_make_connector()) as session:
         query = plan.get("search_query") or f"{industry} in {geo}".strip()
 
         if search_type == "specific":
@@ -1740,8 +2020,47 @@ async def run_pipeline(
             exclude_set = set(existing_by_domain)
             total_discovered = 0
             last_page = current_page
+            wrapped = False   # have we already wrapped the cursor back to page 1?
 
+            # Phase A — Google Maps (Places): the highest-yield source of REAL
+            # individual businesses. Organic web search alone tends to surface
+            # directories/listicles for location queries, so we lead with Places.
+            place_targets = await discover_places(
+                session, query,
+                limit=effective_limit * 4,      # over-fetch; many won't qualify
+                exclude_domains=exclude_set,
+            )
+            if place_targets:
+                total_discovered += len(place_targets)
+                for t in place_targets:
+                    exclude_set.add(_domain_key(t["website"]))
+                place_results = await asyncio.gather(*[
+                    process_single_lead(
+                        session, semaphore, target, cache, exclude_keywords,
+                        include_keywords, industry, geo,
+                        country_code=country_code, phone_regex=phone_regex,
+                    )
+                    for target in place_targets
+                ])
+                results.extend(place_results)
+                logger.info(
+                    "After Places: %d/%d real leads (%d businesses scraped).",
+                    _is_lead_count(results), effective_limit, len(place_targets),
+                )
+
+            # Phase B — organic web + directory harvesting tops up to N, sweeping
+            # progressively deeper Serper pages. Bounded so a query with few real
+            # businesses can't spin forever.
+            max_rounds = max(10, effective_limit * 3)
+            rounds = 0
             while _is_lead_count(results) < effective_limit:
+                rounds += 1
+                if rounds > max_rounds:
+                    logger.info(
+                        "Hit discovery ceiling (%d rounds) — stopping with %d/%d leads.",
+                        max_rounds, _is_lead_count(results), effective_limit,
+                    )
+                    break
                 # Discover one batch worth of candidates from the current page.
                 batch_targets, last_page = await discover_targets(
                     session, query,
@@ -1750,10 +2069,22 @@ async def run_pipeline(
                     start_page=current_page,
                 )
                 if not batch_targets:
+                    # The saved cursor may have run past the end of Google's
+                    # results. Wrap back to page 1 ONCE so an exhausted query
+                    # can recover (e.g. after new businesses appear) instead of
+                    # returning 0 forever.
+                    if current_page > 1 and not wrapped:
+                        wrapped = True
+                        logger.info(
+                            "Page %d exhausted — restarting this query from page 1.",
+                            current_page,
+                        )
+                        current_page = 1
+                        continue
                     logger.info(
-                        "Serper returned no more new results from page %d. "
+                        "Serper returned no more new results. "
                         "Stopping (collected %d/%d leads).",
-                        current_page, _is_lead_count(results), effective_limit,
+                        _is_lead_count(results), effective_limit,
                     )
                     break
 
@@ -1817,6 +2148,9 @@ async def run_pipeline(
     ]
     summary["qualified"] = qualified
     summary["qualified_count"] = len(qualified)
+    # Shortfall: real qualified leads found vs. the number the user asked for.
+    # We never pad the count with weak/aggregator results — we report the gap.
+    summary["shortfall"] = max(0, (summary.get("limit") or 0) - len(qualified))
     # Leads keyword-qualified but filtered out by the relevance classifier.
     summary["filtered_out"] = [
         {"company_name": r.get("company_name"),
@@ -1879,11 +2213,24 @@ def print_summary(summary: Dict[str, Any]) -> None:
         for f in filtered:
             print(f"  ~ [{f.get('category')}] {f.get('company_name')} — {f.get('reason')}")
         print("-" * 64)
-    print(f"QUALIFIED LEADS ({summary.get('qualified_count', 0)}):")
+    target = summary.get("limit")
+    got = summary.get("qualified_count", 0)
+    print(f"QUALIFIED LEADS ({got}"
+          + (f" of {target} requested" if target else "") + "):")
     for lead in summary.get("qualified", []):
         print(f"  • {lead['company_name']}")
         print(f"      site : {lead['website_url']}")
         print(f"      email: {lead['email']}  |  phone: {lead['phone']}")
+    shortfall = summary.get("shortfall", 0)
+    if shortfall:
+        print("-" * 64)
+        print(f"⚠  SHORTFALL: found {got} real qualified lead(s), {shortfall} short "
+              f"of the {target} requested.")
+        print("   Exhausted Google Maps (Places), deeper web pages, and directory")
+        print("   harvesting without finding more genuine businesses. Not padding")
+        print("   the count with directories/aggregators (they aren't real leads).")
+        print("   Try: a broader area, different phrasing, or re-run later to sweep")
+        print("   further pages.")
     print("=" * 64)
     print(f"Raw store  : {OUTPUT_CSV_FILE}\n")
 
@@ -1923,15 +2270,22 @@ def main() -> None:
     )
     print_summary(summary)
 
+    # No real leads this run — nothing to clean or enrich. Skip gracefully
+    # instead of crashing the downstream stages on a missing leads_clean.csv.
+    if summary.get("qualified_count", 0) == 0:
+        print("\n[clean] Skipped — no qualified leads to clean or enrich this run.")
+        return
+
     # Stage 2 — clean + format: derive the governed dataset in the same command.
     # Imported lazily so data_pipeline (which imports this module) stays decoupled.
     if not args.no_clean:
+        import os
         import data_pipeline
         print("\n[clean] Running data-quality pipeline...")
         data_pipeline.run(OUTPUT_CSV_FILE)
 
         # Stage 3 — enrich: add each business's LinkedIn page to the same sheet.
-        if not args.no_linkedin:
+        if not args.no_linkedin and os.path.exists(data_pipeline.CLEAN_EXPORT):
             import linkedin_finder
             geo = (summary.get("plan") or {}).get("geo_location", "") or ""
             print("\n[linkedin] Finding LinkedIn pages...")
@@ -1941,6 +2295,8 @@ def main() -> None:
                 ))
             except Exception as exc:  # noqa: BLE001 - enrichment is best-effort
                 logger.error("LinkedIn enrichment failed: %s", exc)
+        elif not args.no_linkedin:
+            print("[linkedin] Skipped — no leads_clean.csv was produced.")
 
 
 if __name__ == "__main__":
