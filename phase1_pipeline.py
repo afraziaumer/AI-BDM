@@ -129,24 +129,48 @@ SERPER_PLACES_URL = "https://google.serper.dev/places"
 SCRAPEDO_URL = "https://api.scrape.do/"
 
 # Tunable operational parameters (kept as named constants, not magic numbers).
-DEFAULT_RESULT_LIMIT = 20        # used when the query/plan specifies no count
-MAX_SEARCH_PAGES = 10            # always sweep the top 10 Google (Serper) pages
-SEARCH_RESULTS_PER_PAGE = 10     # Serper returns ~10 organic results per page
+# Always sweep a FIXED number of Google pages (MAX_SEARCH_PAGES), fetching results
+# in chunks of N per page, where N = the number in the query (default 5). Every
+# business found across those pages is scraped; the page count is fixed, not N.
+DEFAULT_RESULT_LIMIT = 5         # N = chunk size (results requested per page)
+MAX_SEARCH_PAGES = 3             # FIXED: always sweep up to 3 Google pages
+SEARCH_RESULTS_PER_PAGE = 10     # fallback per-page chunk when N isn't provided
+
+# TEMP (testing): when True, scrape only N businesses total (N = the query
+# number) so test runs are quick. Set back to False to restore the full
+# "N per page × 3 Google pages" discovery.
+TEST_ONLY_N = True
 MAX_DIRECTORIES_TO_HARVEST = 6   # cap directory pages we crawl for outbound links
 MAX_PLACES_PAGES = 8             # Google Maps (Places) pages to sweep for businesses
+# Google Maps (Places) is a bonus source of real businesses run BEFORE the
+# organic Google search. OFF by default so the result is exactly "all businesses
+# across N Google pages" (set True to also mix in Google Maps results).
+USE_PLACES_DISCOVERY = False
 SERPER_TIMEOUT_S = 15            # discovery requests
-NATIVE_FETCH_TIMEOUT_S = 12      # Tier-1 free request
-SCRAPEDO_TIMEOUT_S = 30          # Tier-2 proxied + JS render (give up if slower)
+NATIVE_FETCH_TIMEOUT_S = 10      # Tier-1 free request (fail fast, escalate/skip)
+SCRAPEDO_TIMEOUT_S = 18          # Tier-2 proxied fetch (give up sooner = faster)
+# How many pages of ONE site to fetch in parallel during the whole-site crawl.
+# The biggest speed lever: turns a 40-page site from 40 sequential fetches into
+# ~5 batches. Total in-flight requests ≈ --concurrency × this.
+INTRA_SITE_CONCURRENCY = 8
+# Scrape.do plans cap how many requests you may run AT ONCE. Exceeding it returns
+# HTTP 429. This global limit keeps every proxied call under that cap (raise it
+# if your plan allows more). Native Tier-1 fetches are NOT throttled by this.
+SCRAPEDO_MAX_CONCURRENCY = 2
+SCRAPEDO_MAX_RETRIES = 2         # retry a 429 this many times before giving up
+SCRAPEDO_BACKOFF_S = 3           # base backoff between 429 retries (× attempt no.)
 HTTP_OK = (200, 201)
 HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 
-# Whole-site crawl: from each business homepage, follow same-domain internal
-# links and scrape every page (capped so a large site can't run forever).
-MAX_PAGES_PER_SITE = 25          # hard cap on pages scraped per business
-MAX_CRAWL_DEPTH = 2              # homepage + direct links + one useful second hop
-# Hard cap on fetch ATTEMPTS per site (successful or 404). Bounds the cost of
-# probing contact-path candidates that may not exist on a given site.
-MAX_FETCH_ATTEMPTS = 60
+# Whole-site crawl: follow EVERY same-domain internal link so no page is missed.
+# The caps below are large SAFETY ceilings only — ordinary sites finish far below
+# them; they exist so a crawler trap (infinite calendar/filter URLs) can't run
+# forever. Raise them further if you truly need to cover a giant site.
+MAX_PAGES_PER_SITE = 1000        # safety ceiling on pages kept per business
+MAX_CRAWL_DEPTH = 50             # effectively unlimited: follow links to any depth
+# Safety ceiling on fetch ATTEMPTS per site (successful or failed). Large enough
+# that whole-site crawling isn't cut short, small enough to bound a trap.
+MAX_FETCH_ATTEMPTS = 2000
 MIN_CACHED_PAGES_TO_TRUST = 3    # shallower cache entries are refreshed when links exist
 
 # URL path fragments that indicate a contact/about page. Fetched before any
@@ -290,6 +314,10 @@ AGGREGATOR_BRANDS = frozenset({
     "quora", "reddit", "wikipedia", "wikivoyage", "crunchbase", "glassdoor",
     "indeed", "bbb", "clutch", "trustpilot", "sitejabber", "justdial",
     "sulekha", "citypass", "cylex", "brownbook", "n49", "cybo",
+    # healthcare / professional booking directories (not an individual practice)
+    "zocdoc", "opencare", "healthgrades", "vitals", "ratemds", "webmd", "tebra",
+    "usnews", "webdental", "todaysbestdentists", "sharecare", "smiledirectclub",
+    "1800dentist", "dentaldepartures", "yelp",
     # blog / publishing platforms (never an official business homepage)
     "wordpress", "blogspot", "blogger", "medium", "substack", "tumblr",
     "wix", "weebly", "squarespace", "godaddysites", "webador",
@@ -492,8 +520,22 @@ def _is_internal_crawl_noise(host: str, path: str) -> bool:
         "/wp-admin", "/wp-login", "/wp-json", "/cdn-cgi", "/cart", "/wishlist",
         "/privacy", "/terms", "/cookies", "/cookie-policy", "/sitemap",
         "/robots.txt", "/feed", "/rss", "/tag/", "/author/", "/search",
+        # blog / news / article sections — not contact-bearing, big noise + slow
+        "/blog", "/blogs", "/news", "/article", "/articles", "/press",
+        "/category", "/categories", "/page/",
     )
-    return any(fragment in low for fragment in noisy_fragments)
+    if any(fragment in low for fragment in noisy_fragments):
+        return True
+    # Root-level blog posts have long, hyphen-heavy slugs (6+ words), e.g.
+    # "/the-science-behind-tooth-movement-how-braces-really-work-5". Real service
+    # pages are short ("/veneers", "/dental-implants"). 5+ hyphens ⇒ an article.
+    last_segment = low.rstrip("/").rsplit("/", 1)[-1]
+    if last_segment.count("-") >= 5:
+        return True
+    # Date-archive URLs like /2024/06/... are blog archives.
+    if re.match(r"^/(19|20)\d{2}(/|$)", low):
+        return True
+    return False
 
 
 def _looks_like_article(title: str, path: str) -> bool:
@@ -755,6 +797,8 @@ async def discover_targets(
     limit: int,
     exclude_domains: Optional[Set[str]] = None,
     start_page: int = 1,
+    per_page: int = SEARCH_RESULTS_PER_PAGE,
+    max_pages: int = MAX_SEARCH_PAGES,
 ) -> tuple[List[Dict[str, Any]], int]:
     """Paginated Serper web search starting at `start_page`.
 
@@ -779,8 +823,10 @@ async def discover_targets(
     page = start_page
     last_page = start_page
 
-    while len(targets) < limit and page <= start_page + MAX_SEARCH_PAGES - 1:
-        payload = {"q": query, "num": SEARCH_RESULTS_PER_PAGE, "page": page}
+    while len(targets) < limit and page <= start_page + max_pages - 1:
+        # "num" is the per-page count (Serper allows up to 100), so each page
+        # returns up to `per_page` businesses; we sweep `max_pages` pages.
+        payload = {"q": query, "num": max(1, min(per_page, 100)), "page": page}
         try:
             async with session.post(
                 SERPER_SEARCH_URL, json=payload, headers=headers,
@@ -838,6 +884,11 @@ async def discover_targets(
 
 
 # === Step 3: Two-tier scavenger scrape =====================================
+# Global throttle: never run more than SCRAPEDO_MAX_CONCURRENCY proxied requests
+# at once, so we stay under the Scrape.do plan's concurrent-request cap (429s).
+_scrapedo_semaphore = asyncio.Semaphore(SCRAPEDO_MAX_CONCURRENCY)
+
+
 async def execute_scavenger_scrape(
     session: aiohttp.ClientSession, target_url: str
 ) -> Dict[str, Any]:
@@ -859,6 +910,12 @@ async def execute_scavenger_scrape(
                 "Tier-1 blocked (status=%s, waf=%s): %s",
                 resp.status, waf_detected, target_url,
             )
+            # A genuine 404 means the page simply doesn't exist — Scrape.do would
+            # 404 too, so don't waste a proxy credit/30s escalating it. (If the
+            # 404 came WITH an anti-bot signature it may be a faked block, so we
+            # still escalate that case.)
+            if resp.status == 404 and not waf_detected:
+                return {"html": "", "method": "FAILED"}
     except Exception as exc:  # noqa: BLE001
         logger.warning("Tier-1 connection failed for %s: %s", target_url, exc)
 
@@ -876,24 +933,41 @@ async def execute_scavenger_scrape(
         #   "render": "true",   # JS rendering
         #   "super": "true",    # premium residential proxies
     }
-    try:
-        async with session.get(
-            SCRAPEDO_URL,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
-        ) as resp:
-            if resp.status == 200:
-                body = await _read_html(resp)
-                logger.info("Tier-2 success: %s", target_url)
-                return {"html": body, "method": "SCRAPEDO"}
-            logger.error("Tier-2 Scrape.do failed (status=%s): %s", resp.status, target_url)
+    for attempt in range(SCRAPEDO_MAX_RETRIES + 1):
+        try:
+            # Only SCRAPEDO_MAX_CONCURRENCY proxied requests run at once.
+            async with _scrapedo_semaphore:
+                async with session.get(
+                    SCRAPEDO_URL,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
+                ) as resp:
+                    if resp.status == 200:
+                        body = await _read_html(resp)
+                        logger.info("Tier-2 success: %s", target_url)
+                        return {"html": body, "method": "SCRAPEDO"}
+                    if not (resp.status == 429 and attempt < SCRAPEDO_MAX_RETRIES):
+                        logger.error(
+                            "Tier-2 Scrape.do failed (status=%s): %s",
+                            resp.status, target_url,
+                        )
+                        return {"html": "", "method": "FAILED"}
+                    # else: 429 with retries left -> fall through to backoff below
+        except asyncio.TimeoutError:
+            logger.error("Tier-2 Scrape.do timed out (>%ss): %s", SCRAPEDO_TIMEOUT_S, target_url)
             return {"html": "", "method": "FAILED"}
-    except asyncio.TimeoutError:
-        logger.error("Tier-2 Scrape.do timed out (>%ss): %s", SCRAPEDO_TIMEOUT_S, target_url)
-        return {"html": "", "method": "FAILED"}
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Tier-2 Scrape.do error for %s: %s", target_url, repr(exc))
-        return {"html": "", "method": "FAILED"}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Tier-2 Scrape.do error for %s: %s", target_url, repr(exc))
+            return {"html": "", "method": "FAILED"}
+        # Rate-limited: back off (semaphore released during the sleep), then retry.
+        wait = SCRAPEDO_BACKOFF_S * (attempt + 1)
+        logger.warning(
+            "Scrape.do 429 rate-limited — backing off %ss then retrying: %s",
+            wait, target_url,
+        )
+        await asyncio.sleep(wait)
+
+    return {"html": "", "method": "FAILED"}
 
 
 # === Step 3.5: Whole-site crawl ============================================
@@ -1073,29 +1147,41 @@ async def crawl_site(
         and len(pages) < MAX_PAGES_PER_SITE
         and attempts < MAX_FETCH_ATTEMPTS
     ):
-        page_url, depth = queue[head]
-        head += 1
-        norm = _normalize_page_url(page_url)
-        if norm in visited or depth > MAX_CRAWL_DEPTH:
+        # Pull the next batch of not-yet-visited, in-depth URLs and fetch them
+        # CONCURRENTLY (instead of one at a time) — the single biggest crawl
+        # speedup, since a page fetch is I/O-bound waiting on the network.
+        batch: List[tuple[str, int]] = []
+        while head < len(queue) and len(batch) < INTRA_SITE_CONCURRENCY:
+            page_url, depth = queue[head]
+            head += 1
+            norm = _normalize_page_url(page_url)
+            if norm in visited or depth > MAX_CRAWL_DEPTH:
+                continue
+            visited.add(norm)
+            batch.append((page_url, depth))
+        if not batch:
             continue
-        visited.add(norm)
 
-        attempts += 1
-        fetched = await execute_scavenger_scrape(session, page_url)
-        html = fetched.get("html") or ""
-        if not html:
-            continue
-        pages.append({
-            "page_url": page_url,
-            "html": html,
-            "method": fetched.get("method", "FAILED"),
-        })
-
-        if depth < MAX_CRAWL_DEPTH:
-            inner = _extract_internal_links(html, page_url, root_domain)
-            for link in sorted(inner, key=_contact_priority):
-                if _normalize_page_url(link) not in visited:
-                    queue.append((link, depth + 1))
+        attempts += len(batch)
+        fetched_list = await asyncio.gather(
+            *[execute_scavenger_scrape(session, u) for u, _ in batch]
+        )
+        for (page_url, depth), fetched in zip(batch, fetched_list):
+            html = fetched.get("html") or ""
+            if not html:
+                continue
+            pages.append({
+                "page_url": page_url,
+                "html": html,
+                "method": fetched.get("method", "FAILED"),
+            })
+            if depth < MAX_CRAWL_DEPTH:
+                inner = _extract_internal_links(html, page_url, root_domain)
+                for link in sorted(inner, key=_contact_priority):
+                    if _normalize_page_url(link) not in visited:
+                        queue.append((link, depth + 1))
+        if len(pages) >= MAX_PAGES_PER_SITE:
+            break
 
     logger.info(
         "Crawled %d page(s) of %s (%d fetches, %d priority candidates)",
@@ -1769,6 +1855,7 @@ async def process_single_lead(
     all_emails: List[str] = []
     all_phones: List[str] = []
     site_address = ""
+    seen_sigs: Set[str] = set()   # content signatures, to drop duplicate pages
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     # country_code and phone_regex come from the planner (passed in as args).
     for page in pages:
@@ -1776,6 +1863,12 @@ async def process_single_lead(
         page_text = fields["page_text"]
         if not page_text.strip():
             continue
+        # Drop duplicate-content pages (same page served at two URLs, e.g.
+        # /veneers and /specialty/veneers) — keep the first, skip the rest.
+        sig = " ".join(page_text.lower().split())[:2000]
+        if sig in seen_sigs:
+            continue
+        seen_sigs.add(sig)
         # Run off the event loop: BeautifulSoup parsing is CPU-bound and MX
         # verification does DNS I/O, neither of which should block other scrapes.
         contacts = await asyncio.to_thread(
@@ -2020,80 +2113,53 @@ async def run_pipeline(
             exclude_set = set(existing_by_domain)
             total_discovered = 0
             last_page = current_page
-            wrapped = False   # have we already wrapped the cursor back to page 1?
 
-            # Phase A — Google Maps (Places): the highest-yield source of REAL
-            # individual businesses. Organic web search alone tends to surface
-            # directories/listicles for location queries, so we lead with Places.
-            place_targets = await discover_places(
-                session, query,
-                limit=effective_limit * 4,      # over-fetch; many won't qualify
-                exclude_domains=exclude_set,
-            )
-            if place_targets:
-                total_discovered += len(place_targets)
-                for t in place_targets:
-                    exclude_set.add(_domain_key(t["website"]))
-                place_results = await asyncio.gather(*[
-                    process_single_lead(
-                        session, semaphore, target, cache, exclude_keywords,
-                        include_keywords, industry, geo,
-                        country_code=country_code, phone_regex=phone_regex,
-                    )
-                    for target in place_targets
-                ])
-                results.extend(place_results)
-                logger.info(
-                    "After Places: %d/%d real leads (%d businesses scraped).",
-                    _is_lead_count(results), effective_limit, len(place_targets),
-                )
-
-            # Phase B — organic web + directory harvesting tops up to N, sweeping
-            # progressively deeper Serper pages. Bounded so a query with few real
-            # businesses can't spin forever.
-            max_rounds = max(10, effective_limit * 3)
-            rounds = 0
-            while _is_lead_count(results) < effective_limit:
-                rounds += 1
-                if rounds > max_rounds:
-                    logger.info(
-                        "Hit discovery ceiling (%d rounds) — stopping with %d/%d leads.",
-                        max_rounds, _is_lead_count(results), effective_limit,
-                    )
-                    break
-                # Discover one batch worth of candidates from the current page.
-                batch_targets, last_page = await discover_targets(
+            # Phase A — Google Maps (Places): a fast source of REAL individual
+            # businesses (organic search alone tends to surface directories for
+            # location queries). Bounded to N so it doesn't overshoot the target.
+            if USE_PLACES_DISCOVERY:
+                place_targets = await discover_places(
                     session, query,
-                    limit=concurrency * 2,   # fetch a small batch at a time
+                    limit=effective_limit,          # bounded to N
                     exclude_domains=exclude_set,
-                    start_page=current_page,
                 )
-                if not batch_targets:
-                    # The saved cursor may have run past the end of Google's
-                    # results. Wrap back to page 1 ONCE so an exhausted query
-                    # can recover (e.g. after new businesses appear) instead of
-                    # returning 0 forever.
-                    if current_page > 1 and not wrapped:
-                        wrapped = True
-                        logger.info(
-                            "Page %d exhausted — restarting this query from page 1.",
-                            current_page,
+                if place_targets:
+                    total_discovered += len(place_targets)
+                    for t in place_targets:
+                        exclude_set.add(_domain_key(t["website"]))
+                    place_results = await asyncio.gather(*[
+                        process_single_lead(
+                            session, semaphore, target, cache, exclude_keywords,
+                            include_keywords, industry, geo,
+                            country_code=country_code, phone_regex=phone_regex,
                         )
-                        current_page = 1
-                        continue
+                        for target in place_targets
+                    ])
+                    results.extend(place_results)
                     logger.info(
-                        "Serper returned no more new results. "
-                        "Stopping (collected %d/%d leads).",
-                        _is_lead_count(results), effective_limit,
+                        "After Places: %d leads (%d businesses scraped).",
+                        _is_lead_count(results), len(place_targets),
                     )
-                    break
 
+            # Phase B — organic Google search: sweep a FIXED MAX_SEARCH_PAGES (3)
+            # Google pages, requesting N results per page (N = the query number, the
+            # "chunk"; default 5). Every business found is scraped; no early stop.
+            batch_targets, last_page = await discover_targets(
+                session, query,
+                limit=effective_limit * MAX_SEARCH_PAGES,  # N per page × 3 pages
+                exclude_domains=exclude_set,
+                start_page=1,                          # always the first 3 pages
+                per_page=effective_limit,              # N-sized chunk per page
+                max_pages=MAX_SEARCH_PAGES,            # fixed 3 pages
+            )
+            if TEST_ONLY_N and batch_targets:
+                batch_targets = batch_targets[:effective_limit]
+                logger.info("[TEST] capping to %d business(es) for a quick run.",
+                            effective_limit)
+            if batch_targets:
                 total_discovered += len(batch_targets)
-                # Add this batch's domains to the exclude set so the next
-                # iteration doesn't re-discover them.
                 for t in batch_targets:
                     exclude_set.add(_domain_key(t["website"]))
-
                 batch_results = await asyncio.gather(*[
                     process_single_lead(
                         session, semaphore, target, cache, exclude_keywords,
@@ -2103,13 +2169,13 @@ async def run_pipeline(
                     for target in batch_targets
                 ])
                 results.extend(batch_results)
-                leads_so_far = _is_lead_count(results)
-                logger.info(
-                    "Leads: %d/%d | Serper pages used so far: %d-%d",
-                    leads_so_far, effective_limit, start_page, last_page,
-                )
-                # Advance past the pages we just consumed.
-                current_page = last_page + 1
+            logger.info(
+                "Organic search: up to %d Google pages, chunk N=%d/page -> "
+                "%d businesses discovered, %d leads total.",
+                MAX_SEARCH_PAGES, effective_limit,
+                len(batch_targets), _is_lead_count(results),
+            )
+            current_page = last_page + 1
 
             # Persist the cursor for the next run.
             state[query] = current_page

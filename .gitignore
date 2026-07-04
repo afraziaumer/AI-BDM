@@ -10,6 +10,9 @@ __pycache__/
 *.pyc
 .tldextract-cache/
 
+# rag layer — local vector store data (generated)
+rag/.chroma/
+
 # virtualenvs
 .venv/
 venv/
