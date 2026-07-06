@@ -30,7 +30,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import (
     urljoin, urlsplit, urlunsplit, parse_qsl, urlencode, unquote, quote,
 )
@@ -798,47 +798,64 @@ def select_high_intent_routes(
 
 
 # ===========================================================================
-# CLI runner — load the homepage HTML for Step 3 from the raw store
+# Stored-links entry point — Step 3 without raw HTML
 # ===========================================================================
-RAW_STORE = "scavenger_leads_cache.csv"
+# The streaming crawler persists every page's internal links (with anchor text)
+# to storage/<domain>/links.json at commit time. Raw HTML is never stored, so
+# Step 3 reads that link metadata instead of re-parsing pages.
+def _candidates_from_stored_links(
+    links_by_page: Dict[str, List[Dict[str, str]]], base_url: str
+) -> Tuple[List[str], List[CandidateLink]]:
+    """Build normalized, junk-filtered CandidateLinks from persisted links."""
+    base_domain = _domain_key(base_url)
+    seen: Set[str] = set()
+    normalized: List[str] = []
+    candidates: List[CandidateLink] = []
+    for links in links_by_page.values():
+        for link in links:
+            urls = normalize_urls([link.get("url", "")], base_url)
+            if not urls:
+                continue
+            url = urls[0]
+            if url in seen:
+                continue
+            seen.add(url)
+            normalized.append(url)
+            if is_junk(url, base_domain):
+                continue
+            candidates.append(CandidateLink(
+                url=url,
+                anchor_text=(link.get("anchor") or "")[:120],
+                internal=True,
+            ))
+    return normalized, candidates
 
 
-def load_homepage_from_store(
-    website: str, csv_path: Optional[str] = None
-) -> Optional[Tuple[str, str]]:
-    """Return (base_url, html) for a business's homepage.
-
-    Reads `scavenger_leads_cache.csv` (raw scraped HTML, Step 2). Matches on
-    registered domain and prefers the row whose page_url is the site root, else
-    any stored page of that site.
-    """
-    import csv as _csv
-    import os as _os
-    import sys as _sys
-    _csv.field_size_limit(min(_sys.maxsize, 2**31 - 1))
-
-    want = _domain_key(website)
-    path = csv_path or RAW_STORE
-    if not _os.path.exists(path):
+def select_routes_for_site(
+    website: str,
+    user_query: str = "",
+    knowledge_gaps: Optional[Sequence[str]] = None,
+) -> Optional[RouteResult]:
+    """Step 3 from the storage layer: read a committed site's persisted link
+    metadata (links.json) and pick its high-intent routes. Returns None when the
+    domain has no stored link metadata (not committed / pre-refactor entry)."""
+    from storage import get_store
+    links_by_page = get_store().read_links(_domain_key(website))
+    if not links_by_page:
         return None
-
-    fallback: Optional[Tuple[str, str]] = None
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in _csv.DictReader(f):
-            site = (row.get("website_url") or "").strip()
-            if not site or _domain_key(site) != want:
-                continue
-            html = (row.get("raw_html") or "").strip()
-            if not html:
-                continue
-            page = (row.get("page_url") or site).rstrip("/")
-            if page == site.rstrip("/"):
-                return site, html                # exact homepage
-            if fallback is None:
-                fallback = (site, html)
-    if fallback:
-        return fallback
-    return None
+    normalized, candidates = _candidates_from_stored_links(links_by_page, website)
+    logger.info(
+        "Step 3: %d stored links -> %d candidates (%s)",
+        len(normalized), len(candidates), website,
+    )
+    selected, method = select_routes(candidates, user_query, knowledge_gaps)
+    return RouteResult(
+        base_url=website,
+        extracted_urls=normalized,
+        candidate_links=candidates,
+        selected=selected,
+        selection_method=method,
+    )
 
 
 def _print_result(result: RouteResult) -> None:
@@ -870,10 +887,9 @@ def _cli() -> None:
         description="Step 3 — high-intent route filtering (link extraction + "
                     "normalization + junk filtering + ranking + LLM routing).")
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--website", help="Load this business's homepage HTML from the raw store CSV.")
-    source.add_argument("--url", help="Fetch this URL live (requests) and run Step 3.")
-    source.add_argument("--list", action="store_true", help="List businesses available in the CSV.")
-    parser.add_argument("--csv", default=RAW_STORE, help="Raw store path.")
+    source.add_argument("--website", help="Use this committed business's stored link metadata (links.json).")
+    source.add_argument("--url", help="Fetch this URL live (requests) and run Step 3 on its HTML.")
+    source.add_argument("--list", action="store_true", help="List businesses committed to storage.")
     parser.add_argument("--query", default="", help="User goal / query.")
     parser.add_argument("--gaps", default="",
                         help="Comma-separated knowledge gaps, e.g. "
@@ -884,35 +900,30 @@ def _cli() -> None:
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
     if args.list:
-        import csv as _csv
-        import sys as _sys
-        _csv.field_size_limit(min(_sys.maxsize, 2**31 - 1))
-        seen: set = set()
-        with open(args.csv, newline="", encoding="utf-8") as f:
-            for row in _csv.DictReader(f):
-                dom = _domain_key((row.get("website_url") or ""))
-                if dom and dom not in seen and (row.get("raw_html") or "").strip():
-                    seen.add(dom)
-                    print("  ", row.get("website_url"))
-        print(f"\n{len(seen)} businesses with homepage HTML in {args.csv}")
+        from storage import get_store
+        seen: Set[str] = set()
+        for row in get_store().read_index():
+            dom = _domain_key(row.get("website_url") or "")
+            if dom and dom not in seen:
+                seen.add(dom)
+                print("  ", row.get("website_url"))
+        print(f"\n{len(seen)} businesses committed to storage")
         return
 
     gaps = [g.strip() for g in args.gaps.split(",") if g.strip()]
 
     if args.website:
-        loaded = load_homepage_from_store(args.website, args.csv)
-        if not loaded:
-            parser.error(f"No homepage HTML found for '{args.website}' in {args.csv}. "
-                         f"Try --list to see available sites.")
-        base_url, html = loaded
-    else:  # --url : live fetch
+        result = select_routes_for_site(args.website, args.query, gaps)
+        if result is None:
+            parser.error(f"No stored link metadata for '{args.website}'. "
+                         f"Try --list to see committed sites.")
+    else:  # --url : live fetch (HTML lives only in memory for this one call)
         import requests
         from phase1_pipeline import BROWSER_HEADERS
         resp = requests.get(args.url, headers=BROWSER_HEADERS, timeout=20)
         resp.raise_for_status()
-        html, base_url = resp.text, args.url
+        result = select_high_intent_routes(resp.text, args.url, args.query, gaps)
 
-    result = select_high_intent_routes(html, base_url, args.query, gaps)
     _print_result(result)
 
 
