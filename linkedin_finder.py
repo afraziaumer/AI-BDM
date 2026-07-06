@@ -238,7 +238,9 @@ async def enrich(in_path: str, out_path: str, geo: str = "") -> Dict[str, int]:
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        # Formula-injection-sanitize every cell (scraped/derived content).
+        for row in rows:
+            writer.writerow({k: pp._csv_safe(v) for k, v in row.items()})
 
     print(f"[linkedin] {found}/{len(rows)} businesses matched -> {out_path}")
     return {"total": len(rows), "found": found}

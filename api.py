@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import csv
 import os
+import secrets
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 import phase1_pipeline as pipeline
@@ -33,6 +35,25 @@ app = FastAPI(
     version="1.0.0",
     description="Natural-language lead query -> Maps discovery -> tiered scrape -> store.",
 )
+
+
+# --- Auth ------------------------------------------------------------------
+# Every endpoint except /health requires the header  X-API-Key: <AIBDM_API_KEY>.
+# The key is read from the environment (never hard-coded). If it is NOT set, the
+# protected endpoints refuse all calls (fail closed) rather than running open.
+_API_KEY = os.getenv("AIBDM_API_KEY")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(provided: Optional[str] = Security(_api_key_header)) -> None:
+    """Reject requests without a valid X-API-Key. Constant-time comparison."""
+    if not _API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Server API key not configured (set AIBDM_API_KEY).",
+        )
+    if not provided or not secrets.compare_digest(provided, _API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
 # --- Request / response schemas -------------------------------------------
@@ -99,7 +120,7 @@ def health() -> Dict[str, str]:
     }
 
 
-@app.post("/pipeline/run", tags=["pipeline"])
+@app.post("/pipeline/run", tags=["pipeline"], dependencies=[Depends(require_api_key)])
 async def run_pipeline_endpoint(req: PipelineRequest) -> Dict[str, Any]:
     """Run the full Phase 1 pipeline and return the structured summary.
 
@@ -116,7 +137,8 @@ async def run_pipeline_endpoint(req: PipelineRequest) -> Dict[str, Any]:
     return summary
 
 
-@app.get("/leads", response_model=List[LeadSummary], tags=["leads"])
+@app.get("/leads", response_model=List[LeadSummary], tags=["leads"],
+         dependencies=[Depends(require_api_key)])
 def list_leads(
     include_text: bool = Query(False, description="Include page text (large)."),
     limit: Optional[int] = Query(None, ge=1, le=1000),
@@ -125,7 +147,7 @@ def list_leads(
     return _read_leads(include_text=include_text, limit=limit)
 
 
-@app.get("/leads/count", tags=["leads"])
+@app.get("/leads/count", tags=["leads"], dependencies=[Depends(require_api_key)])
 def leads_count() -> Dict[str, int]:
     """Return the number of leads currently persisted."""
     return {"count": len(_read_leads(include_text=False, limit=None))}

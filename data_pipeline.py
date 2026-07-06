@@ -330,26 +330,29 @@ def govern(
 # Writers
 # --------------------------------------------------------------------------- #
 def write_clean_export(businesses: List[Dict[str, Any]], path: str) -> None:
-    """Write the readable per-business dataset (no raw HTML)."""
+    """Write the readable per-business dataset (no raw HTML). Every cell is
+    formula-injection-sanitized (pp._csv_safe) since it holds scraped content."""
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CLEAN_COLUMNS)
         writer.writeheader()
         for b in businesses:
-            writer.writerow({c: b.get(c, "") for c in CLEAN_COLUMNS})
+            writer.writerow({c: pp._csv_safe(b.get(c, "")) for c in CLEAN_COLUMNS})
 
 
 def write_quarantine(rejected_pages: List[Dict[str, str]],
                      invalid_biz: List[Dict[str, Any]], path: str) -> None:
     """Write everything that was dropped/failed, with a reason column."""
+    def _row(cells: List[Any]) -> List[str]:
+        return [pp._csv_safe(c) for c in cells]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["level", "reason", "company_name", "website_url", "detail"])
         for r in rejected_pages:
-            writer.writerow(["page", r.get("_reason", ""), r.get("company_name", ""),
-                             r.get("website_url", ""), r.get("page_url", "")])
+            writer.writerow(_row(["page", r.get("_reason", ""), r.get("company_name", ""),
+                                  r.get("website_url", ""), r.get("page_url", "")]))
         for b in invalid_biz:
-            writer.writerow(["business", b.get("_reason", ""), b.get("company_name", ""),
-                             b.get("website_url", ""), b.get("domain", "")])
+            writer.writerow(_row(["business", b.get("_reason", ""), b.get("company_name", ""),
+                                  b.get("website_url", ""), b.get("domain", "")]))
 
 
 def write_report(prof: Dict[str, Any], stats: Dict[str, Any],

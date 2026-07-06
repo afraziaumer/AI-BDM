@@ -159,6 +159,13 @@ INTRA_SITE_CONCURRENCY = 8
 SCRAPEDO_MAX_CONCURRENCY = 2
 SCRAPEDO_MAX_RETRIES = 2         # retry a 429 this many times before giving up
 SCRAPEDO_BACKOFF_S = 3           # base backoff between 429 retries (× attempt no.)
+# Cost optimization: by default Scrape.do fetches are CHEAP (raw HTML, no browser,
+# ~1 credit). If a cheap fetch fails, retry ONCE with JS rendering + premium proxy
+# — the expensive mode — only for sites that need it. Scrape.do bills only HTTP
+# 200s, so the cheap misses are free, making this cost-safe. On the render call,
+# images/CSS/fonts are blocked so the browser render stays fast.
+SCRAPEDO_RENDER_FALLBACK = True  # retry a failed cheap fetch with JS rendering
+SCRAPEDO_BLOCK_RESOURCES = True  # skip images/css/fonts on the render call (faster)
 HTTP_OK = (200, 201)
 HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 
@@ -166,11 +173,18 @@ HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
 # The caps below are large SAFETY ceilings only — ordinary sites finish far below
 # them; they exist so a crawler trap (infinite calendar/filter URLs) can't run
 # forever. Raise them further if you truly need to cover a giant site.
-MAX_PAGES_PER_SITE = 1000        # safety ceiling on pages kept per business
-MAX_CRAWL_DEPTH = 50             # effectively unlimited: follow links to any depth
-# Safety ceiling on fetch ATTEMPTS per site (successful or failed). Large enough
-# that whole-site crawling isn't cut short, small enough to bound a trap.
-MAX_FETCH_ATTEMPTS = 2000
+MAX_PAGES_PER_SITE = 40          # cap pages per business (enough for real sites)
+MAX_CRAWL_DEPTH = 50             # follow links to any depth (page cap bounds it)
+# Safety ceiling on fetch ATTEMPTS per site (successful or failed).
+MAX_FETCH_ATTEMPTS = 150
+# Early-stop toggle. OFF by default so the crawler visits every USEFUL page and
+# collects the MOST contacts possible (multi-location sites expose a different
+# phone/email per page). It stays efficient via: skipping useless URLs
+# (booking/query-string/blog), de-duplicating identical pages, and the
+# MAX_PAGES_PER_SITE cap. Set True to instead stop as soon as one email+phone
+# is found (fastest, fewest contacts).
+STOP_WHEN_CONTACT_COMPLETE = False
+MIN_PAGES_BEFORE_STOP = 5
 MIN_CACHED_PAGES_TO_TRUST = 3    # shallower cache entries are refreshed when links exist
 
 # URL path fragments that indicate a contact/about page. Fetched before any
@@ -266,6 +280,11 @@ EMAIL_RE = re.compile(
 # Very loose on purpose — it is just a candidate collector; _clean_phone
 # and phonenumbers.parse do the real validation.
 _PHONE_RE_FALLBACK = re.compile(r"\+?\d[\d\s().\-]{7,}\d")
+# ReDoS guards for the LLM-generated phone regex: reject an over-long pattern
+# (fall back to the safe fixed one) and never scan more than a bounded slice of
+# page text, so a pathological regex can't hang a worker on a big page.
+MAX_PHONE_REGEX_LEN = 200
+MAX_PHONE_SCAN_CHARS = 20000
 # Substrings that mark a regex 'email' match as junk.
 JUNK_EMAIL_HINTS = (
     "example.", "yourdomain", "domain.com", "email@", "sentry", "wixpress",
@@ -523,6 +542,9 @@ def _is_internal_crawl_noise(host: str, path: str) -> bool:
         # blog / news / article sections — not contact-bearing, big noise + slow
         "/blog", "/blogs", "/news", "/article", "/articles", "/press",
         "/category", "/categories", "/page/",
+        # booking / scheduling widgets — no contact info, endless variants
+        # (careers/jobs are intentionally KEPT: they often list HR/office contacts)
+        "/booking", "/book-", "/schedule", "/appointments",
     )
     if any(fragment in low for fragment in noisy_fragments):
         return True
@@ -889,6 +911,53 @@ async def discover_targets(
 _scrapedo_semaphore = asyncio.Semaphore(SCRAPEDO_MAX_CONCURRENCY)
 
 
+async def _scrapedo_fetch(
+    session: aiohttp.ClientSession, target_url: str, render: bool
+) -> str:
+    """One Scrape.do proxy fetch. Returns HTML on 200, else "".
+
+    render=False → cheap: raw HTML through the proxy, no browser (~1 credit).
+    render=True  → expensive: runs a headless browser (JS) via a premium proxy
+                   for hard/SPA sites, with images/CSS/fonts blocked so it's fast.
+    Concurrency-throttled and 429-retried with backoff. Scrape.do bills only
+    HTTP 200s, so failed cheap attempts cost nothing.
+    """
+    params: Dict[str, str] = {"token": SCRAPEDO_API_KEY, "url": target_url}
+    if render:
+        params["render"] = "true"       # execute JavaScript (headless browser)
+        params["super"] = "true"        # premium residential proxies
+        if SCRAPEDO_BLOCK_RESOURCES:
+            params["blockResources"] = "true"   # skip images/css/fonts → faster
+    mode = "render" if render else "plain"
+
+    for attempt in range(SCRAPEDO_MAX_RETRIES + 1):
+        try:
+            async with _scrapedo_semaphore:       # cap concurrent proxied calls
+                async with session.get(
+                    SCRAPEDO_URL, params=params,
+                    timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
+                ) as resp:
+                    if resp.status == 200:
+                        return await _read_html(resp)
+                    if not (resp.status == 429 and attempt < SCRAPEDO_MAX_RETRIES):
+                        logger.error("Scrape.do %s failed (status=%s): %s",
+                                     mode, resp.status, target_url)
+                        return ""
+        except asyncio.TimeoutError:
+            logger.error("Scrape.do %s timed out (>%ss): %s",
+                         mode, SCRAPEDO_TIMEOUT_S, target_url)
+            return ""
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Scrape.do %s error for %s: %s", mode, target_url, repr(exc))
+            return ""
+        # 429 with retries left: back off (semaphore released), then retry.
+        wait = SCRAPEDO_BACKOFF_S * (attempt + 1)
+        logger.warning("Scrape.do 429 rate-limited — backing off %ss: %s",
+                       wait, target_url)
+        await asyncio.sleep(wait)
+    return ""
+
+
 async def execute_scavenger_scrape(
     session: aiohttp.ClientSession, target_url: str
 ) -> Dict[str, Any]:
@@ -919,53 +988,26 @@ async def execute_scavenger_scrape(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Tier-1 connection failed for %s: %s", target_url, exc)
 
-    # --- Tier 2: Scrape.do (premium proxy + JS render) for blocked sites ---
+    # --- Tier 2: Scrape.do — cheap proxy first, JS-render fallback on failure ---
     if not SCRAPEDO_API_KEY:
         logger.error("Scrape.do token missing; cannot escalate %s", target_url)
         return {"html": "", "method": "FAILED"}
 
     logger.info("Tier-2 Scrape.do escalation: %s", target_url)
-    params: Dict[str, str] = {
-        "token": SCRAPEDO_API_KEY,
-        "url": target_url,
-        # render=true and super=true require paid add-ons; omit both so the
-        # request works on the base plan. Add them back if the account upgrades:
-        #   "render": "true",   # JS rendering
-        #   "super": "true",    # premium residential proxies
-    }
-    for attempt in range(SCRAPEDO_MAX_RETRIES + 1):
-        try:
-            # Only SCRAPEDO_MAX_CONCURRENCY proxied requests run at once.
-            async with _scrapedo_semaphore:
-                async with session.get(
-                    SCRAPEDO_URL,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
-                ) as resp:
-                    if resp.status == 200:
-                        body = await _read_html(resp)
-                        logger.info("Tier-2 success: %s", target_url)
-                        return {"html": body, "method": "SCRAPEDO"}
-                    if not (resp.status == 429 and attempt < SCRAPEDO_MAX_RETRIES):
-                        logger.error(
-                            "Tier-2 Scrape.do failed (status=%s): %s",
-                            resp.status, target_url,
-                        )
-                        return {"html": "", "method": "FAILED"}
-                    # else: 429 with retries left -> fall through to backoff below
-        except asyncio.TimeoutError:
-            logger.error("Tier-2 Scrape.do timed out (>%ss): %s", SCRAPEDO_TIMEOUT_S, target_url)
-            return {"html": "", "method": "FAILED"}
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Tier-2 Scrape.do error for %s: %s", target_url, repr(exc))
-            return {"html": "", "method": "FAILED"}
-        # Rate-limited: back off (semaphore released during the sleep), then retry.
-        wait = SCRAPEDO_BACKOFF_S * (attempt + 1)
-        logger.warning(
-            "Scrape.do 429 rate-limited — backing off %ss then retrying: %s",
-            wait, target_url,
-        )
-        await asyncio.sleep(wait)
+    # 2a — cheap: raw HTML through the proxy, no browser (cheapest, ~1 credit).
+    html = await _scrapedo_fetch(session, target_url, render=False)
+    if html:
+        logger.info("Tier-2 success (plain): %s", target_url)
+        return {"html": html, "method": "SCRAPEDO"}
+
+    # 2b — fallback: only sites that failed cheap get the expensive JS render +
+    # premium proxy (images/css/fonts blocked for speed). Cost-safe: the cheap
+    # miss above was free, and Scrape.do bills only successful (200) requests.
+    if SCRAPEDO_RENDER_FALLBACK:
+        html = await _scrapedo_fetch(session, target_url, render=True)
+        if html:
+            logger.info("Tier-2 success (render): %s", target_url)
+            return {"html": html, "method": "SCRAPEDO_RENDER"}
 
     return {"html": "", "method": "FAILED"}
 
@@ -995,6 +1037,10 @@ def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[
         if _domain_key(href) != root_domain:       # same business only
             continue
         if parsed.path.lower().endswith(SKIP_EXTENSIONS):  # assets, not pages
+            continue
+        # Query-string URLs are almost always booking/filter/pagination variants
+        # (e.g. ?market=nyc&studio=chelsea) — endless, no unique contact info.
+        if parsed.query:
             continue
         if _is_internal_crawl_noise(parsed.netloc.lower().removeprefix("www."),
                                     parsed.path):
@@ -1104,6 +1150,22 @@ async def _discover_contact_urls(
     return found
 
 
+def _html_has_email(html: str) -> bool:
+    """Cheap heuristic: does the page HTML contain a plausible email (a mailto:
+    link or a non-junk address)? Used to decide when a site's contact is in hand."""
+    if "mailto:" in html.lower():
+        return True
+    m = EMAIL_RE.search(html)
+    return bool(m and not any(h in m.group(0).lower() for h in JUNK_EMAIL_HINTS))
+
+
+def _html_has_phone(html: str) -> bool:
+    """Cheap heuristic: does the page HTML contain a phone (tel: link or number)?"""
+    if "tel:" in html.lower():
+        return True
+    return bool(_PHONE_RE_FALLBACK.search(html))
+
+
 async def crawl_site(
     session: aiohttp.ClientSession,
     root_url: str,
@@ -1140,6 +1202,11 @@ async def crawl_site(
         [(u, 1) for u in priority_urls] + [(u, 1) for u in homepage_links]
     )
 
+    # Track whether we already have a reachable contact so we can stop early on
+    # huge sites. Seed from the homepage we already fetched.
+    have_email = _html_has_email(root_html)
+    have_phone = _html_has_phone(root_html)
+
     head = 0
     attempts = 0
     while (
@@ -1175,12 +1242,23 @@ async def crawl_site(
                 "html": html,
                 "method": fetched.get("method", "FAILED"),
             })
+            if not have_email and _html_has_email(html):
+                have_email = True
+            if not have_phone and _html_has_phone(html):
+                have_phone = True
             if depth < MAX_CRAWL_DEPTH:
                 inner = _extract_internal_links(html, page_url, root_domain)
                 for link in sorted(inner, key=_contact_priority):
                     if _normalize_page_url(link) not in visited:
                         queue.append((link, depth + 1))
         if len(pages) >= MAX_PAGES_PER_SITE:
+            break
+        # Shortlist to useful pages: once we have a reachable contact (email AND
+        # phone) and have covered the priority pages, stop — the rest is noise.
+        if (STOP_WHEN_CONTACT_COMPLETE and have_email and have_phone
+                and len(pages) >= MIN_PAGES_BEFORE_STOP):
+            logger.info("Contact found for %s after %d page(s) — stopping crawl early.",
+                        root_domain, len(pages))
             break
 
     logger.info(
@@ -1362,7 +1440,9 @@ def extract_contacts(
         or (emails[0] if emails else None)
 
     # === Phones (all valid, deduped) =========================================
-    if phone_regex:
+    # ReDoS guard: only trust a short LLM-generated regex; anything oversized
+    # falls back to the safe fixed pattern.
+    if phone_regex and len(phone_regex) <= MAX_PHONE_REGEX_LEN:
         try:
             active_re = re.compile(phone_regex, re.IGNORECASE | re.MULTILINE)
         except re.error:
@@ -1388,8 +1468,9 @@ def extract_contacts(
         href = a["href"].strip()
         if href.lower().startswith("tel:"):
             _add_phone(unquote(href[len("tel:"):]).strip())
-    # Then every number matched in the visible text.
-    for m in active_re.findall(text or ""):
+    # Then every number matched in the visible text. Scan only a bounded slice
+    # so a pathological regex can't run away on a huge page (ReDoS guard).
+    for m in active_re.findall((text or "")[:MAX_PHONE_SCAN_CHARS]):
         raw = m if isinstance(m, str) else m[0]
         _add_phone(raw)
 
@@ -1585,9 +1666,27 @@ def initialize_csv_storage_layer() -> None:
             csv.writer(f).writerow(CSV_HEADERS)
 
 
+# Characters that make a spreadsheet treat a cell as a FORMULA. Scraped content
+# is untrusted, so any cell starting with one of these is prefixed with a quote
+# to neutralize CSV/formula injection when the export is opened in Excel/Sheets.
+_CSV_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: Any) -> str:
+    """Neutralize spreadsheet formula injection in an untrusted cell value."""
+    s = "" if value is None else str(value)
+    if s and s[0] in _CSV_INJECTION_PREFIXES:
+        return "'" + s
+    return s
+
+
 def _lead_to_row(lead: Dict[str, Any]) -> List[str]:
-    """Flatten a lead/page dict into a CSV row matching CSV_HEADERS order."""
-    return [
+    """Flatten a lead/page dict into a CSV row matching CSV_HEADERS order.
+
+    Every field is passed through _csv_safe so scraped content can't smuggle a
+    spreadsheet formula into the export.
+    """
+    return [_csv_safe(v) for v in (
         lead.get("company_name", "N/A"),
         lead.get("website_url", "N/A"),
         lead.get("page_url", lead.get("website_url", "N/A")),
@@ -1600,7 +1699,7 @@ def _lead_to_row(lead: Dict[str, Any]) -> List[str]:
         lead.get("date_added", ""),
         str(lead.get("page_text", "")),
         str(lead.get("raw_html", "")),
-    ]
+    )]
 
 
 def _dedupe_shared_lines(
