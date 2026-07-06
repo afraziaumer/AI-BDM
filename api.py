@@ -19,7 +19,6 @@ Endpoints:
 
 from __future__ import annotations
 
-import csv
 import os
 import secrets
 from typing import Any, Dict, List, Optional
@@ -82,30 +81,31 @@ class LeadSummary(BaseModel):
 
 # --- Helpers ---------------------------------------------------------------
 def _read_leads(include_text: bool, limit: Optional[int]) -> List[Dict[str, Any]]:
-    """Read persisted leads from the CSV store."""
-    if not os.path.exists(pipeline.OUTPUT_CSV_FILE):
-        return []
+    """Read persisted leads from the crawl index (metadata) via the storage
+    layer; page text is loaded from storage/<domain>/*.txt only when asked."""
+    from storage import get_store
+    store = get_store()
     leads: List[Dict[str, Any]] = []
-    with open(pipeline.OUTPUT_CSV_FILE, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            text = row.get("page_text", "") or ""
-            leads.append(
-                {
-                    "company_name": row.get("company_name", "N/A"),
-                    "website_url": row.get("website_url", "N/A"),
-                    "page_url": row.get("page_url", row.get("website_url", "N/A")),
-                    "page_title": row.get("page_title", ""),
-                    "meta_description": row.get("meta_description", ""),
-                    "email": row.get("email", "N/A"),
-                    "phone_number": row.get("phone_number", "N/A"),
-                    "physical_address": row.get("physical_address", "N/A"),
-                    "scrape_source_method": row.get("scrape_source_method", "N/A"),
-                    "text_length": len(text),
-                    "page_text": text if include_text else None,
-                }
-            )
-            if limit is not None and len(leads) >= limit:
-                break
+    for row in store.read_index():
+        text_length = int(row.get("content_length") or 0)
+        leads.append(
+            {
+                "company_name": row.get("company_name", "N/A"),
+                "website_url": row.get("website_url", "N/A"),
+                "page_url": row.get("page_url", row.get("website_url", "N/A")),
+                "page_title": row.get("page_title", ""),
+                "meta_description": row.get("meta_description", ""),
+                "email": row.get("email", "N/A"),
+                "phone_number": row.get("phone_number", "N/A"),
+                "physical_address": row.get("physical_address", "N/A"),
+                "scrape_source_method": row.get("http_status", "N/A"),
+                "text_length": text_length,
+                "page_text": (store.read_page_text(row.get("txt_path", ""))
+                              if include_text else None),
+            }
+        )
+        if limit is not None and len(leads) >= limit:
+            break
     return leads
 
 
@@ -155,5 +155,6 @@ def leads_count() -> Dict[str, int]:
 
 @app.on_event("startup")
 def _startup() -> None:
-    """Ensure the CSV store exists with headers before serving requests."""
-    pipeline.initialize_csv_storage_layer()
+    """Warm the storage layer so the first request doesn't pay initialization."""
+    from storage import get_store
+    get_store()

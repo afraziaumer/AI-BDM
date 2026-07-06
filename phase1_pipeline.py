@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import json
 import logging
 import os
@@ -51,9 +50,9 @@ from email_extractor import EmailExtractor
 # Reuse the already-tested Step-1 planner instead of duplicating LLM logic.
 from LLM_planner import plan_query, classify_business
 
-# Raw HTML fields can exceed the default 128 KB CSV field limit; raise it so the
-# cache reader (load_cache) and any downstream reads don't crash.
-csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+# Modular storage layer: cleaned page text + link metadata + per-page index.
+# Local filesystem today; swap the backend in storage.get_store() for R2 later.
+from storage import get_store
 
 # --- Logging ---------------------------------------------------------------
 logging.basicConfig(
@@ -115,7 +114,9 @@ SCRAPEDO_API_KEY = (
     or os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
 )
 
-OUTPUT_CSV_FILE = "scavenger_leads_cache.csv"
+# Per-page crawl metadata index (NO page text / raw HTML — cleaned text lives in
+# storage/<domain>/*.txt behind the storage layer; see storage.py).
+CRAWL_INDEX_FILE = "crawl_index.csv"
 # Tracks which Serper page each general-search query is up to, so the next run
 # picks up where the previous left off (pages 1-3 run 1 → pages 4-6 run 2…).
 SEARCH_STATE_FILE = "search_state.json"
@@ -133,13 +134,9 @@ SCRAPEDO_URL = "https://api.scrape.do/"
 # in chunks of N per page, where N = the number in the query (default 5). Every
 # business found across those pages is scraped; the page count is fixed, not N.
 DEFAULT_RESULT_LIMIT = 5         # N = chunk size (results requested per page)
-MAX_SEARCH_PAGES = 3             # FIXED: always sweep up to 3 Google pages
+MAX_SEARCH_PAGES = 3             # safety ceiling on how far discovery may page
+                                  # to still reach N candidates (not a target)
 SEARCH_RESULTS_PER_PAGE = 10     # fallback per-page chunk when N isn't provided
-
-# TEMP (testing): when True, scrape only N businesses total (N = the query
-# number) so test runs are quick. Set back to False to restore the full
-# "N per page × 3 Google pages" discovery.
-TEST_ONLY_N = True
 MAX_DIRECTORIES_TO_HARVEST = 6   # cap directory pages we crawl for outbound links
 MAX_PLACES_PAGES = 8             # Google Maps (Places) pages to sweep for businesses
 # Google Maps (Places) is a bonus source of real businesses run BEFORE the
@@ -149,10 +146,9 @@ USE_PLACES_DISCOVERY = False
 SERPER_TIMEOUT_S = 15            # discovery requests
 NATIVE_FETCH_TIMEOUT_S = 10      # Tier-1 free request (fail fast, escalate/skip)
 SCRAPEDO_TIMEOUT_S = 18          # Tier-2 proxied fetch (give up sooner = faster)
-# How many pages of ONE site to fetch in parallel during the whole-site crawl.
-# The biggest speed lever: turns a 40-page site from 40 sequential fetches into
-# ~5 batches. Total in-flight requests ≈ --concurrency × this.
-INTRA_SITE_CONCURRENCY = 8
+# NOTE: intra-site fetch batching was removed on purpose. The streaming crawl
+# processes strictly ONE page at a time (fetch → clean → stage → free) so at
+# most one page's raw HTML is ever in RAM per business being crawled.
 # Scrape.do plans cap how many requests you may run AT ONCE. Exceeding it returns
 # HTTP 429. This global limit keeps every proxied call under that cap (raise it
 # if your plan allows more). Native Tier-1 fetches are NOT throttled by this.
@@ -397,24 +393,6 @@ ARTICLE_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-CSV_HEADERS = [
-    "company_name",
-    "website_url",           # root site (groups all pages of one business)
-    "page_url",              # the specific page this row was scraped from
-    "page_title",            # the page's <title>
-    "meta_description",      # the page's meta description (short clean summary)
-    "email",
-    "phone_number",
-    "physical_address",
-    "scrape_source_method",  # "NATIVE" or "SCRAPEDO"
-    "date_added",            # ISO-8601 UTC timestamp this row was first stored
-    "page_text",             # cleaned main content (nav/footer/cookie removed)
-    "raw_html",              # the page's raw HTML (kept separate from page_text)
-]
-
-# Tags whose contents are never useful page text and would pollute the store.
-_NOISE_TAGS = ("script", "style", "noscript", "template", "svg", "head")
-
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -432,10 +410,6 @@ ANTI_BOT_SIGNATURES = [
     "cf-browser-verification",
     "attention required",
 ]
-
-# A single lock guards CSV appends so concurrent tasks never interleave rows.
-_csv_lock = threading.Lock()
-
 
 # === Step 1: Intent deconstruction =========================================
 async def deconstruct_intent(user_prompt: str) -> Dict[str, Any]:
@@ -1022,18 +996,27 @@ def _normalize_page_url(url: str) -> str:
     return f"{parsed.scheme}://{host}{path}{query}"
 
 
-def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[str]:
-    """Return same-domain, crawlable page links found in `html`."""
-    soup = BeautifulSoup(html, "lxml")
-    links: List[str] = []
+def _extract_internal_link_pairs(
+    soup: BeautifulSoup, base_url: str, root_domain: str
+) -> List[Dict[str, str]]:
+    """Return same-domain, crawlable links as [{'url', 'anchor'}].
+
+    Runs on the RAW page soup, before any cleaning, so no hyperlink information
+    is lost when nav/footer clutter is later stripped. URLs are resolved,
+    normalized, deduped; unsupported schemes (mailto:, tel:, javascript:, #…)
+    and asset/query/noise URLs are skipped. Anchor text is kept for Step 3.
+    """
+    pairs: List[Dict[str, str]] = []
     seen: Set[str] = set()
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
             continue
         # Resolve relative links exactly as a browser would.
         href = urljoin(base_url, href)
         parsed = urlparse(href)
+        if parsed.scheme not in ("http", "https"):
+            continue
         if _domain_key(href) != root_domain:       # same business only
             continue
         if parsed.path.lower().endswith(SKIP_EXTENSIONS):  # assets, not pages
@@ -1049,8 +1032,15 @@ def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[
         if norm in seen:
             continue
         seen.add(norm)
-        links.append(href)
-    return links
+        pairs.append({"url": href,
+                      "anchor": a.get_text(" ", strip=True)[:120]})
+    return pairs
+
+
+def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[str]:
+    """Return same-domain, crawlable page links found in `html`."""
+    soup = BeautifulSoup(html, "lxml")
+    return [p["url"] for p in _extract_internal_link_pairs(soup, base_url, root_domain)]
 
 
 def _contact_priority(url: str) -> int:
@@ -1150,20 +1140,12 @@ async def _discover_contact_urls(
     return found
 
 
-def _html_has_email(html: str) -> bool:
-    """Cheap heuristic: does the page HTML contain a plausible email (a mailto:
-    link or a non-junk address)? Used to decide when a site's contact is in hand."""
-    if "mailto:" in html.lower():
-        return True
-    m = EMAIL_RE.search(html)
-    return bool(m and not any(h in m.group(0).lower() for h in JUNK_EMAIL_HINTS))
-
-
-def _html_has_phone(html: str) -> bool:
-    """Cheap heuristic: does the page HTML contain a phone (tel: link or number)?"""
-    if "tel:" in html.lower():
-        return True
-    return bool(_PHONE_RE_FALLBACK.search(html))
+# Bounded text sample kept in RAM for the LLM relevance classifier. Keyword
+# qualification runs on each FULL page before its text is freed, so only the
+# classifier works from a sample.
+CLASSIFY_SAMPLE_MAX_CHARS = 60_000
+_SAMPLE_HOME_CHARS = 8_000       # homepage contribution to the sample
+_SAMPLE_PAGE_CHARS = 1_500       # every other page's contribution
 
 
 async def crawl_site(
@@ -1171,101 +1153,197 @@ async def crawl_site(
     root_url: str,
     root_html: str,
     root_method: str,
-) -> List[Dict[str, str]]:
-    """Contact-first crawl of one business site.
+    *,
+    company_name: str = "",
+    country_code: str = "",
+    phone_regex: str = "",
+    exclude_keywords: Optional[List[str]] = None,
+    include_keywords: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """STREAMING contact-first crawl of one business site.
 
-    Order of attack:
-      1. Probe known contact pages discovered via robots.txt / sitemap / a fixed
-         path list (where emails actually live — including unlinked pages).
-      2. Then follow the homepage's own internal links, contact/about first.
+    Discovery order is unchanged (sitemap/robots contact probes first, then
+    internal links, contact-ish first; two-tier native→Scrape.do fetch; depth
+    and fetch-budget bounds). What changed is the data flow: pages are processed
+    strictly ONE AT A TIME —
 
-    The homepage was already fetched via the two-tier scrape; subpages use the
-    same native-then-Scrape.do fetch path so blocked internal pages do not
-    silently disappear. Bounded by MAX_PAGES_PER_SITE (pages kept) and
-    MAX_FETCH_ATTEMPTS (total fetches, so missing probes can't run up the cost).
-    Returns [{page_url, html, method}].
+        fetch → extract hyperlinks (raw soup) → clean for LLM →
+        stage .txt via the storage layer → buffer index/link metadata →
+        free raw HTML + cleaned text → next page
+
+    Raw HTML and page text never accumulate in RAM. Only lightweight metadata
+    survives the loop: contact lists, keyword hits (checked against each FULL
+    page before it is freed), and a bounded classification sample. Pages are
+    staged; the caller commits or discards the whole domain after qualification.
     """
-    root_domain = _domain_key(root_url)
-    pages: List[Dict[str, str]] = [
-        {"page_url": root_url, "html": root_html, "method": root_method}
-    ]
+    store = get_store()
+    domain = _domain_key(root_url)
+    exclude_keywords = exclude_keywords or []
+    include_keywords = include_keywords or []
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    pages_kept = 0
+    emails: List[str] = []
+    phones: List[str] = []
+    address = ""
+    matched_exclude: Set[str] = set()
+    matched_include: Set[str] = set()
+    sample_parts: List[str] = []
+    sample_chars = 0
+    seen_sigs: Set[str] = set()          # content signatures → skip dup pages
+    home_lines: Optional[Set[str]] = None  # homepage boilerplate for dedupe
+
+    async def _process_one(page_url: str, html: str, method: str) -> List[str]:
+        """Process ONE page end-to-end and stage it. Returns its internal links.
+
+        Everything heavy (soup, html, text) is local to this call and freed on
+        return; only the enclosing lightweight accumulators are updated.
+        """
+        nonlocal pages_kept, address, sample_chars, home_lines
+        soup = BeautifulSoup(html, "lxml")
+        # Hyperlinks FIRST, from the raw soup, so cleaning can't lose them.
+        link_pairs = _extract_internal_link_pairs(soup, page_url, domain)
+        link_urls = [p["url"] for p in link_pairs]
+        cleaned = clean_page_for_llm(soup, page_url)
+        del soup
+        text = cleaned["text"]
+        if not text.strip():
+            return link_urls
+
+        # Duplicate-content page (same page at two URLs) → skip.
+        sig = " ".join(text.lower().split())[:2000]
+        if sig in seen_sigs:
+            return link_urls
+        seen_sigs.add(sig)
+
+        # Boilerplate dedupe: the homepage keeps its full text; later pages drop
+        # lines the homepage already has (menu/header/footer), keeping headings.
+        lines = cleaned["lines"]
+        if home_lines is None:
+            home_lines = set(lines)
+        else:
+            lines = [ln for ln in lines
+                     if ln.startswith(("#", "-")) or ln not in home_lines]
+            text = "\n".join(lines)
+
+        # Contacts come from the RAW html (mailto:, schema.org, obfuscation…),
+        # before it is freed. CPU/DNS-bound → off the event loop.
+        contacts = await asyncio.to_thread(
+            extract_contacts, html, text, country_code, phone_regex,
+            domain, VERIFY_EMAIL_MX, EMAIL_MIN_SCORE,
+        )
+        for e in contacts["emails"]:
+            if e not in emails:
+                emails.append(e)
+        for p in contacts["phones"]:
+            if p not in phones:
+                phones.append(p)
+        if not address and contacts["address"]:
+            address = contacts["address"]
+
+        # Keyword qualification on the FULL page text (exact — no sampling).
+        low = text.lower()
+        matched_exclude.update(k for k in exclude_keywords if k.lower() in low)
+        matched_include.update(k for k in include_keywords if k.lower() in low)
+
+        # Bounded sample for the LLM relevance classifier.
+        if sample_chars < CLASSIFY_SAMPLE_MAX_CHARS:
+            take = _SAMPLE_HOME_CHARS if pages_kept == 0 else _SAMPLE_PAGE_CHARS
+            part = text[:take]
+            sample_parts.append(part)
+            sample_chars += len(part)
+
+        # Stage the cleaned text + metadata NOW (not after the crawl finishes).
+        txt_path = store.stage_page(domain, store.page_name_for(page_url), text)
+        store.buffer_index_row(domain, {
+            "company_name": company_name,
+            "domain": domain,
+            "website_url": root_url,
+            "page_url": page_url,
+            "page_title": cleaned["page_title"],
+            "meta_description": cleaned["meta_description"],
+            "email": CONTACT_SEP.join(contacts["emails"]) if contacts["emails"] else "N/A",
+            "phone_number": CONTACT_SEP.join(contacts["phones"]) if contacts["phones"] else "N/A",
+            "physical_address": contacts["address"] or "N/A",
+            "txt_path": txt_path,
+            "crawl_status": "ok",
+            "http_status": method,          # scrape tier (NATIVE/SCRAPEDO)
+            "content_length": str(len(text)),
+            "word_count": str(cleaned["word_count"]),
+            "timestamp": now_iso,
+            "page_type": _page_type(page_url),
+        })
+        store.buffer_links(domain, page_url, link_pairs)
+        pages_kept += 1
+        return link_urls
+
+    # --- Homepage (already fetched by the caller's two-tier scrape) ---------
+    home_link_urls = await _process_one(root_url, root_html, root_method)
+    del root_html  # the raw homepage HTML is not needed past this point
+
     visited: Set[str] = {_normalize_page_url(root_url)}
-
     # High-value contact pages first (sitemap/robots/probe), then homepage links.
-    priority_urls = await _discover_contact_urls(session, root_url, root_domain)
-    homepage_links = sorted(
-        _extract_internal_links(root_html, root_url, root_domain),
-        key=_contact_priority,
-    )
-    # Priority URLs at depth 1; homepage links at depth 1 too, but after probes.
+    priority_urls = await _discover_contact_urls(session, root_url, domain)
     queue: List[tuple[str, int]] = (
-        [(u, 1) for u in priority_urls] + [(u, 1) for u in homepage_links]
+        [(u, 1) for u in priority_urls]
+        + [(u, 1) for u in sorted(home_link_urls, key=_contact_priority)]
     )
-
-    # Track whether we already have a reachable contact so we can stop early on
-    # huge sites. Seed from the homepage we already fetched.
-    have_email = _html_has_email(root_html)
-    have_phone = _html_has_phone(root_html)
 
     head = 0
     attempts = 0
     while (
         head < len(queue)
-        and len(pages) < MAX_PAGES_PER_SITE
+        and pages_kept < MAX_PAGES_PER_SITE
         and attempts < MAX_FETCH_ATTEMPTS
     ):
-        # Pull the next batch of not-yet-visited, in-depth URLs and fetch them
-        # CONCURRENTLY (instead of one at a time) — the single biggest crawl
-        # speedup, since a page fetch is I/O-bound waiting on the network.
-        batch: List[tuple[str, int]] = []
-        while head < len(queue) and len(batch) < INTRA_SITE_CONCURRENCY:
-            page_url, depth = queue[head]
-            head += 1
-            norm = _normalize_page_url(page_url)
-            if norm in visited or depth > MAX_CRAWL_DEPTH:
-                continue
-            visited.add(norm)
-            batch.append((page_url, depth))
-        if not batch:
+        # STRICTLY one page at a time (mandatory streaming): fetch, process,
+        # free, then move on. No intra-site fetch batching — the single-HTML-
+        # in-RAM guarantee outranks the concurrency speedup here.
+        page_url, depth = queue[head]
+        head += 1
+        norm = _normalize_page_url(page_url)
+        if norm in visited or depth > MAX_CRAWL_DEPTH:
             continue
+        visited.add(norm)
 
-        attempts += len(batch)
-        fetched_list = await asyncio.gather(
-            *[execute_scavenger_scrape(session, u) for u, _ in batch]
-        )
-        for (page_url, depth), fetched in zip(batch, fetched_list):
-            html = fetched.get("html") or ""
-            if not html:
-                continue
-            pages.append({
-                "page_url": page_url,
-                "html": html,
-                "method": fetched.get("method", "FAILED"),
-            })
-            if not have_email and _html_has_email(html):
-                have_email = True
-            if not have_phone and _html_has_phone(html):
-                have_phone = True
-            if depth < MAX_CRAWL_DEPTH:
-                inner = _extract_internal_links(html, page_url, root_domain)
-                for link in sorted(inner, key=_contact_priority):
-                    if _normalize_page_url(link) not in visited:
-                        queue.append((link, depth + 1))
-        if len(pages) >= MAX_PAGES_PER_SITE:
-            break
-        # Shortlist to useful pages: once we have a reachable contact (email AND
-        # phone) and have covered the priority pages, stop — the rest is noise.
-        if (STOP_WHEN_CONTACT_COMPLETE and have_email and have_phone
-                and len(pages) >= MIN_PAGES_BEFORE_STOP):
+        attempts += 1
+        fetched = await execute_scavenger_scrape(session, page_url)
+        html = fetched.get("html") or ""
+        method = fetched.get("method", "FAILED")
+        del fetched
+        if not html:
+            continue
+        inner_links = await _process_one(page_url, html, method)
+        del html  # raw HTML freed immediately after processing
+
+        if depth < MAX_CRAWL_DEPTH:
+            for link in sorted(inner_links, key=_contact_priority):
+                if _normalize_page_url(link) not in visited:
+                    queue.append((link, depth + 1))
+
+        # Once we have a reachable contact (email AND phone) and covered the
+        # priority pages, stop — the rest is noise.
+        if (STOP_WHEN_CONTACT_COMPLETE and emails and phones
+                and pages_kept >= MIN_PAGES_BEFORE_STOP):
             logger.info("Contact found for %s after %d page(s) — stopping crawl early.",
-                        root_domain, len(pages))
+                        domain, pages_kept)
             break
 
     logger.info(
-        "Crawled %d page(s) of %s (%d fetches, %d priority candidates)",
-        len(pages), root_domain, attempts, len(priority_urls),
+        "Crawled %d page(s) of %s (%d fetches, %d priority candidates) — streamed to staging",
+        pages_kept, domain, attempts, len(priority_urls),
     )
-    return pages
+    return {
+        "domain": domain,
+        "pages_kept": pages_kept,
+        "attempts": attempts,
+        "emails": emails,
+        "phones": phones,
+        "address": address,
+        "matched_exclude": sorted(matched_exclude),
+        "matched_include": sorted(matched_include),
+        "sample_text": " ".join(sample_parts),
+    }
 
 
 # === Step 4: Local CSV storage =============================================
@@ -1291,18 +1369,66 @@ def _fix_mojibake(text: str) -> str:
     return repaired if after < before else text
 
 
-def extract_page_fields(html: str) -> Dict[str, str]:
-    """Extract a page's content WITHOUT dropping anything useful.
+# CSS that hides an element outright — its text is invisible to a visitor.
+_HIDDEN_STYLE_RE = re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden", re.I)
+# class/id tokens that mark cookie banners, consent walls and ad slots. Matched
+# against whole tokens (not substrings) so e.g. "download" never matches "ad".
+_NOISE_TOKENS = frozenset({
+    "cookie", "cookies", "cookie-banner", "cookie-consent", "cookie-notice",
+    "cookiebar", "consent", "consent-banner", "gdpr", "gdpr-banner",
+    "ad", "ads", "advert", "advertisement", "adsense", "ad-slot", "adslot",
+    "ad-banner", "sponsored", "sponsor-banner",
+})
+# Structural tags that never carry readable page content.
+_STRIP_TAGS = ("script", "style", "noscript", "template", "svg", "iframe",
+               "canvas", "embed", "object", "head")
 
-    Returns {page_title, meta_description, page_text}. We add the title and meta
-    description as their own clean fields (organization), but page_text keeps the
-    FULL visible text — including footers/nav where emails, phone numbers and
-    addresses live. Only truly invisible tags (script/style/head) are removed.
+_PAGE_TYPE_HINTS: Dict[str, tuple] = {
+    "contact": ("contact", "kontakt", "contacto", "impressum", "get-in-touch"),
+    "about": ("about", "team", "who-we-are", "our-story", "company"),
+    "services": ("service", "berth", "moorings", "facilities", "offering"),
+    "products": ("product", "shop", "store", "pricing", "plans"),
+    "blog": ("blog", "news", "article", "press", "insights"),
+    "legal": ("privacy", "terms", "legal", "policy", "disclaimer"),
+}
+
+
+def _page_type(url: str) -> str:
+    """Best-effort page classification from the URL path alone."""
+    path = urlparse(url).path.strip("/").lower()
+    if not path:
+        return "home"
+    for ptype, hints in _PAGE_TYPE_HINTS.items():
+        if any(h in path for h in hints):
+            return ptype
+    return "other"
+
+
+def _has_noise_token(tag) -> bool:
+    """True if a tag's class/id tokens identify it as cookie/consent/ad chrome."""
+    tokens = set(tag.get("class") or [])
+    if tag.get("id"):
+        tokens.add(tag["id"])
+    return any(t.lower() in _NOISE_TOKENS for t in tokens)
+
+
+def clean_page_for_llm(soup: BeautifulSoup, page_url: str = "") -> Dict[str, Any]:
+    """Clean one parsed page into LLM-ready structured text.
+
+    Removes CSS/JS, hidden elements, cookie/consent banners and ad slots.
+    Preserves the title, meta description, H1–H6 headings (as `#`-prefixed
+    lines), paragraphs, list items (as `- ` lines), tables (flattened to
+    `cell | cell` rows), anchor text, and the page's reading order. Nav/footer
+    TEXT is kept (that's where contacts live) but its links are captured
+    separately by `_extract_internal_link_pairs` before this runs.
+
+    Mutates `soup` (the caller is about to free it anyway). Returns
+    {page_title, meta_description, text, lines, word_count}.
     """
-    empty = {"page_title": "", "meta_description": "", "page_text": ""}
-    if not html:
+    empty = {"page_title": "", "meta_description": "",
+             "text": "", "lines": [], "word_count": 0}
+    if soup is None:
         return empty
-    soup = BeautifulSoup(html, "lxml")
 
     # Capture title + meta description before stripping the <head>.
     title = soup.title.get_text(strip=True) if soup.title else ""
@@ -1319,23 +1445,48 @@ def extract_page_fields(html: str) -> Dict[str, str]:
         if real:
             el.replace_with(real)
 
-    # Remove only non-visible tags; keep ALL real content (nav/footer included).
-    for tag in soup(_NOISE_TAGS):
+    # 1) Non-visible / non-content tags.
+    for tag in soup(_STRIP_TAGS):
+        tag.decompose()
+    # 2) Hidden elements (inline style / hidden attr / aria-hidden).
+    for tag in soup.find_all(style=_HIDDEN_STYLE_RE):
+        tag.decompose()
+    for tag in soup.find_all(attrs={"hidden": True}):
+        tag.decompose()
+    for tag in soup.find_all(attrs={"aria-hidden": "true"}):
+        tag.decompose()
+    # 3) Cookie banners / consent walls / ad slots by class-or-id token.
+    for tag in soup.find_all(_has_noise_token):
         tag.decompose()
 
-    # Keep line structure so callers can de-duplicate the boilerplate that
-    # repeats across a site's pages (menu/header/footer). Blanks dropped.
-    # Each line is repaired for mojibake (double-encoded UTF-8) along the way.
-    lines = [
-        _fix_mojibake(" ".join(ln.split()))
-        for ln in soup.get_text(separator="\n").split("\n")
-        if ln.strip()
-    ]
+    # 4) Structure markers, injected in place so reading order is preserved.
+    for level in range(1, 7):
+        for h in soup.find_all(f"h{level}"):
+            text = h.get_text(" ", strip=True)
+            h.replace_with(f"\n{'#' * level} {text}\n" if text else "\n")
+    for li in soup.find_all("li"):
+        text = li.get_text(" ", strip=True)
+        li.replace_with(f"\n- {text}\n" if text else "\n")
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(("td", "th"))]
+        row = " | ".join(c for c in cells if c)
+        tr.replace_with(f"\n{row}\n" if row else "\n")
+
+    # 5) Serialize: one line per block, mojibake-repaired, blanks and
+    #    consecutive duplicates dropped.
+    lines: List[str] = []
+    for raw_line in soup.get_text(separator="\n").split("\n"):
+        line = _fix_mojibake(" ".join(raw_line.split()))
+        if line and (not lines or line != lines[-1]):
+            lines.append(line)
+
+    text = "\n".join(lines)
     return {
         "page_title": _fix_mojibake(title),
         "meta_description": _fix_mojibake(meta_desc),
-        "page_text": " ".join(lines),
+        "text": text,
         "lines": lines,
+        "word_count": len(text.split()),
     }
 
 
@@ -1644,31 +1795,10 @@ def _union_contacts(rows: List[Dict[str, Any]], field: str) -> List[str]:
     return out
 
 
-def initialize_csv_storage_layer() -> None:
-    """Create the CSV with headers if missing; repair a stale/empty header.
-
-    If the file exists but its header doesn't match CSV_HEADERS (e.g. the older
-    schema without `page_url`) and it holds no data rows, rewrite the header so
-    the new per-page layout lines up. A file that already has data is left as-is.
-    """
-    if not os.path.exists(OUTPUT_CSV_FILE):
-        logger.info("Initializing CSV archive: %s", OUTPUT_CSV_FILE)
-        with open(OUTPUT_CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(CSV_HEADERS)
-        return
-    with open(OUTPUT_CSV_FILE, newline="", encoding="utf-8") as f:
-        rows = list(csv.reader(f))
-    header = rows[0] if rows else []
-    data_rows = rows[1:]
-    if header != CSV_HEADERS and not any(any(c.strip() for c in r) for r in data_rows):
-        logger.info("Upgrading empty CSV to new per-page schema (added page_url).")
-        with open(OUTPUT_CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(CSV_HEADERS)
-
-
 # Characters that make a spreadsheet treat a cell as a FORMULA. Scraped content
 # is untrusted, so any cell starting with one of these is prefixed with a quote
-# to neutralize CSV/formula injection when the export is opened in Excel/Sheets.
+# to neutralize CSV/formula injection when an export is opened in Excel/Sheets.
+# Shared by the CSV exporters (data_pipeline, linkedin_finder).
 _CSV_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
@@ -1680,172 +1810,113 @@ def _csv_safe(value: Any) -> str:
     return s
 
 
-def _lead_to_row(lead: Dict[str, Any]) -> List[str]:
-    """Flatten a lead/page dict into a CSV row matching CSV_HEADERS order.
-
-    Every field is passed through _csv_safe so scraped content can't smuggle a
-    spreadsheet formula into the export.
-    """
-    return [_csv_safe(v) for v in (
-        lead.get("company_name", "N/A"),
-        lead.get("website_url", "N/A"),
-        lead.get("page_url", lead.get("website_url", "N/A")),
-        lead.get("page_title", ""),
-        lead.get("meta_description", ""),
-        lead.get("email", "N/A"),
-        lead.get("phone_number", "N/A"),
-        lead.get("physical_address", "N/A"),
-        lead.get("scrape_source_method", "FAILED"),
-        lead.get("date_added", ""),
-        str(lead.get("page_text", "")),
-        str(lead.get("raw_html", "")),
-    )]
-
-
-def _dedupe_shared_lines(
-    page_records: List[Dict[str, Any]], page_lines: List[List[str]]
-) -> None:
-    """Strip boilerplate (menu/header/footer) that repeats across a site's pages.
-
-    A line that appears on at least half of the pages is treated as shared
-    template text. It's removed from every page EXCEPT the first (homepage),
-    which keeps the full text — so the site's shared content is stored once
-    instead of duplicated on every page. Modifies page_records in place.
-    """
-    n = len(page_records)
-    if n < 3:  # too few pages for repetition to be a problem
-        return
-
-    from collections import Counter
-    doc_freq: Counter = Counter()
-    for lines in page_lines:
-        for line in set(lines):
-            doc_freq[line] += 1
-
-    threshold = max(2, (n + 1) // 2)  # appears on >= ~half the pages
-    shared = {line for line, freq in doc_freq.items() if freq >= threshold}
-    if not shared:
-        return
-
-    # Homepage (index 0) keeps everything; subpages keep only unique lines.
-    for i in range(1, n):
-        unique = [line for line in page_lines[i] if line not in shared]
-        page_records[i]["page_text"] = " ".join(unique)
-
-
-def append_records_to_csv(records: List[Dict[str, Any]]) -> None:
-    """Append a batch of page rows in one locked write, so all pages of a
-    business land contiguously in the store (homepage first, then crawl order)."""
-    if not records:
-        return
-    with _csv_lock:
-        with open(OUTPUT_CSV_FILE, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)  # quotes/escapes embedded commas + quotes
-            for lead in records:
-                writer.writerow(_lead_to_row(lead))
-    logger.debug("Saved %d page row(s) for %s",
-                 len(records), records[0].get("company_name"))
-
-
 def load_cache() -> Dict[str, List[Dict[str, str]]]:
-    """Return previously-analyzed businesses keyed by root website URL.
+    """Return previously-crawled businesses keyed by root website URL.
 
-    Each value is the list of that site's stored page rows. Stands in for the
-    MongoDB Atlas cache: a business already in the store is skipped (not
-    re-crawled), and its pages are aggregated to re-qualify without re-scraping.
+    Reads the per-page crawl index through the storage layer (metadata only —
+    the cleaned text lives in storage/<domain>/*.txt). A business already in
+    the index is skipped (not re-crawled) and re-qualified from its stored
+    pages, streamed one at a time.
     """
-    if not os.path.exists(OUTPUT_CSV_FILE):
-        return {}
     cached: Dict[str, List[Dict[str, str]]] = {}
-    with open(OUTPUT_CSV_FILE, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            site = row.get("website_url")
-            if site and site != "N/A":
-                # Key on the tracking-stripped URL so rows stored under different
-                # srsltid tags collapse to one business and match this run's URL.
-                cached.setdefault(_strip_tracking(site), []).append(row)
+    for row in get_store().read_index():
+        site = row.get("website_url")
+        if site and site != "N/A":
+            # Key on the tracking-stripped URL so rows stored under different
+            # srsltid tags collapse to one business and match this run's URL.
+            cached.setdefault(_strip_tracking(site), []).append(row)
     return cached
 
 
 def _cache_needs_recrawl(url: str, rows: List[Dict[str, str]]) -> bool:
-    """Return True when a cached site is too shallow for its visible links.
+    """Return True when a cached site is too shallow for its discovered links.
 
-    Older runs may have stored only the homepage. Without this guard, every
-    future run treats that one row as complete and never crawls the site's
-    contact/menu/service pages. We only refresh shallow entries when the cached
-    homepage actually exposes more same-site crawl targets.
+    Uses the domain's persisted link metadata (links.json, written at commit
+    time) instead of re-parsing raw HTML: if the site exposed internal pages
+    that were never stored, the entry is stale — refresh it. A full recrawl
+    replaces the domain's stored pages and index rows.
     """
     if len(rows) >= MIN_CACHED_PAGES_TO_TRUST:
         return False
-    homepage = ""
-    homepage_url = url
-    for row in rows:
-        page_url = row.get("page_url") or row.get("website_url") or url
-        if _normalize_page_url(page_url) == _normalize_page_url(url):
-            homepage = row.get("raw_html", "") or ""
-            homepage_url = page_url
-            break
-    if not homepage and rows:
-        homepage = rows[0].get("raw_html", "") or ""
-        homepage_url = rows[0].get("page_url") or rows[0].get("website_url") or url
-    if not homepage:
-        return True
-    existing = {
+    links_by_page = get_store().read_links(_domain_key(url))
+    if not links_by_page:
+        return True    # no link metadata — old/incomplete entry
+    stored = {
         _normalize_page_url(r.get("page_url") or r.get("website_url") or "")
         for r in rows
     }
-    links = _extract_internal_links(homepage, homepage_url, _domain_key(url))
-    new_links = [
-        link for link in links
-        if _normalize_page_url(link) not in existing
-    ]
-    return bool(new_links)
+    return any(
+        _normalize_page_url(link.get("url", "")) not in stored
+        for page_links in links_by_page.values()
+        for link in page_links
+    )
 
 
-def _filter_new_page_records(
-    page_records: List[Dict[str, Any]], cached_rows: Optional[List[Dict[str, str]]]
-) -> List[Dict[str, Any]]:
-    """Keep only newly discovered page rows when refreshing a shallow cache."""
-    if not cached_rows:
-        return page_records
-    existing = {
-        _normalize_page_url(r.get("page_url") or r.get("website_url") or "")
-        for r in cached_rows
+def _scan_stored_pages(
+    rows: List[Dict[str, str]],
+    exclude_keywords: List[str],
+    include_keywords: List[str],
+) -> Dict[str, Any]:
+    """Re-qualify a cached site by streaming its stored .txt pages ONE at a time.
+
+    Mirrors the live crawl's aggregation: exact keyword hits on each full page,
+    plus a bounded classification sample — never the whole site's text in RAM.
+    """
+    store = get_store()
+    matched_exclude: Set[str] = set()
+    matched_include: Set[str] = set()
+    sample_parts: List[str] = []
+    sample_chars = 0
+    has_text = False
+    for i, row in enumerate(rows):
+        text = store.read_page_text(row.get("txt_path", ""))
+        if not text:
+            continue
+        has_text = True
+        low = text.lower()
+        matched_exclude.update(k for k in exclude_keywords or [] if k.lower() in low)
+        matched_include.update(k for k in include_keywords or [] if k.lower() in low)
+        if sample_chars < CLASSIFY_SAMPLE_MAX_CHARS:
+            take = _SAMPLE_HOME_CHARS if i == 0 else _SAMPLE_PAGE_CHARS
+            part = text[:take]
+            sample_parts.append(part)
+            sample_chars += len(part)
+        del text
+    return {
+        "matched_exclude": sorted(matched_exclude),
+        "matched_include": sorted(matched_include),
+        "sample_text": " ".join(sample_parts),
+        "has_text": has_text,
     }
-    return [
-        record for record in page_records
-        if _normalize_page_url(record.get("page_url", "")) not in existing
-    ]
 
 
 # === Step 5: Lead qualification ============================================
 def qualify_lead(
-    page_text: str,
-    exclude_keywords: List[str],
+    matched_exclude: List[str],
+    matched_include: List[str],
     include_keywords: List[str],
+    has_text: bool = True,
 ) -> Dict[str, Any]:
-    """Score a lead's page text against the plan's keyword constraints.
+    """Build the qualification verdict from keyword hits aggregated page by page.
 
-    A lead is QUALIFIED when its text contains none of the exclude_keywords and
-    (if include_keywords are given) at least one of them. Empty text cannot be
-    assessed, so it is reported as 'no_content' rather than silently passing.
+    Same rules as ever: a lead is QUALIFIED when no exclude keyword was seen and
+    (if include keywords are given) at least one include keyword was. The hits
+    are collected by the streaming crawl, which checks each FULL page's text
+    before freeing it — exact matching with no whole-site text in RAM. A site
+    with no readable text is 'no_content' rather than silently passing.
     """
-    text = (page_text or "").lower()
-    if not text.strip():
+    if not has_text:
         return {"qualified": False, "reason": "no_content",
                 "matched_exclude": [], "matched_include": []}
-
-    matched_exclude = [k for k in (exclude_keywords or []) if k.lower() in text]
-    matched_include = [k for k in (include_keywords or []) if k.lower() in text]
-
     if matched_exclude:
         return {"qualified": False, "reason": "excluded",
-                "matched_exclude": matched_exclude, "matched_include": matched_include}
+                "matched_exclude": list(matched_exclude),
+                "matched_include": list(matched_include)}
     if include_keywords and not matched_include:
         return {"qualified": False, "reason": "missing_required",
                 "matched_exclude": [], "matched_include": []}
     return {"qualified": True, "reason": "passed",
-            "matched_exclude": [], "matched_include": matched_include}
+            "matched_exclude": [], "matched_include": list(matched_include)}
 
 
 async def classify_relevance(
@@ -1867,24 +1938,30 @@ async def classify_relevance(
 
 
 async def _evaluate_lead(
-    industry: str, geo: str, name: str, combined: str,
-    exclude_keywords: List[str], include_keywords: List[str],
+    industry: str, geo: str, name: str,
+    matched_exclude: List[str], matched_include: List[str],
+    include_keywords: List[str], sample_text: str, has_text: bool = True,
 ) -> tuple[Dict[str, Any], Optional[Dict[str, str]]]:
     """Return (qualification, classification) for a business.
 
-    When LEAD_FILTERING_ENABLED is False (current default), filtering is skipped
-    entirely: the business passes as qualified and NO relevance LLM call is made,
-    so discovery alone decides relevance. Flip the flag to re-enable filtering.
+    Fed by streamed aggregates: exact keyword hits collected page-by-page during
+    the crawl (or from stored pages), plus a bounded text sample for the LLM
+    relevance classifier — the whole site's text is never held in memory.
+
+    When LEAD_FILTERING_ENABLED is False, filtering is skipped entirely: the
+    business passes as qualified and NO relevance LLM call is made, so discovery
+    alone decides relevance. Flip the flag to re-enable filtering.
     """
     if not LEAD_FILTERING_ENABLED:
         passthrough = {"qualified": True, "reason": "filtering_disabled",
                        "matched_exclude": [], "matched_include": []}
         return passthrough, None
 
-    qualification = qualify_lead(combined, exclude_keywords, include_keywords)
+    qualification = qualify_lead(matched_exclude, matched_include,
+                                 include_keywords, has_text)
     classification = None
     if qualification.get("qualified"):
-        classification = await classify_relevance(industry, geo, name, combined)
+        classification = await classify_relevance(industry, geo, name, sample_text)
     return qualification, classification
 
 
@@ -1901,9 +1978,11 @@ async def process_single_lead(
     country_code: str = "",
     phone_regex: str = "",
 ) -> Dict[str, Any]:
-    """Cache-check, crawl the whole site, persist every page, then qualify the
-    business across all of its pages combined (Step 5) and classify its
-    relevance (Step 5.5: single business vs product shop / aggregator)."""
+    """Cache-check, STREAM-crawl the whole site (one page at a time, each page
+    staged to storage the moment it's cleaned), then qualify the business from
+    the crawl's aggregates (Step 5) and classify its relevance (Step 5.5).
+    Qualified businesses are committed to final storage; rejected ones
+    (aggregator / unrelated / spam) have their staged files deleted."""
     name = target.get("title")
     # Canonicalize: strip srsltid/utm/etc so re-runs hit the cache instead of
     # re-scraping. The stripped URL still fetches fine (sites ignore those tags).
@@ -1912,19 +1991,25 @@ async def process_single_lead(
     if not url:
         return {"company_name": name, "website_url": None, "status": "no_website"}
 
-    # Cache check: a business already in the store is not re-crawled. Its stored
-    # pages are aggregated and re-qualified against the (possibly new) keywords.
+    store = get_store()
+    domain = _domain_key(url)
+
+    # Cache check: a business already in the index is not re-crawled. Its stored
+    # pages are streamed one at a time and re-qualified against the (possibly
+    # new) keywords — metadata comes from the index, text from the .txt files.
     cached_rows = cache.get(url)
     if cached_rows and not _cache_needs_recrawl(url, cached_rows):
         logger.info(
-            "Cache HIT for %s (%d page(s)) — qualifying from cache.",
+            "Cache HIT for %s (%d page(s)) — qualifying from stored pages.",
             url, len(cached_rows),
         )
-        combined = " ".join(r.get("page_text", "") for r in cached_rows)
+        scan = _scan_stored_pages(cached_rows, exclude_keywords, include_keywords)
         email = CONTACT_SEP.join(_union_contacts(cached_rows, "email")) or "N/A"
         phone = CONTACT_SEP.join(_union_contacts(cached_rows, "phone_number")) or "N/A"
         qualification, classification = await _evaluate_lead(
-            industry, geo, name, combined, exclude_keywords, include_keywords
+            industry, geo, name,
+            scan["matched_exclude"], scan["matched_include"],
+            include_keywords, scan["sample_text"], scan["has_text"],
         )
         return {"company_name": name, "website_url": url, "status": "cache_hit",
                 "method": "CACHE", "pages": len(cached_rows), "email": email,
@@ -1932,98 +2017,50 @@ async def process_single_lead(
                 "classification": classification}
     if cached_rows:
         logger.info(
-            "Cache refresh for %s: only %d cached page(s), more internal links visible.",
+            "Cache refresh for %s: only %d cached page(s), more internal links "
+            "visible — recrawling (commit will replace the stored copy).",
             url, len(cached_rows),
         )
 
-    # Scrape the homepage with the full two-tier scrape, then crawl the rest of
-    # the site from it (internal pages fetched natively).
-    async with semaphore:
-        root = await execute_scavenger_scrape(session, url)
-        if root["method"] == "FAILED" or not root["html"]:
-            logger.warning("No content resolved for %s", url)
-            return {"company_name": name, "website_url": url, "status": "failed",
-                    "method": "FAILED"}
-        pages = await crawl_site(session, url, root["html"], root["method"])
+    # Scrape the homepage with the full two-tier scrape, then stream-crawl the
+    # rest of the site from it. Every page is cleaned and staged to storage
+    # immediately; nothing heavy survives the crawl.
+    try:
+        async with semaphore:
+            root = await execute_scavenger_scrape(session, url)
+            if root["method"] == "FAILED" or not root["html"]:
+                logger.warning("No content resolved for %s", url)
+                return {"company_name": name, "website_url": url,
+                        "status": "failed", "method": "FAILED"}
+            root_method = root["method"]
+            crawl = await crawl_site(
+                session, url, root.pop("html"), root_method,
+                company_name=name or "",
+                country_code=country_code, phone_regex=phone_regex,
+                exclude_keywords=exclude_keywords,
+                include_keywords=include_keywords,
+            )
+    except Exception:
+        # A crawl abandoned mid-flight must not leave staged files behind.
+        store.discard_domain(domain)
+        raise
 
-    # Build one row per page (keeping each page's lines for de-duplication).
-    combined_parts: List[str] = []
-    page_records: List[Dict[str, Any]] = []
-    page_lines: List[List[str]] = []
-    # Accumulate ALL unique contacts across the whole site (order-preserving).
-    all_emails: List[str] = []
-    all_phones: List[str] = []
-    site_address = ""
-    seen_sigs: Set[str] = set()   # content signatures, to drop duplicate pages
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    # country_code and phone_regex come from the planner (passed in as args).
-    for page in pages:
-        fields = extract_page_fields(page["html"])
-        page_text = fields["page_text"]
-        if not page_text.strip():
-            continue
-        # Drop duplicate-content pages (same page served at two URLs, e.g.
-        # /veneers and /specialty/veneers) — keep the first, skip the rest.
-        sig = " ".join(page_text.lower().split())[:2000]
-        if sig in seen_sigs:
-            continue
-        seen_sigs.add(sig)
-        # Run off the event loop: BeautifulSoup parsing is CPU-bound and MX
-        # verification does DNS I/O, neither of which should block other scrapes.
-        contacts = await asyncio.to_thread(
-            extract_contacts,
-            page["html"], page_text, country_code, phone_regex,
-            _domain_key(url), VERIFY_EMAIL_MX, EMAIL_MIN_SCORE,
-        )
-        page_emails = contacts["emails"]
-        page_phones = contacts["phones"]
-        for e in page_emails:
-            if e not in all_emails:
-                all_emails.append(e)
-        for p in page_phones:
-            if p not in all_phones:
-                all_phones.append(p)
-        if not site_address and contacts["address"]:
-            site_address = contacts["address"]
-        page_records.append(
-            {
-                "company_name": name,
-                "website_url": url,
-                "page_url": page["page_url"],
-                "page_title": fields["page_title"],
-                "meta_description": fields["meta_description"],
-                "email": CONTACT_SEP.join(page_emails) if page_emails else "N/A",
-                "phone_number": CONTACT_SEP.join(page_phones) if page_phones else "N/A",
-                "physical_address": contacts["address"] or "N/A",
-                "scrape_source_method": page["method"],
-                "date_added": now_iso,
-                "page_text": page_text,
-                "raw_html": page["html"],
-            }
-        )
-        page_lines.append(fields["lines"])
-        combined_parts.append(page_text)
-
-    # Site-wide aggregated contacts (joined) for the cache + result summary.
-    email = CONTACT_SEP.join(all_emails) if all_emails else None
-    phone = CONTACT_SEP.join(all_phones) if all_phones else None
-
-    if not page_records:
+    if not crawl["pages_kept"]:
         logger.warning("No readable content on any page of %s", url)
+        store.discard_domain(domain)
         return {"company_name": name, "website_url": url, "status": "failed",
-                "method": root["method"]}
+                "method": root_method}
 
-    # De-duplicate boilerplate: lines that repeat across most of a site's pages
-    # (menu/header/footer) are stripped from every page EXCEPT the homepage, so
-    # each row keeps only its unique content. The homepage keeps the full text,
-    # so nothing is lost — just no longer repeated 20x.
-    _dedupe_shared_lines(page_records, page_lines)
+    # Site-wide aggregated contacts (joined) for the result summary.
+    email = CONTACT_SEP.join(crawl["emails"]) if crawl["emails"] else None
+    phone = CONTACT_SEP.join(crawl["phones"]) if crawl["phones"] else None
 
-    # Evaluate BEFORE persisting. With filtering enabled, only real qualified
-    # leads are stored; with it disabled, every scraped business is kept.
-    combined = " ".join(combined_parts)
+    # Evaluate BEFORE committing. With filtering enabled, only real qualified
+    # leads are kept; rejected businesses' staged pages are deleted.
     qualification, classification = await _evaluate_lead(
-        industry, geo, name, combined, exclude_keywords, include_keywords
+        industry, geo, name,
+        crawl["matched_exclude"], crawl["matched_include"],
+        include_keywords, crawl["sample_text"],
     )
     is_lead = bool(
         qualification.get("qualified")
@@ -2031,45 +2068,20 @@ async def process_single_lead(
     )
 
     if is_lead:
-        records_to_append = _filter_new_page_records(page_records, cached_rows)
-        append_records_to_csv(records_to_append)  # contiguous block, homepage first
-        if cached_rows:
-            cache[url] = cached_rows + [
-                {
-                    "website_url": record["website_url"],
-                    "page_url": record["page_url"],
-                    "page_text": record["page_text"],
-                    "raw_html": record["raw_html"],
-                    "email": record["email"],
-                    "phone_number": record["phone_number"],
-                    "physical_address": record["physical_address"],
-                }
-                for record in records_to_append
-            ]
-        else:
-            cache[url] = [
-                {
-                    "website_url": record["website_url"],
-                    "page_url": record["page_url"],
-                    "page_text": record["page_text"],
-                    "raw_html": record["raw_html"],
-                    "email": record["email"],
-                    "phone_number": record["phone_number"],
-                    "physical_address": record["physical_address"],
-                }
-                for record in page_records
-            ]
+        store.commit_domain(domain)
+        cache[url] = [r for r in store.read_index() if r.get("domain") == domain]
         logger.info(
-            "Saved %d new page(s) for %s (%d total crawled)",
-            len(records_to_append), name, len(page_records),
+            "Committed %d page(s) for %s -> storage/%s/",
+            crawl["pages_kept"], name, domain,
         )
     else:
+        store.discard_domain(domain)
         reason = (classification or {}).get("category") or qualification.get("reason")
-        logger.info("Not stored (%s): %s", reason, name)
+        logger.info("Not stored (%s): %s — staged pages discarded.", reason, name)
 
     return {"company_name": name, "website_url": url, "status": "scraped",
-            "method": root["method"], "pages": len(page_records),
-            "stored": is_lead, "text_len": len(combined),
+            "method": root_method, "pages": crawl["pages_kept"],
+            "stored": is_lead, "text_len": len(crawl["sample_text"]),
             "email": email, "phone": phone,
             "qualification": qualification,
             "classification": classification}
@@ -2107,9 +2119,8 @@ async def run_pipeline(
     except RuntimeError:  # pragma: no cover - not inside a loop (shouldn't happen)
         pass
 
-    initialize_csv_storage_layer()
     cache = load_cache()
-    logger.info("Loaded %d previously-analyzed leads from cache.", len(cache))
+    logger.info("Loaded %d previously-analyzed leads from the crawl index.", len(cache))
 
     summary: Dict[str, Any] = {
         "query": user_query,
@@ -2171,12 +2182,13 @@ async def run_pipeline(
                 key, rows = existing_by_domain[target_domain]
                 logger.info("Specific search: '%s' already in store — returning existing.",
                             target_domain)
-                combined = " ".join(r.get("page_text", "") for r in rows)
+                scan = _scan_stored_pages(rows, exclude_keywords, include_keywords)
                 email = CONTACT_SEP.join(_union_contacts(rows, "email")) or "N/A"
                 phone = CONTACT_SEP.join(_union_contacts(rows, "phone_number")) or "N/A"
                 qualification, classification = await _evaluate_lead(
                     industry, geo, rows[0].get("company_name") or target_domain,
-                    combined, exclude_keywords, include_keywords,
+                    scan["matched_exclude"], scan["matched_include"],
+                    include_keywords, scan["sample_text"], scan["has_text"],
                 )
                 results = [{
                     "company_name": rows[0].get("company_name") or target_domain,
@@ -2240,21 +2252,19 @@ async def run_pipeline(
                         _is_lead_count(results), len(place_targets),
                     )
 
-            # Phase B — organic Google search: sweep a FIXED MAX_SEARCH_PAGES (3)
-            # Google pages, requesting N results per page (N = the query number, the
-            # "chunk"; default 5). Every business found is scraped; no early stop.
+            # Phase B — organic Google search: discover exactly N candidates (N =
+            # the query number, e.g. "5 marinas" -> 5). Only spills past page 1
+            # if page 1 alone doesn't yield N usable (non-aggregator, non-
+            # directory) results; MAX_SEARCH_PAGES is just the safety ceiling on
+            # how far it may page to still reach N — never a deliberate over-fetch.
             batch_targets, last_page = await discover_targets(
                 session, query,
-                limit=effective_limit * MAX_SEARCH_PAGES,  # N per page × 3 pages
+                limit=effective_limit,                 # exactly N candidates
                 exclude_domains=exclude_set,
-                start_page=1,                          # always the first 3 pages
+                start_page=1,
                 per_page=effective_limit,              # N-sized chunk per page
-                max_pages=MAX_SEARCH_PAGES,            # fixed 3 pages
+                max_pages=MAX_SEARCH_PAGES,            # ceiling, not a target
             )
-            if TEST_ONLY_N and batch_targets:
-                batch_targets = batch_targets[:effective_limit]
-                logger.info("[TEST] capping to %d business(es) for a quick run.",
-                            effective_limit)
             if batch_targets:
                 total_discovered += len(batch_targets)
                 for t in batch_targets:
@@ -2269,10 +2279,10 @@ async def run_pipeline(
                 ])
                 results.extend(batch_results)
             logger.info(
-                "Organic search: up to %d Google pages, chunk N=%d/page -> "
-                "%d businesses discovered, %d leads total.",
-                MAX_SEARCH_PAGES, effective_limit,
-                len(batch_targets), _is_lead_count(results),
+                "Organic search: target N=%d -> %d businesses discovered "
+                "(pages %d-%d), %d leads total.",
+                effective_limit, len(batch_targets), 1, last_page,
+                _is_lead_count(results),
             )
             current_page = last_page + 1
 
@@ -2326,8 +2336,8 @@ async def run_pipeline(
     ]
 
     logger.info(
-        "Phase 1 complete. %d qualified leads (of %d processed). Store: %s",
-        len(qualified), len(results), OUTPUT_CSV_FILE,
+        "Phase 1 complete. %d qualified leads (of %d processed). Index: %s",
+        len(qualified), len(results), CRAWL_INDEX_FILE,
     )
     # Record this query's scope so the data-quality report covers only the
     # latest query, not the whole cumulative store.
@@ -2397,7 +2407,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
         print("   Try: a broader area, different phrasing, or re-run later to sweep")
         print("   further pages.")
     print("=" * 64)
-    print(f"Raw store  : {OUTPUT_CSV_FILE}\n")
+    print(f"Crawl index: {CRAWL_INDEX_FILE}  |  Cleaned pages: storage/<domain>/*.txt\n")
 
 
 def main() -> None:
@@ -2447,7 +2457,7 @@ def main() -> None:
         import os
         import data_pipeline
         print("\n[clean] Running data-quality pipeline...")
-        data_pipeline.run(OUTPUT_CSV_FILE)
+        data_pipeline.run()
 
         # Stage 3 — enrich: add each business's LinkedIn page to the same sheet.
         if not args.no_linkedin and os.path.exists(data_pipeline.CLEAN_EXPORT):

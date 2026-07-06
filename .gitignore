@@ -19,6 +19,8 @@ venv/
 env/
 
 # pipeline output / caches
+storage/
+crawl_index.csv
 scavenger_leads_cache.csv
 search_state.json
 last_run.json

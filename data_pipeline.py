@@ -2,9 +2,10 @@
 AI BDM Platform - Data Quality Pipeline
 =======================================
 
-Standalone data-governance layer over the scraped lead store
-(`scavenger_leads_cache.csv`). It does NOT scrape anything — it reads what the
-pipeline saved and turns it into a clean, well-structured dataset.
+Standalone data-governance layer over the crawl output. It does NOT scrape
+anything — it reads the per-page metadata index (`crawl_index.csv`) written by
+the streaming crawler (cleaned page text lives in storage/<domain>/*.txt behind
+the storage layer) and turns it into a clean, well-structured dataset.
 
 Stages (run in order by `run()`):
   1. PROFILING      - measure the raw data: row counts, fill rates, duplicates.
@@ -15,11 +16,11 @@ Stages (run in order by `run()`):
   5. EXPLORATION    - summary stats (contact coverage, top domains, methods).
   6. GOVERNANCE     - validate each business against rules; quarantine failures.
 
-Non-destructive: it never rewrites or backs up the raw store — it only READS
-`scavenger_leads_cache.csv` and DERIVES the clean outputs from it.
+Non-destructive: it never rewrites the index or the stored pages — it only
+READS them and DERIVES the clean outputs.
 
 Outputs:
-  - leads_clean.csv                  readable per-business dataset (no raw HTML)
+  - leads_clean.csv                  readable per-business dataset (no page text)
   - leads_quarantine.csv             rows rejected by governance + the reason
   - data_quality_report.txt          human-readable, wrapped profiling/report
 
@@ -27,7 +28,7 @@ Reuses helpers from phase1_pipeline so cleaning rules stay consistent with the
 scraper (domain keys, tracking-param stripping, contact validation, mojibake).
 
 Run:
-  ./env/bin/python data_pipeline.py                # clean the default store
+  ./env/bin/python data_pipeline.py                # clean the default index
   ./env/bin/python data_pipeline.py --dry-run      # report only, write nothing
 """
 
@@ -44,10 +45,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import phase1_pipeline as pp
 import email_extractor as ee
+from storage import INDEX_COLUMNS, get_store
 
-csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
-
-RAW_STORE = pp.OUTPUT_CSV_FILE                 # scavenger_leads_cache.csv
+RAW_STORE = pp.CRAWL_INDEX_FILE                # crawl_index.csv (metadata only)
 CLEAN_EXPORT = "leads_clean.csv"
 QUARANTINE = "leads_quarantine.csv"
 REPORT = "data_quality_report.txt"
@@ -74,19 +74,18 @@ def _email_is_own(email: str, biz_domain: str) -> bool:
 # Loading
 # --------------------------------------------------------------------------- #
 def load_raw(path: str) -> List[Dict[str, str]]:
-    """Robustly read the store. Tolerates the old/corrupted header (extra
-    trailing commas) by reading via DictReader and keeping only known columns."""
+    """Robustly read the per-page crawl index. Tolerates stray columns by
+    reading via DictReader and keeping only known index columns."""
     if not os.path.exists(path):
-        print(f"[load] No store at {path}")
+        print(f"[load] No crawl index at {path}")
         return []
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     cleaned: List[Dict[str, str]] = []
     for row in rows:
-        # Drop the junk None/'' keys produced by trailing-comma headers.
         cleaned.append({k: (v or "") for k, v in row.items()
-                        if k in pp.CSV_HEADERS})
-    print(f"[load] {len(cleaned)} rows from {path}")
+                        if k in INDEX_COLUMNS})
+    print(f"[load] {len(cleaned)} index rows from {path}")
     return cleaned
 
 
@@ -96,9 +95,9 @@ def load_raw(path: str) -> List[Dict[str, str]]:
 def profile(rows: List[Dict[str, str]]) -> Dict[str, Any]:
     """Measure the raw data so we know what we're cleaning."""
     n = len(rows)
-    fill = {c: 0 for c in pp.CSV_HEADERS}
+    fill = {c: 0 for c in INDEX_COLUMNS}
     for r in rows:
-        for c in pp.CSV_HEADERS:
+        for c in INDEX_COLUMNS:
             v = (r.get(c) or "").strip()
             if v and v != "N/A":
                 fill[c] += 1
@@ -113,7 +112,7 @@ def profile(rows: List[Dict[str, str]]) -> Dict[str, Any]:
         "distinct_pages": len(set(p for p in pages if p)),
         "duplicate_page_rows": len(pages) - len(set(pages)) if pages else 0,
         "fill_rate": {c: (fill[c], round(100 * fill[c] / n, 1) if n else 0.0)
-                      for c in pp.CSV_HEADERS},
+                      for c in INDEX_COLUMNS},
     }
     return report
 
@@ -164,7 +163,8 @@ def clean_rows(
             rejected.append({**r, "_reason": "utility_domain"})
             continue
 
-        page_text = _clean_cell(r.get("page_text", ""))
+        # The index stores metadata only; page text lives in storage/*.txt.
+        content_length = int(r.get("content_length") or 0)
         # email / phone cells may hold several values joined by CONTACT_SEP.
         email = _clean_multi(r.get("email", ""), pp._valid_email, lower=True)
         # A phone is kept only if it validates or carries an international "+",
@@ -173,8 +173,8 @@ def clean_rows(
             r.get("phone_number", ""), lambda p: bool(pp._format_phone(p))
         )
 
-        # A page with no text AND no contact carries no value -> drop.
-        if not page_text and email == "N/A" and phone == "N/A":
+        # A page with no stored text AND no contact carries no value -> drop.
+        if content_length == 0 and email == "N/A" and phone == "N/A":
             rejected.append({**r, "_reason": "empty_no_contact"})
             continue
 
@@ -187,10 +187,10 @@ def clean_rows(
             "email": email,
             "phone_number": phone,
             "physical_address": _clean_cell(r.get("physical_address", "")) or "N/A",
-            "scrape_source_method": (r.get("scrape_source_method", "") or "").strip() or "N/A",
-            "date_added": (r.get("date_added", "") or "").strip(),
-            "page_text": page_text,
-            "raw_html": r.get("raw_html", "") or "",
+            "scrape_source_method": (r.get("http_status", "") or "").strip() or "N/A",
+            "date_added": (r.get("timestamp", "") or "").strip(),
+            "txt_path": r.get("txt_path", ""),
+            "content_length": content_length,
             "_domain": domain,
         })
 
@@ -199,7 +199,7 @@ def clean_rows(
 
 def dedupe_pages(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Collapse duplicate (business, page) rows, keeping the richest copy
-    (longest page_text / best contact)."""
+    (longest stored text / best contact)."""
     best: Dict[Tuple[str, str], Dict[str, str]] = {}
     for r in rows:
         key = (r["_domain"], r["page_url"])
@@ -211,7 +211,7 @@ def dedupe_pages(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 def _richness(r: Dict[str, str]) -> int:
     """Heuristic completeness score used to pick the best of duplicate rows."""
-    score = len(r.get("page_text", ""))
+    score = int(r.get("content_length") or 0)
     if r.get("email", "N/A") != "N/A":
         score += 5000
     if r.get("phone_number", "N/A") != "N/A":
@@ -250,8 +250,12 @@ def to_business_level(pages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         addr = next((r["physical_address"] for r in rows if r["physical_address"] != "N/A"), "N/A")
         dates = sorted(d for d in (r.get("date_added", "") for r in rows) if d)
 
-        desc_source = home.get("meta_description") or home.get("page_text", "")
-        description = _clean_cell(desc_source)[:DESCRIPTION_WIDTH]
+        # Prefer the homepage's meta description; fall back to the first lines
+        # of its stored cleaned text (read lazily — one small file, then freed).
+        desc_source = home.get("meta_description")
+        if not desc_source and home.get("txt_path"):
+            desc_source = get_store().read_page_text(home["txt_path"])[:1000]
+        description = _clean_cell(desc_source or "")[:DESCRIPTION_WIDTH]
         # All pages we actually scraped for this business, so coverage is visible.
         page_urls = list(dict.fromkeys(
             r.get("page_url", "") for r in rows_sorted if r.get("page_url")

@@ -10,9 +10,10 @@ One natural-language query runs the whole pipeline through Step 3:
 Usage:
     ./env/bin/python main.py --query "give me 10 marinas in dubai with no mobile apps"
 
-Step 3 reads each business's homepage HTML from the raw store
-(scavenger_leads_cache.csv), plus the user's query and the knowledge gaps the
-planner derived (e.g. "no mobile apps" -> mobile-app signals to look for).
+Step 3 reads each business's persisted link metadata from the storage layer
+(storage/<domain>/links.json — written by the streaming crawler), plus the
+user's query and the knowledge gaps the planner derived (e.g. "no mobile apps"
+-> mobile-app signals to look for). Raw HTML is never stored.
 """
 
 from __future__ import annotations
@@ -58,15 +59,15 @@ async def run(query: str, concurrency: int = 5) -> None:
     # domain -> JSON list of that business's high-intent routes (for leads_clean.csv).
     routes: Dict[str, str] = {}
     for website, name in businesses.items():
-        loaded = rf.load_homepage_from_store(website)
-        if not loaded:
-            logger.info("No homepage HTML stored for %s — skipping Step 3.", website)
+        # Step 3 reads the persisted link metadata (storage/<domain>/links.json)
+        # written by the streaming crawler — no raw HTML is stored or re-parsed.
+        result = rf.select_routes_for_site(website, query, knowledge_gaps)
+        if result is None:
+            logger.info("No stored link metadata for %s — skipping Step 3.", website)
             continue
-        base_url, html = loaded
-        result = rf.select_high_intent_routes(html, base_url, query, knowledge_gaps)
         routed += 1
-        routes[p1._domain_key(base_url)] = json.dumps(result.selected, ensure_ascii=False)
-        print(f"\n■ {name or base_url}")
+        routes[p1._domain_key(website)] = json.dumps(result.selected, ensure_ascii=False)
+        print(f"\n■ {name or website}")
         print(f"    candidates: {len(result.candidate_links)}  |  method: {result.selection_method}")
         for s in result.selected:
             print(f"    [{s['priority']}] ({s.get('confidence', '?')}) {s['url']}")
@@ -74,10 +75,10 @@ async def run(query: str, concurrency: int = 5) -> None:
 
     print(f"\nStep 3 complete: routed {routed}/{len(businesses)} business(es).")
 
-    # ---- Cleaning: build leads_clean.csv (with high_intent_pages) from raw store ----
+    # ---- Cleaning: build leads_clean.csv (with high_intent_pages) from the index ----
     import data_pipeline
     print("\n[clean] Building leads_clean.csv...")
-    data_pipeline.run(p1.OUTPUT_CSV_FILE, routes=routes)
+    data_pipeline.run(routes=routes)
 
 
 def main() -> None:
