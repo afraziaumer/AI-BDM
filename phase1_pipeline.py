@@ -36,7 +36,7 @@ import socket
 import sys
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote, urljoin
 
 import aiohttp
@@ -53,6 +53,20 @@ from LLM_planner import plan_query, classify_business
 # Modular storage layer: cleaned page text + link metadata + per-page index.
 # Local filesystem today; swap the backend in storage.get_store() for R2 later.
 from storage import get_store
+
+# Search-result triage (official website / discovery source to mine / noise)
+# and the deduplicated discovery queue — independent of the crawler; new
+# discovery-source types are added there, never here.
+import discovery_classifier as dc
+
+# Tech Stack Detection is an OPTIONAL processing step inside the crawl (see
+# crawl_site below) — never a hard dependency of the crawler. If the module or
+# its Wappalyzer dependency isn't installed, detection is silently skipped and
+# the crawl behaves exactly as it did before this feature existed.
+try:
+    import tech_stack
+except ImportError:
+    tech_stack = None  # type: ignore[assignment]
 
 # --- Logging ---------------------------------------------------------------
 logging.basicConfig(
@@ -139,6 +153,12 @@ MAX_SEARCH_PAGES = 3             # safety ceiling on how far discovery may page
 SEARCH_RESULTS_PER_PAGE = 10     # fallback per-page chunk when N isn't provided
 MAX_DIRECTORIES_TO_HARVEST = 6   # cap directory pages we crawl for outbound links
 MAX_PLACES_PAGES = 8             # Google Maps (Places) pages to sweep for businesses
+# General search keeps discovering (deeper Serper pages + mining discovery
+# sources) across MULTIPLE rounds until N qualified leads are collected — not
+# until N candidates have been attempted. This bounds the total pages consulted
+# across ALL rounds in one run, so a query with genuinely few real businesses
+# can't page into Google forever; the honest shortfall is reported instead.
+MAX_TOTAL_SEARCH_PAGES_PER_RUN = 30
 # Google Maps (Places) is a bonus source of real businesses run BEFORE the
 # organic Google search. OFF by default so the result is exactly "all businesses
 # across N Google pages" (set True to also mix in Google Maps results).
@@ -288,109 +308,15 @@ JUNK_EMAIL_HINTS = (
     "noreply@", "no-reply@", "donotreply@",
 )
 
-# Domains that are directories/aggregators/social, not a business's own site.
-# Web search for "<category> in <place>" surfaces many of these; we skip them
-# so the pipeline scrapes actual business homepages.
-AGGREGATOR_DOMAINS = (
-    # social
-    "facebook.com", "instagram.com", "twitter.com", "x.com", "linkedin.com",
-    "youtube.com", "tiktok.com", "pinterest.com", "reddit.com",
-    # directories / reviews / maps
-    "yelp.com", "tripadvisor.com", "mapquest.com", "foursquare.com",
-    "google.com", "goo.gl", "maps.app.goo.gl", "wikipedia.org",
-    "yellowpages.com", "bbb.org", "indeed.com", "glassdoor.com",
-    # travel / booking aggregators
-    "booking.com", "expedia.com", "agoda.com", "trip.com", "kayak.com",
-    "marinas.com", "navily.com", "visitdubai.com", "lonelyplanet.com",
-    # ad / tracker networks
-    "reklam5.com", "doubleclick.net", "googlesyndication.com",
-    "googleadservices.com", "taboola.com", "outbrain.com", "adnxs.com",
-    # social share / chat / link shorteners / app stores (exact)
-    "wa.me", "t.me", "bit.ly", "linktr.ee", "apps.apple.com", "itunes.apple.com",
-    "play.google.com", "m.me", "api.whatsapp.com",
-)
-
-# Brand-level blocklist (TLD-agnostic): matches the registered-domain LABEL, so
-# tripadvisor.com AND tripadvisor.be / yelp.co.uk / zomato.pk are ALL blocked.
-# These are review sites, directories, aggregators, listicles and Q&A sites —
-# never the official business website we want. (A real business named e.g.
-# "bookingmarina.com" is safe: its label is "bookingmarina", not "booking".)
-AGGREGATOR_BRANDS = frozenset({
-    # restaurant / food reviews + delivery + directories
-    "tripadvisor", "yelp", "zomato", "opentable", "foodpanda", "restaurantguru",
-    "wanderlog", "eater", "thefork", "grubhub", "ubereats", "deliveroo",
-    "doordash", "happycow", "timeout", "citysearch", "sirved", "menupix",
-    "pakistanfoodportal", "pakistanirestaurants", "restaurantji", "allmenus",
-    # travel / hotel aggregators + review
-    "booking", "expedia", "agoda", "trivago", "kayak", "hotels", "hostelworld",
-    "lonelyplanet", "getyourguide", "viator", "evendo",
-    # general directories / listings / Q&A / ranking
-    "yellowpages", "foursquare", "mapquest", "yell", "manta", "hotfrog",
-    "quora", "reddit", "wikipedia", "wikivoyage", "crunchbase", "glassdoor",
-    "indeed", "bbb", "clutch", "trustpilot", "sitejabber", "justdial",
-    "sulekha", "citypass", "cylex", "brownbook", "n49", "cybo",
-    # healthcare / professional booking directories (not an individual practice)
-    "zocdoc", "opencare", "healthgrades", "vitals", "ratemds", "webmd", "tebra",
-    "usnews", "webdental", "todaysbestdentists", "sharecare", "smiledirectclub",
-    "1800dentist", "dentaldepartures", "yelp",
-    # blog / publishing platforms (never an official business homepage)
-    "wordpress", "blogspot", "blogger", "medium", "substack", "tumblr",
-    "wix", "weebly", "squarespace", "godaddysites", "webador",
-    # app stores + social / chat + link shorteners (brand-level; short ones like
-    # wa.me / t.me / bit.ly are exact-matched in AGGREGATOR_DOMAINS instead).
-    "apple", "itunes", "microsoft", "whatsapp", "telegram",
-    "linktree", "tinyurl",
-})
-
-# Subdomains, anchor texts and paths that mark a link as a utility/CTA/footer
-# link (sign-up, help, login, ads...) rather than an actual business site.
-UTILITY_SUBDOMAINS = frozenset({
-    "help", "support", "signup", "sign-up", "login", "signin", "account",
-    "accounts", "blog", "shop", "store", "app", "apps", "api", "docs",
-    "status", "mail", "satellite", "cdn", "static", "ads", "ad", "portal",
-    "my", "dashboard", "go", "get", "link", "track",
-})
-UTILITY_ANCHOR_RE = re.compile(
-    r"\b(sign\s?up|sign\s?in|log\s?in|login|register|subscribe|download|"
-    r"activate|get\s?started|learn\s?more|read\s?more|contact\s?us|help|"
-    r"support|faq|privacy|terms|cookies?|careers?|advertise|book\s?now|"
-    r"buy\s?now|shop\s?now|free\s?now)\b",
-    re.IGNORECASE,
-)
-UTILITY_PATH_HINTS = (
-    "/signup", "/sign-up", "/signin", "/login", "/register", "/account",
-    "/support", "/help", "/privacy", "/terms", "/cart", "/checkout",
-    "/subscribe", "/download", "/advertise",
-)
+# Search-result triage (official website / discovery source to mine / noise)
+# lives entirely in discovery_classifier.py — a module deliberately independent
+# of the crawler, so new discovery-source types can be added there without
+# touching this file. See discover_targets / discover_places below.
 
 # Offline domain extractor (bundled public-suffix snapshot; no network fetch).
 _TLD = tldextract.TLDExtract(
     suffix_list_urls=(),
     cache_dir=os.getenv("TLDEXTRACT_CACHE", ".tldextract-cache"),
-)
-
-# Path fragments and title patterns that mark a result as an article/listicle/
-# directory page rather than a single business homepage.
-ARTICLE_PATH_HINTS = (
-    "/blog", "/news", "/article", "/articles", "/guide", "/guides",
-    "/region/", "/browse/", "/explore", "/wiki/", "/category/", "/list",
-    "/directory", "/directories",
-)
-# Listicle / directory / review title signals — matched ANYWHERE in the title
-# (not just the start), since "Cafe Near Me - Best Coffee Shops in Islamabad"
-# and "Exploring the Best Cafes" are listicles too.
-ARTICLE_TITLE_RE = re.compile(
-    r"\b("
-    r"\d+\s+best|best\s+\d+|top\s+\d+|\d+\s+(?:best|top|great|famous|popular)|"
-    r"the\s+best\b|best\b|top\b|"
-    r"a\s+guide\b|guide\s+to\b|ultimate\s+guide\b|complete\s+guide\b|"
-    r"exploring\b|near\s+me\b|"
-    # "<category> in <city>" listicle phrasing (cafes/coffee shops/restaurants in …)
-    r"(?:cafe|cafes|cafés?|coffee\s+shops?|restaurants?|hotels?|bars?|"
-    r"places?|things\s+to\s+do)\s+(?:in|near|around)\b|"
-    r"where\s+to\b|must[- ]?visit\b|reviews?\b|ranked\b|listings?\b|directory\b"
-    r")",
-    re.IGNORECASE,
 )
 
 BROWSER_HEADERS = {
@@ -425,18 +351,6 @@ async def deconstruct_intent(user_prompt: str) -> Dict[str, Any]:
 
 
 # === Step 2: Target footprint discovery ====================================
-def _is_aggregator(host: str) -> bool:
-    """True if host is a review/directory/aggregator, not an official business.
-
-    Checks exact/suffix domains AND the TLD-agnostic brand label, so country
-    variants (tripadvisor.be, yelp.co.uk, zomato.pk) are all caught.
-    """
-    if any(host == d or host.endswith("." + d) for d in AGGREGATOR_DOMAINS):
-        return True
-    brand = _TLD.extract_str(host).domain.lower()
-    return brand in AGGREGATOR_BRANDS
-
-
 def _domain_key(url_or_host: str) -> str:
     """Registered domain (e.g. 'help.predictwind.com' -> 'predictwind.com').
 
@@ -487,16 +401,6 @@ def _strip_tracking(url: str) -> str:
     return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(kept), ""))
 
 
-def _is_utility_link(host: str, path: str, anchor: str) -> bool:
-    """True if a harvested link is a sign-up/help/login/ad/CTA link, not a site."""
-    subdomain = host.split(".")[0]
-    if subdomain in UTILITY_SUBDOMAINS:
-        return True
-    if any(hint in path.lower() for hint in UTILITY_PATH_HINTS):
-        return True
-    return bool(anchor and UTILITY_ANCHOR_RE.search(anchor))
-
-
 def _is_internal_crawl_noise(host: str, path: str) -> bool:
     """True for same-site pages that are not useful crawl targets.
 
@@ -534,13 +438,6 @@ def _is_internal_crawl_noise(host: str, path: str) -> bool:
     return False
 
 
-def _looks_like_article(title: str, path: str) -> bool:
-    """True if the result is a blog/listicle/directory page, not a homepage."""
-    if any(hint in path.lower() for hint in ARTICLE_PATH_HINTS):
-        return True
-    return bool(title and ARTICLE_TITLE_RE.match(title))
-
-
 async def _read_html(resp: aiohttp.ClientResponse) -> str:
     """Decode a response body as UTF-8 first (most sites), falling back to the
     declared charset only if that fails. Avoids the mojibake (â€™, Ã©) you get
@@ -566,57 +463,6 @@ async def _native_get(session: aiohttp.ClientSession, url: str) -> Optional[str]
         logger.debug("Native GET failed for %s: %s", url, exc)
     return None
 
-
-async def harvest_directory(
-    session: aiohttp.ClientSession,
-    directory_url: str,
-    seen_hosts: Set[str],
-    needed: int,
-) -> List[Dict[str, Any]]:
-    """Follow a directory/listicle's outbound links to individual businesses.
-
-    Fetches the directory cheaply (native only), then returns up to `needed`
-    new targets: external links whose host is not the directory itself, not an
-    aggregator, and not already seen. Each business is normalized to its
-    homepage URL so the scraper hits the root site.
-    """
-    html = await _native_get(session, directory_url)
-    if not html:
-        return []
-
-    source_domain = _domain_key(directory_url)
-    found: List[Dict[str, Any]] = []
-    soup = BeautifulSoup(html, "lxml")
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href.lower().startswith("http"):  # only cross-site absolute links
-            continue
-        parsed = urlparse(href)
-        host = parsed.netloc.lower().removeprefix("www.")
-        domain = _domain_key(href)
-        anchor = a.get_text(strip=True)
-        if not host or domain == source_domain or domain in seen_hosts:
-            continue
-        if _is_aggregator(host) or _looks_like_article(anchor, parsed.path):
-            continue
-        # Drop footer/CTA/utility/ad links (sign-up, help, login, satellite...).
-        if _is_utility_link(host, parsed.path, anchor):
-            logger.debug("Skipping utility link: %s (%r)", href, anchor)
-            continue
-        seen_hosts.add(domain)
-        found.append(
-            {
-                "title": anchor or host,
-                "website": f"{parsed.scheme}://{parsed.netloc}/",  # business homepage
-                "snippet": f"(harvested from {source_domain})",
-            }
-        )
-        if len(found) >= needed:
-            break
-
-    if found:
-        logger.info("Harvested %d businesses from directory %s", len(found), source_domain)
-    return found
 
 
 # === Search-state persistence ==============================================
@@ -769,15 +615,23 @@ async def discover_places(
             website = (item.get("website") or "").strip()
             if not website:
                 continue                         # need a site to scrape
-            host = urlparse(website).netloc.lower().removeprefix("www.")
             domain = _domain_key(website)
-            if not host or domain in seen_hosts or _is_aggregator(host):
+            if not domain or domain in seen_hosts:
+                continue
+            result = dc.classify_search_result(website, item.get("title", "") or "")
+            logger.info("Classified (Places) %s -> %s (%s)",
+                        website, result.category.value, result.reason)
+            if result.category != dc.ResultCategory.OFFICIAL:
+                # A Places listing's own "website" field pointing at a
+                # directory/aggregator is rare but happens — never queue it.
                 continue
             seen_hosts.add(domain)
             targets.append({
                 "title": item.get("title", "") or "",
                 "website": website,
                 "snippet": item.get("address", "") or "",
+                "discovered_from": ["Google Maps"],
+                "source_confidence": dc.Confidence.HIGH.value,
             })
             if len(targets) >= limit:
                 break
@@ -814,7 +668,9 @@ async def discover_targets(
     )
 
     targets: List[Dict[str, Any]] = []
-    directories: List[str] = []
+    # (url, source_name, confidence) — discovery sources to MINE, not discard.
+    directories: List[tuple] = []
+    noise_count = 0
     seen_hosts: Set[str] = set(exclude_domains or ())
     page = start_page
     last_page = start_page
@@ -845,36 +701,54 @@ async def discover_targets(
         for item in organic:
             link = item.get("link", "")
             title = item.get("title", "") or ""
-            parsed = urlparse(link)
-            host = parsed.netloc.lower().removeprefix("www.")
             domain = _domain_key(link)
-            if not host or domain in seen_hosts or _is_aggregator(host):
+            if not domain or domain in seen_hosts:
                 continue
-            if _looks_like_article(title, parsed.path):
-                directories.append(link)
+
+            result = dc.classify_search_result(link, title)
+            logger.info("Classified %s -> %s (%s)", link, result.category.value, result.reason)
+
+            if result.category == dc.ResultCategory.NOISE:
+                noise_count += 1
                 continue
+            if result.category == dc.ResultCategory.DISCOVERY_SOURCE:
+                directories.append((link, result.source_name, result.confidence))
+                continue
+
+            # OFFICIAL
             seen_hosts.add(domain)
-            targets.append(
-                {"title": title, "website": link, "snippet": item.get("snippet", "")}
-            )
+            targets.append({
+                "title": title, "website": link, "snippet": item.get("snippet", ""),
+                "discovered_from": ["Google Search"],
+                "source_confidence": dc.Confidence.MEDIUM.value,
+            })
             if len(targets) >= limit:
                 break
         page += 1
 
     direct_count = len(targets)
 
-    # Top up from directories when direct results fell short.
-    for directory_url in directories[:MAX_DIRECTORIES_TO_HARVEST]:
+    # Mine discovery sources for individual businesses — highest-confidence
+    # sources first (Google Maps/associations before random directories).
+    directories.sort(key=lambda d: dc.confidence_rank(d[2]), reverse=True)
+    mined_count = 0
+    sources_mined = 0
+    for directory_url, source_name, confidence in directories[:MAX_DIRECTORIES_TO_HARVEST]:
         if len(targets) >= limit:
             break
-        harvested = await harvest_directory(
-            session, directory_url, seen_hosts, needed=limit - len(targets)
+        businesses = await dc.extract_businesses_from_source(
+            session, directory_url, source_name or directory_url, confidence,
+            seen_hosts, needed=limit - len(targets),
         )
-        targets.extend(harvested)
+        sources_mined += 1
+        mined_count += len(businesses)
+        targets.extend(b.as_target() for b in businesses)
 
     logger.info(
-        "Discovery: %d sites (%d direct, %d harvested) | pages %d-%d",
-        len(targets), direct_count, len(targets) - direct_count, start_page, last_page,
+        "Discovery: %d sites (%d direct, %d mined from %d/%d discovery source(s)) | "
+        "%d noise rejected | pages %d-%d",
+        len(targets), direct_count, mined_count, sources_mined, len(directories),
+        noise_count, start_page, last_page,
     )
     return targets, last_page
 
@@ -887,14 +761,16 @@ _scrapedo_semaphore = asyncio.Semaphore(SCRAPEDO_MAX_CONCURRENCY)
 
 async def _scrapedo_fetch(
     session: aiohttp.ClientSession, target_url: str, render: bool
-) -> str:
-    """One Scrape.do proxy fetch. Returns HTML on 200, else "".
+) -> Tuple[str, Dict[str, str]]:
+    """One Scrape.do proxy fetch. Returns (html, headers); html is "" on failure.
 
     render=False → cheap: raw HTML through the proxy, no browser (~1 credit).
     render=True  → expensive: runs a headless browser (JS) via a premium proxy
                    for hard/SPA sites, with images/CSS/fonts blocked so it's fast.
     Concurrency-throttled and 429-retried with backoff. Scrape.do bills only
-    HTTP 200s, so failed cheap attempts cost nothing.
+    HTTP 200s, so failed cheap attempts cost nothing. Headers are Scrape.do's
+    own response headers (best-effort passthrough), not guaranteed identical to
+    the origin's — still useful bonus signal for tech detection when present.
     """
     params: Dict[str, str] = {"token": SCRAPEDO_API_KEY, "url": target_url}
     if render:
@@ -912,30 +788,35 @@ async def _scrapedo_fetch(
                     timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
                 ) as resp:
                     if resp.status == 200:
-                        return await _read_html(resp)
+                        return await _read_html(resp), dict(resp.headers)
                     if not (resp.status == 429 and attempt < SCRAPEDO_MAX_RETRIES):
                         logger.error("Scrape.do %s failed (status=%s): %s",
                                      mode, resp.status, target_url)
-                        return ""
+                        return "", {}
         except asyncio.TimeoutError:
             logger.error("Scrape.do %s timed out (>%ss): %s",
                          mode, SCRAPEDO_TIMEOUT_S, target_url)
-            return ""
+            return "", {}
         except Exception as exc:  # noqa: BLE001
             logger.error("Scrape.do %s error for %s: %s", mode, target_url, repr(exc))
-            return ""
+            return "", {}
         # 429 with retries left: back off (semaphore released), then retry.
         wait = SCRAPEDO_BACKOFF_S * (attempt + 1)
         logger.warning("Scrape.do 429 rate-limited — backing off %ss: %s",
                        wait, target_url)
         await asyncio.sleep(wait)
-    return ""
+    return "", {}
 
 
 async def execute_scavenger_scrape(
     session: aiohttp.ClientSession, target_url: str
 ) -> Dict[str, Any]:
-    """Tier-1 native fetch; on block/error fail over to Tier-2 Scrape.do."""
+    """Tier-1 native fetch; on block/error fail over to Tier-2 Scrape.do.
+
+    Returns {"html", "method", "headers"}. Headers are captured from the SAME
+    response already being fetched (no extra request) so downstream tech-stack
+    detection (Wappalyzer) can use them without a second call to the site.
+    """
     # --- Tier 1: low-cost native request ---
     try:
         logger.info("Tier-1 native fetch: %s", target_url)
@@ -948,7 +829,7 @@ async def execute_scavenger_scrape(
             waf_detected = any(sig in body.lower() for sig in ANTI_BOT_SIGNATURES)
             if resp.status in HTTP_OK and not waf_detected:
                 logger.info("Tier-1 success: %s", target_url)
-                return {"html": body, "method": "NATIVE"}
+                return {"html": body, "method": "NATIVE", "headers": dict(resp.headers)}
             logger.warning(
                 "Tier-1 blocked (status=%s, waf=%s): %s",
                 resp.status, waf_detected, target_url,
@@ -958,32 +839,32 @@ async def execute_scavenger_scrape(
             # 404 came WITH an anti-bot signature it may be a faked block, so we
             # still escalate that case.)
             if resp.status == 404 and not waf_detected:
-                return {"html": "", "method": "FAILED"}
+                return {"html": "", "method": "FAILED", "headers": {}}
     except Exception as exc:  # noqa: BLE001
         logger.warning("Tier-1 connection failed for %s: %s", target_url, exc)
 
     # --- Tier 2: Scrape.do — cheap proxy first, JS-render fallback on failure ---
     if not SCRAPEDO_API_KEY:
         logger.error("Scrape.do token missing; cannot escalate %s", target_url)
-        return {"html": "", "method": "FAILED"}
+        return {"html": "", "method": "FAILED", "headers": {}}
 
     logger.info("Tier-2 Scrape.do escalation: %s", target_url)
     # 2a — cheap: raw HTML through the proxy, no browser (cheapest, ~1 credit).
-    html = await _scrapedo_fetch(session, target_url, render=False)
+    html, headers = await _scrapedo_fetch(session, target_url, render=False)
     if html:
         logger.info("Tier-2 success (plain): %s", target_url)
-        return {"html": html, "method": "SCRAPEDO"}
+        return {"html": html, "method": "SCRAPEDO", "headers": headers}
 
     # 2b — fallback: only sites that failed cheap get the expensive JS render +
     # premium proxy (images/css/fonts blocked for speed). Cost-safe: the cheap
     # miss above was free, and Scrape.do bills only successful (200) requests.
     if SCRAPEDO_RENDER_FALLBACK:
-        html = await _scrapedo_fetch(session, target_url, render=True)
+        html, headers = await _scrapedo_fetch(session, target_url, render=True)
         if html:
             logger.info("Tier-2 success (render): %s", target_url)
-            return {"html": html, "method": "SCRAPEDO_RENDER"}
+            return {"html": html, "method": "SCRAPEDO_RENDER", "headers": headers}
 
-    return {"html": "", "method": "FAILED"}
+    return {"html": "", "method": "FAILED", "headers": {}}
 
 
 # === Step 3.5: Whole-site crawl ============================================
@@ -1154,6 +1035,7 @@ async def crawl_site(
     root_html: str,
     root_method: str,
     *,
+    root_headers: Optional[Dict[str, str]] = None,
     company_name: str = "",
     country_code: str = "",
     phone_regex: str = "",
@@ -1175,6 +1057,13 @@ async def crawl_site(
     survives the loop: contact lists, keyword hits (checked against each FULL
     page before it is freed), and a bounded classification sample. Pages are
     staged; the caller commits or discards the whole domain after qualification.
+
+    Tech Stack Detection (Wappalyzer) runs on the HOMEPAGE'S raw HTML while it
+    is still in memory below — the SAME response already fetched here, never a
+    second request — and is staged alongside the pages so a rejected business's
+    profile is discarded with everything else. This happens unconditionally for
+    every newly-crawled business; only surfacing it to a user is intent-gated
+    (see tech_stack.get_stored_profile, called elsewhere at query time).
     """
     store = get_store()
     domain = _domain_key(root_url)
@@ -1192,6 +1081,8 @@ async def crawl_site(
     sample_chars = 0
     seen_sigs: Set[str] = set()          # content signatures → skip dup pages
     home_lines: Optional[Set[str]] = None  # homepage boilerplate for dedupe
+    discovered_urls: Set[str] = set()    # every page/link URL seen (tech profile's
+                                          # login/portal path-hint check, at the end)
 
     async def _process_one(page_url: str, html: str, method: str) -> List[str]:
         """Process ONE page end-to-end and stage it. Returns its internal links.
@@ -1204,6 +1095,11 @@ async def crawl_site(
         # Hyperlinks FIRST, from the raw soup, so cleaning can't lose them.
         link_pairs = _extract_internal_link_pairs(soup, page_url, domain)
         link_urls = [p["url"] for p in link_pairs]
+        # Tracked regardless of whether this page's content is kept — a login/
+        # portal path is itself a signal for tech profiling, even off a thin or
+        # duplicate-content page. Cheap: just strings, not page content.
+        discovered_urls.add(page_url)
+        discovered_urls.update(link_urls)
         cleaned = clean_page_for_llm(soup, page_url)
         del soup
         text = cleaned["text"]
@@ -1279,6 +1175,22 @@ async def crawl_site(
 
     # --- Homepage (already fetched by the caller's two-tier scrape) ---------
     home_link_urls = await _process_one(root_url, root_html, root_method)
+
+    # Tech Stack Detection: Wappalyzer runs on the SAME raw HTML above, still
+    # in memory, before it is freed on the next line — never a second request.
+    # Unconditional (collection isn't gated by query intent); best-effort, so a
+    # detection failure can never break the crawl. Assembled into the full
+    # profile at the end of this function, once every page has been discovered
+    # (stronger login/customer-portal signal than the homepage alone gives).
+    tech_raw: Dict[str, Dict[str, Any]] = {}
+    if tech_stack is not None:
+        try:
+            tech_raw = await asyncio.to_thread(
+                tech_stack.analyze_raw_html, domain, root_html, root_headers
+            )
+        except Exception as exc:  # noqa: BLE001 - detection is best-effort
+            logger.warning("Tech-stack detection failed for %s: %s", domain, exc)
+
     del root_html  # the raw homepage HTML is not needed past this point
 
     visited: Set[str] = {_normalize_page_url(root_url)}
@@ -1333,6 +1245,25 @@ async def crawl_site(
         "Crawled %d page(s) of %s (%d fetches, %d priority candidates) — streamed to staging",
         pages_kept, domain, attempts, len(priority_urls),
     )
+
+    # Assemble the full tech profile NOW — every page this crawl discovered is
+    # known at this point, giving login/customer-portal detection its strongest
+    # signal (a nav link 2 clicks deep still counts, even if never fetched).
+    # Staged alongside the pages: commit_domain/discard_domain move or delete
+    # it together with everything else, no separate lifecycle to maintain.
+    if tech_stack is not None and tech_raw:
+        try:
+            profile = tech_stack.build_website_profile(
+                domain, tech_raw, homepage_url=root_url, fetch_method=root_method,
+                discovered_urls=discovered_urls,
+            )
+            profile["sales_signals"] = tech_stack.generate_sales_signals_from_profile(profile)
+            store.stage_tech_profile(domain, profile["capabilities"], profile)
+            logger.info("Tech stack profiled for %s: %d technologies detected.",
+                        domain, len(tech_raw))
+        except Exception as exc:  # noqa: BLE001 - never break the crawl over this
+            logger.warning("Failed to stage tech profile for %s: %s", domain, exc)
+
     return {
         "domain": domain,
         "pages_kept": pages_kept,
@@ -2033,8 +1964,10 @@ async def process_single_lead(
                 return {"company_name": name, "website_url": url,
                         "status": "failed", "method": "FAILED"}
             root_method = root["method"]
+            root_headers = root.get("headers", {})
             crawl = await crawl_site(
                 session, url, root.pop("html"), root_method,
+                root_headers=root_headers,
                 company_name=name or "",
                 country_code=country_code, phone_regex=phone_regex,
                 exclude_keywords=exclude_keywords,
@@ -2212,79 +2145,110 @@ async def run_pipeline(
                         country_code=country_code, phone_regex=phone_regex,
                     ))
         else:
-            # GENERAL: keep discovering and scraping in batches of `concurrency`
-            # until we have collected `effective_limit` SUCCESSFUL leads, or until
-            # Serper runs out of results. This ensures "50 marinas" means 50
-            # stored leads, not 50 attempts that might half-fail.
+            # GENERAL: keep discovering — deeper Serper pages, plus mining any
+            # discovery sources (directories/associations/etc.) encountered —
+            # across MULTIPLE rounds, accumulating candidates in a deduplicated
+            # queue and crawling newly-queued businesses each round, UNTIL
+            # `effective_limit` REAL QUALIFIED leads are collected. This is the
+            # actual goal ("50 marinas" means 50 qualified companies), not "50
+            # search results attempted". Bounded by MAX_TOTAL_SEARCH_PAGES_PER_RUN
+            # so a query with few genuine businesses can't page forever — the
+            # honest shortfall is reported instead of padding the count.
             state = _load_search_state()
             start_page = state.get(query, 1)
             current_page = start_page
             logger.info("General search — resuming from Serper page %d.", current_page)
 
             exclude_set = set(existing_by_domain)
+            attempted: Set[str] = set()
+            queue = dc.DiscoveryQueue()
             total_discovered = 0
             last_page = current_page
+            round_num = 0
+            exhausted = False
 
             # Phase A — Google Maps (Places): a fast source of REAL individual
-            # businesses (organic search alone tends to surface directories for
-            # location queries). Bounded to N so it doesn't overshoot the target.
+            # businesses, queued once upfront (Places sweeps its own pages
+            # internally, up to MAX_PLACES_PAGES — not part of the round loop).
             if USE_PLACES_DISCOVERY:
                 place_targets = await discover_places(
-                    session, query,
-                    limit=effective_limit,          # bounded to N
+                    session, query, limit=effective_limit * 2,
                     exclude_domains=exclude_set,
                 )
-                if place_targets:
-                    total_discovered += len(place_targets)
-                    for t in place_targets:
-                        exclude_set.add(_domain_key(t["website"]))
-                    place_results = await asyncio.gather(*[
-                        process_single_lead(
-                            session, semaphore, target, cache, exclude_keywords,
-                            include_keywords, industry, geo,
-                            country_code=country_code, phone_regex=phone_regex,
-                        )
-                        for target in place_targets
-                    ])
-                    results.extend(place_results)
-                    logger.info(
-                        "After Places: %d leads (%d businesses scraped).",
-                        _is_lead_count(results), len(place_targets),
-                    )
+                total_discovered += len(place_targets)
+                for t in place_targets:
+                    queue.add(dc.QueuedBusiness(
+                        website=t["website"], title=t.get("title", ""),
+                        snippet=t.get("snippet", ""),
+                        discovered_from=list(t.get("discovered_from") or ["Google Maps"]),
+                        confidence=dc.Confidence(
+                            t.get("source_confidence", dc.Confidence.HIGH.value)
+                        ),
+                    ))
+                logger.info("Places discovery queued %d business(es).", len(place_targets))
 
-            # Phase B — organic Google search: discover exactly N candidates (N =
-            # the query number, e.g. "5 marinas" -> 5). Only spills past page 1
-            # if page 1 alone doesn't yield N usable (non-aggregator, non-
-            # directory) results; MAX_SEARCH_PAGES is just the safety ceiling on
-            # how far it may page to still reach N — never a deliberate over-fetch.
-            batch_targets, last_page = await discover_targets(
-                session, query,
-                limit=effective_limit,                 # exactly N candidates
-                exclude_domains=exclude_set,
-                start_page=1,
-                per_page=effective_limit,              # N-sized chunk per page
-                max_pages=MAX_SEARCH_PAGES,            # ceiling, not a target
-            )
-            if batch_targets:
-                total_discovered += len(batch_targets)
-                for t in batch_targets:
-                    exclude_set.add(_domain_key(t["website"]))
+            # Phase B — organic search + discovery-source mining, repeated
+            # across rounds until N qualified leads are collected.
+            while (
+                _is_lead_count(results) < effective_limit
+                and (current_page - start_page) < MAX_TOTAL_SEARCH_PAGES_PER_RUN
+                and not exhausted
+            ):
+                round_num += 1
+                pending = queue.pending(attempted)
+
+                # Top up the queue only if it can't already cover this round.
+                if len(pending) < effective_limit:
+                    batch_targets, last_page = await discover_targets(
+                        session, query,
+                        limit=effective_limit,
+                        exclude_domains=exclude_set | attempted | queue.domains(),
+                        start_page=current_page,
+                        per_page=effective_limit,
+                        max_pages=MAX_SEARCH_PAGES,
+                    )
+                    total_discovered += len(batch_targets)
+                    current_page = last_page + 1
+                    if not batch_targets:
+                        exhausted = True
+                    for t in batch_targets:
+                        queue.add(dc.QueuedBusiness(
+                            website=t["website"], title=t.get("title", ""),
+                            snippet=t.get("snippet", ""),
+                            discovered_from=list(t.get("discovered_from") or ["Google Search"]),
+                            confidence=dc.Confidence(
+                                t.get("source_confidence", dc.Confidence.MEDIUM.value)
+                            ),
+                        ))
+                    pending = queue.pending(attempted)
+
+                if not pending:
+                    logger.info(
+                        "Discovery exhausted at round %d — no more candidates "
+                        "(collected %d/%d qualified leads).",
+                        round_num, _is_lead_count(results), effective_limit,
+                    )
+                    break
+
+                still_needed = max(effective_limit - _is_lead_count(results), 1)
+                batch = pending[:still_needed]
+                for b in batch:
+                    attempted.add(dc.domain_key(b.website))
                 batch_results = await asyncio.gather(*[
                     process_single_lead(
-                        session, semaphore, target, cache, exclude_keywords,
+                        session, semaphore, b.as_target(), cache, exclude_keywords,
                         include_keywords, industry, geo,
                         country_code=country_code, phone_regex=phone_regex,
                     )
-                    for target in batch_targets
+                    for b in batch
                 ])
                 results.extend(batch_results)
-            logger.info(
-                "Organic search: target N=%d -> %d businesses discovered "
-                "(pages %d-%d), %d leads total.",
-                effective_limit, len(batch_targets), 1, last_page,
-                _is_lead_count(results),
-            )
-            current_page = last_page + 1
+                logger.info(
+                    "Round %d: attempted %d business(es) -> %d/%d qualified leads "
+                    "so far (queue: %d total, %d unattempted).",
+                    round_num, len(batch), _is_lead_count(results), effective_limit,
+                    len(queue), len(queue.pending(attempted)),
+                )
 
             # Persist the cursor for the next run.
             state[query] = current_page
@@ -2410,6 +2374,22 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print(f"Crawl index: {CRAWL_INDEX_FILE}  |  Cleaned pages: storage/<domain>/*.txt\n")
 
 
+async def _run_tech_stack_batch(ts_module, domains: Set[str]) -> Dict[str, Any]:
+    """Run tech_stack.get_stored_profile() for each domain concurrently.
+
+    get_stored_profile() ALWAYS checks storage first — every domain here was
+    just crawled in Stage 1 above, which already ran Wappalyzer on its
+    homepage and staged the result, so this is normally a pure disk read (only
+    a rare fallback scan makes a blocking request, hence still offloaded via
+    asyncio.to_thread). This module never shares the crawler's aiohttp session.
+    """
+    domains = list(domains)
+    profiles = await asyncio.gather(
+        *[asyncio.to_thread(ts_module.get_stored_profile, d) for d in domains]
+    )
+    return dict(zip(domains, profiles))
+
+
 def main() -> None:
     # Windows consoles default to cp1252 and crash on Unicode (e.g. a non-break
     # hyphen) when printing the summary. Force UTF-8 output where supported.
@@ -2451,13 +2431,45 @@ def main() -> None:
         print("\n[clean] Skipped — no qualified leads to clean or enrich this run.")
         return
 
+    # Stage 1.5 — Tech Stack Detection: ONLY if this query's intent needs it
+    # (LLM_planner sets plan["needs_tech_stack"]). Runs after Stage 1 has
+    # already discovered/crawled every qualified business; it never triggers a
+    # crawl itself, it only consumes what Stage 1 already produced.
+    tech_stacks: Dict[str, str] = {}
+    plan = summary.get("plan") or {}
+    if plan.get("needs_tech_stack"):
+        import json as _json
+        import tech_stack as ts
+        domains = {
+            _domain_key(q["website_url"]) for q in summary.get("qualified", [])
+            if q.get("website_url")
+        }
+        print("\n" + "#" * 64)
+        print(f"STEP 4 — TECH STACK DETECTION  ({len(domains)} business(es))")
+        print("#" * 64)
+        profiles = asyncio.run(_run_tech_stack_batch(ts, domains))
+        for domain, profile in profiles.items():
+            tech_stacks[domain] = _json.dumps(profile, ensure_ascii=False, default=str)
+            print(f"\n■ {domain}")
+            if profile.get("error"):
+                print(f"    error: {profile['error']}")
+                continue
+            normalized = profile.get("normalized_tech_stack", {})
+            for bucket in ts.NORMALIZED_BUCKETS:
+                if normalized.get(bucket):
+                    names = ", ".join(t["name"] for t in normalized[bucket])
+                    print(f"    {bucket:<14}: {names}")
+            for s in profile.get("sales_signals", []):
+                print(f"    [{s['confidence']:.2f}] {s['signal']} "
+                      f"-> {', '.join(s['recommended_services'])}")
+
     # Stage 2 — clean + format: derive the governed dataset in the same command.
     # Imported lazily so data_pipeline (which imports this module) stays decoupled.
     if not args.no_clean:
         import os
         import data_pipeline
         print("\n[clean] Running data-quality pipeline...")
-        data_pipeline.run()
+        data_pipeline.run(tech_stacks=tech_stacks)
 
         # Stage 3 — enrich: add each business's LinkedIn page to the same sheet.
         if not args.no_linkedin and os.path.exists(data_pipeline.CLEAN_EXPORT):
