@@ -125,6 +125,19 @@ leading zero or area code in parentheses).
      - UK  : r"(?:\\+44|0)[\\s.\\-]?(?:7\\d{9}|[1-9]\\d{8,9})(?!\\d)"
      (The double-backslash is required because these are JSON string values.)
      The regex will be compiled with re.IGNORECASE | re.MULTILINE by the pipeline.
+  J. Detect whether the request needs TECHNOLOGY STACK ANALYSIS \
+-> needs_tech_stack (boolean). This is a SEPARATE, OPTIONAL pipeline stage that \
+only runs after the normal lead collection above. Set it true ONLY when the \
+request is actually asking about a website's technology, not just business \
+qualities. Examples that must be true: "does this company use a CRM?", "what \
+tech stack does this site use?", "is their website outdated?", "are they using \
+WordPress?", "do they use React?", "what technologies power this website?", \
+"do they have a customer portal?", "should we pitch a website redesign?", \
+"what services could we offer based on their current tech?". Set it false for \
+ordinary lead requests, even ones that happen to mention a technology as an \
+EXCLUDE/INCLUDE keyword filter (e.g. "marinas with no CRM" is a keyword filter \
+on exclude_keywords, NOT a tech-stack analysis request -> false). Default false \
+whenever unsure.
 
 Output rules: respond with ONLY a single valid JSON object. No markdown, no prose.
 """
@@ -140,6 +153,7 @@ PLANNER_EXAMPLE = {
     "intent": "find_and_filter",
     "country_code": "US",
     "phone_regex": r"(?:(?:\+1|1)[\s.\-]?)?(?<!\d)(?:\([2-9]\d{2}\)|[2-9]\d{2})[\s.\-]?[2-9]\d{2}[\s.\-]?\d{4}(?!\d)",
+    "needs_tech_stack": False,
     "exclude_keywords": [
         "smart monitoring", "remote monitoring", "real-time monitoring",
         "iot", "internet of things", "sensors", "telemetry",
@@ -168,6 +182,10 @@ def plan_query(user_query: str) -> Dict[str, Any]:
       intent            - "find" or "find_and_filter"
       country_code      - ISO 3166-1 alpha-2 for the location ("US", "AE", …)
       phone_regex       - Python regex matching that country's phone formats
+      needs_tech_stack  - True only if the request asks about website technology
+                          (CRM/CMS/framework/outdated-site/redesign questions);
+                          gates the optional Tech Stack Detection stage, which
+                          runs after normal lead collection, never instead of it
       exclude_keywords  - expanded lowercase phrases that DISqualify a lead
       include_keywords  - expanded lowercase phrases that a lead should mention
       reasoning         - short note on how the query was interpreted

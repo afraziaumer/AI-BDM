@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import phase1_pipeline as pp
 import email_extractor as ee
+import discovery_classifier as dc
 from storage import INDEX_COLUMNS, get_store
 
 RAW_STORE = pp.CRAWL_INDEX_FILE                # crawl_index.csv (metadata only)
@@ -58,6 +59,7 @@ CLEAN_COLUMNS = [
     "physical_address", "num_pages", "date_added", "page_title", "description",
     "pages_scraped",
     "high_intent_pages",   # Step 3 LLM-selected routes (JSON list of dicts)
+    "tech_stack",          # optional Tech Stack Detection result (JSON object)
 ]
 DESCRIPTION_WIDTH = 280   # chars kept for the readable one-line description
 MAX_PHONES_PER_BUSINESS = 8   # cap the phone list (a bigger list = directory page)
@@ -156,10 +158,10 @@ def clean_rows(
         if not site or not domain:
             rejected.append({**r, "_reason": "no_website"})
             continue
-        if pp._is_aggregator(host):
+        if dc.classify_search_result(site).category != dc.ResultCategory.OFFICIAL:
             rejected.append({**r, "_reason": "aggregator_domain"})
             continue
-        if host and pp._is_utility_link(host, pp.urlparse(site).path, ""):
+        if host and dc.is_utility_link(host, pp.urlparse(site).path):
             rejected.append({**r, "_reason": "utility_domain"})
             continue
 
@@ -442,7 +444,8 @@ def scope_to_last_run(
 
 def run(path: str = RAW_STORE, dry_run: bool = False,
         scope_all: bool = False,
-        routes: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        routes: Optional[Dict[str, str]] = None,
+        tech_stacks: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Run the full data-quality pipeline and write the outputs.
 
     By default the report covers only the latest query (per `last_run.json`).
@@ -451,6 +454,11 @@ def run(path: str = RAW_STORE, dry_run: bool = False,
     `routes` optionally maps a business's registered domain -> a JSON string of
     its Step 3 high-intent pages; when given, that value is written into the
     `high_intent_pages` column.
+
+    `tech_stacks` optionally maps a business's registered domain -> a JSON
+    string of its Tech Stack Detection result (see tech_stack.py); only
+    populated when the query's intent required tech-stack analysis. Written
+    into the `tech_stack` column.
     """
     raw = load_raw(path)
     if not raw:
@@ -473,8 +481,10 @@ def run(path: str = RAW_STORE, dry_run: bool = False,
     businesses = to_business_level(deduped)
     # Attach Step 3 high-intent pages (JSON list of routes) per business by domain.
     routes = routes or {}
+    tech_stacks = tech_stacks or {}
     for b in businesses:
         b["high_intent_pages"] = routes.get(b["domain"], "")
+        b["tech_stack"] = tech_stacks.get(b["domain"], "")
     stats = explore(businesses)
     valid, invalid = govern(businesses)
 

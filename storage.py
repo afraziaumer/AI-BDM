@@ -11,8 +11,10 @@ changes.
 Local layout:
     storage/
         <domain>/
-            <page>.txt        cleaned, LLM-ready page text (one file per page)
-            links.json        per-page extracted internal links (for Step 3)
+            <page>.txt           cleaned, LLM-ready page text (one file per page)
+            links.json           per-page extracted internal links (for Step 3)
+            tech_stack.json      normalized tech capabilities (see tech_stack.py)
+            website_profile.json full tech-intelligence profile (see tech_stack.py)
     crawl_index.csv           per-page metadata index (NO page text, NO raw HTML)
 
 Staging & commit
@@ -97,6 +99,14 @@ class PageStore(ABC):
     def buffer_links(self, domain: str, page_url: str, links: List[Dict[str, str]]) -> None:
         """Buffer one page's extracted internal links (written on commit)."""
 
+    @abstractmethod
+    def stage_tech_profile(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        """Stage tech_stack.json (capabilities) + website_profile.json (full)
+        alongside this domain's staged pages. Promoted/discarded together with
+        them by commit_domain/discard_domain — no separate lifecycle needed."""
+
     # --- lifecycle ---------------------------------------------------------
     @abstractmethod
     def commit_domain(self, domain: str) -> None:
@@ -122,6 +132,18 @@ class PageStore(ABC):
     @abstractmethod
     def read_links(self, domain: str) -> Dict[str, List[Dict[str, str]]]:
         """Return committed {page_url: [links]} for a domain (for Step 3)."""
+
+    @abstractmethod
+    def read_tech_profile(self, domain: str) -> Optional[Dict]:
+        """Return the committed website_profile.json for a domain, or None."""
+
+    @abstractmethod
+    def write_tech_profile_now(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        """Write a tech profile straight to FINAL storage for an already-
+        committed domain (query-time backfill scan — not part of an in-
+        progress crawl, so there is no staging/commit decision to make)."""
 
 
 class LocalPageStore(PageStore):
@@ -172,6 +194,13 @@ class LocalPageStore(PageStore):
     def buffer_links(self, domain: str, page_url: str, links: List[Dict[str, str]]) -> None:
         with self._lock:
             self._link_buffers.setdefault(domain, {})[page_url] = links
+
+    def stage_tech_profile(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        self._write_tech_profile_files(d, capabilities, full_profile)
 
     # -- lifecycle --
     def commit_domain(self, domain: str) -> None:
@@ -241,6 +270,35 @@ class LocalPageStore(PageStore):
             return json.loads(f.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
+
+    def read_tech_profile(self, domain: str) -> Optional[Dict]:
+        f = self._final_dir(domain) / "website_profile.json"
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def write_tech_profile_now(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        d = self._final_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        self._write_tech_profile_files(d, capabilities, full_profile)
+
+    @staticmethod
+    def _write_tech_profile_files(
+        directory: Path, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        (directory / "tech_stack.json").write_text(
+            json.dumps(capabilities, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        (directory / "website_profile.json").write_text(
+            json.dumps(full_profile, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
 
 
 # --- Singleton accessor: the ONE place to swap the backend for R2 later. -----
