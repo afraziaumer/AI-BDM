@@ -66,7 +66,12 @@ to pull candidate business websites. Write it the way a human would type it into
 Google to find many such businesses: usually "<category> in <place>" \
 (e.g. "marinas in Dubai"). Keep it broad enough to return lots of real \
 businesses — do NOT bake the exclusion words into it (we filter those later), \
-and do NOT add quotes or operators.
+and do NOT add quotes or operators. If the city name could plausibly exist in \
+more than one country/region (e.g. "Venice" is both Italy and Florida, \
+"Cambridge" is both UK and Massachusetts, "Portland" is both Oregon and \
+Maine), include the disambiguating region/country in `search_query` too \
+(e.g. "salons in Venice, Italy", not just "salons in Venice") — do not rely \
+on geo_location/country_code alone to carry that disambiguation.
   2. SCALE: `result_limit` tells the pipeline how many businesses to pull. Read it \
 from the request ("give me 50 marinas..." -> 50). If the user gives no number, \
 use 20.

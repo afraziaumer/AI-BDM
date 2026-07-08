@@ -596,6 +596,8 @@ async def discover_places(
     query: str,
     limit: int,
     exclude_domains: Optional[Set[str]] = None,
+    country_code: str = "",
+    location: str = "",
 ) -> List[Dict[str, Any]]:
     """Google Maps (Serper Places) discovery — real individual businesses.
 
@@ -604,6 +606,13 @@ async def discover_places(
     endpoint returns actual business listings (name, address, website), which is
     the right source when the user wants "N businesses in a location". Only
     listings that expose a website are returned, since we need a site to scrape.
+
+    `country_code`/`location` are forwarded to Serper's `gl`/`location` params so
+    results are actually geo-anchored — otherwise Google/Serper falls back to
+    whatever region the query text alone implies (usually the server's own
+    country), which silently returns the wrong place for any city name that
+    exists in multiple countries (e.g. "Venice" -> Venice, FL instead of
+    Venice, Italy, even when the plan correctly resolved country_code="IT").
     """
     if not SERPER_API_KEY:
         logger.error("Serper key missing (set `serper` or `SERPER_API_KEY` in .env).")
@@ -616,7 +625,11 @@ async def discover_places(
     for page in range(1, MAX_PLACES_PAGES + 1):
         if len(targets) >= limit:
             break
-        payload = {"q": query, "page": page}
+        payload: Dict[str, Any] = {"q": query, "page": page}
+        if country_code:
+            payload["gl"] = country_code.lower()
+        if location:
+            payload["location"] = location
         try:
             async with session.post(
                 SERPER_PLACES_URL, json=payload, headers=headers,
@@ -672,6 +685,8 @@ async def discover_targets(
     start_page: int = 1,
     per_page: int = SEARCH_RESULTS_PER_PAGE,
     max_pages: int = MAX_SEARCH_PAGES,
+    country_code: str = "",
+    location: str = "",
 ) -> tuple[List[Dict[str, Any]], int]:
     """Paginated Serper web search starting at `start_page`.
 
@@ -679,6 +694,12 @@ async def discover_targets(
     so the next run resumes from `last_page_fetched + 1` instead of page 1,
     progressively working deeper into Google results across repeated queries.
     `exclude_domains` seeds the dedup set so already-stored businesses are skipped.
+
+    `country_code`/`location` are forwarded to Serper's `gl`/`location` params —
+    without them, Google/Serper geo-anchors purely from server IP + query text,
+    which silently returns the wrong place for any city name that exists in
+    multiple countries (e.g. "salons in Venice" -> Venice, FL, not Venice,
+    Italy, even though the plan's own country_code correctly says "IT").
     """
     if not SERPER_API_KEY:
         logger.error("Serper key missing (set `serper` or `SERPER_API_KEY` in .env).")
@@ -701,7 +722,11 @@ async def discover_targets(
     while len(targets) < limit and page <= start_page + max_pages - 1:
         # "num" is the per-page count (Serper allows up to 100), so each page
         # returns up to `per_page` businesses; we sweep `max_pages` pages.
-        payload = {"q": query, "num": max(1, min(per_page, 100)), "page": page}
+        payload: Dict[str, Any] = {"q": query, "num": max(1, min(per_page, 100)), "page": page}
+        if country_code:
+            payload["gl"] = country_code.lower()
+        if location:
+            payload["location"] = location
         try:
             async with session.post(
                 SERPER_SEARCH_URL, json=payload, headers=headers,
@@ -2266,7 +2291,9 @@ async def run_pipeline(
                     targets = [{"title": target_domain,
                                 "website": f"https://{target_domain}/", "snippet": ""}]
                 else:
-                    targets, _ = await discover_targets(session, query, 1)
+                    targets, _ = await discover_targets(
+                        session, query, 1, country_code=country_code, location=geo,
+                    )
                 summary["discovered"] = len(targets)
                 for target in targets:
                     r = await process_single_lead(
@@ -2323,6 +2350,7 @@ async def run_pipeline(
                 place_targets = await discover_places(
                     session, query, limit=effective_limit * 2,
                     exclude_domains=exclude_set,
+                    country_code=country_code, location=geo,
                 )
                 total_discovered += len(place_targets)
                 for t in place_targets:
@@ -2355,6 +2383,7 @@ async def run_pipeline(
                         start_page=current_page,
                         per_page=effective_limit,
                         max_pages=MAX_SEARCH_PAGES,
+                        country_code=country_code, location=geo,
                     )
                     total_discovered += len(batch_targets)
                     current_page = last_page + 1
