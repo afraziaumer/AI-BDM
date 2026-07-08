@@ -68,6 +68,24 @@ try:
 except ImportError:
     tech_stack = None  # type: ignore[assignment]
 
+# LLM Crawl Planner is likewise OPTIONAL: crawl_site falls back to queuing every
+# homepage link (its pre-existing behavior) if this module or the LLM it uses
+# is unavailable — a missing/failing planner can only mean less credit
+# savings, never less recall.
+try:
+    import crawl_planner
+except ImportError:
+    crawl_planner = None  # type: ignore[assignment]
+
+# Website Classifier is likewise OPTIONAL: crawl_site falls back to treating
+# every site as an official business (its pre-existing behavior) if this
+# module or the LLM it uses is unavailable — a missing/failing classifier can
+# only mean wasted credits on an undetected directory, never a dropped lead.
+try:
+    import website_classifier
+except ImportError:
+    website_classifier = None  # type: ignore[assignment]
+
 # --- Logging ---------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -417,6 +435,11 @@ def _is_internal_crawl_noise(host: str, path: str) -> bool:
         "/wp-admin", "/wp-login", "/wp-json", "/cdn-cgi", "/cart", "/wishlist",
         "/privacy", "/terms", "/cookies", "/cookie-policy", "/sitemap",
         "/robots.txt", "/feed", "/rss", "/tag/", "/author/", "/search",
+        # pure auth-ACTION endpoints — no content, no business/portal signal
+        # beyond what /login itself already gives (kept crawlable: see
+        # crawl_planner.py, which scores /login and /register as candidates —
+        # a CRM/portal-detection query may specifically want them crawled).
+        "/logout", "/log-out", "/forgot-password", "/reset-password",
         # blog / news / article sections — not contact-bearing, big noise + slow
         "/blog", "/blogs", "/news", "/article", "/articles", "/press",
         "/category", "/categories", "/page/",
@@ -1041,6 +1064,8 @@ async def crawl_site(
     phone_regex: str = "",
     exclude_keywords: Optional[List[str]] = None,
     include_keywords: Optional[List[str]] = None,
+    user_query: str = "",
+    industry: str = "",
 ) -> Dict[str, Any]:
     """STREAMING contact-first crawl of one business site.
 
@@ -1191,14 +1216,93 @@ async def crawl_site(
         except Exception as exc:  # noqa: BLE001 - detection is best-effort
             logger.warning("Tech-stack detection failed for %s: %s", domain, exc)
 
+    # Website Classification: is this homepage an individual business's own
+    # site, or a directory/aggregator/marketplace/travel-guide/review/listing
+    # site that merely LISTS many businesses? Runs on the SAME raw HTML above,
+    # still in memory, using the tech-stack signals just collected. Must run
+    # BEFORE the crawl planner — a directory is never deep-crawled at all, so
+    # planning a deep crawl for one would be pure waste. Fails OPEN to
+    # deep_crawl on any error/unavailability (module missing, LLM down, bad
+    # response) — exactly the pre-existing behavior — so a classifier outage
+    # can only ever waste credits on an undetected directory, never drop a
+    # real business.
+    classification = None
+    if website_classifier is not None:
+        try:
+            classification = await asyncio.to_thread(
+                website_classifier.classify_homepage,
+                domain, root_url, root_html, tech_raw, user_query,
+            )
+        except Exception as exc:  # noqa: BLE001 - classification is best-effort
+            logger.warning("Website classification failed for %s: %s", domain, exc)
+
+    if classification is not None and not classification.deep_crawl:
+        # Directory/aggregator/informational site: never deep-crawled, never
+        # stored as a business. Mine its homepage for real business links
+        # instead and hand them back so the caller can queue each as its OWN
+        # crawl job (own storage, own crawl planner, own tech profile).
+        discovered_businesses = await asyncio.to_thread(
+            website_classifier.mine_homepage_businesses,
+            root_html, root_url, domain, classification,
+        )
+        logger.info(
+            "[Classifier] %s classified as %s (confidence=%d%%, action=%s) — "
+            "extracting businesses instead of deep-crawling. %d business(es) found.",
+            domain, classification.category, classification.confidence,
+            classification.action, len(discovered_businesses),
+        )
+        del root_html
+        return {
+            "domain": domain,
+            "pages_kept": pages_kept,
+            "attempts": 0,
+            "emails": emails,
+            "phones": phones,
+            "address": address,
+            "matched_exclude": sorted(matched_exclude),
+            "matched_include": sorted(matched_include),
+            "sample_text": " ".join(sample_parts),
+            "is_directory": True,
+            "classification": {
+                "category": classification.category,
+                "confidence": classification.confidence,
+                "action": classification.action,
+                "method": classification.method,
+                "reasoning": classification.reasoning,
+            },
+            "discovered_businesses": discovered_businesses,
+        }
+
+    # LLM Crawl Planner: decide which of the homepage's own links are worth
+    # fetching for THIS query, within a small budget — instead of queuing every
+    # link (the old behavior, which is exactly what wasted Scrape.do credits on
+    # hundreds of blog/product pages). Runs on the SAME raw HTML above, still in
+    # memory. Falls back to the full, unfiltered link set on ANY failure
+    # (module missing, LLM down, bad response) so a planner outage can only
+    # ever mean less credit savings for this site, never less recall.
+    planned_urls = home_link_urls
+    if crawl_planner is not None:
+        try:
+            planned = await asyncio.to_thread(
+                crawl_planner.plan_site_crawl,
+                domain, root_url, root_html, user_query, industry,
+                exclude_keywords, include_keywords,
+            )
+            if planned:
+                planned_urls = planned
+        except Exception as exc:  # noqa: BLE001 - planning is best-effort
+            logger.warning("Crawl planning failed for %s, falling back to full "
+                           "link set: %s", domain, exc)
+
     del root_html  # the raw homepage HTML is not needed past this point
 
     visited: Set[str] = {_normalize_page_url(root_url)}
-    # High-value contact pages first (sitemap/robots/probe), then homepage links.
+    # High-value contact pages first (sitemap/robots/probe), then the crawl
+    # planner's selected homepage links (or all of them, if planning fell back).
     priority_urls = await _discover_contact_urls(session, root_url, domain)
     queue: List[tuple[str, int]] = (
         [(u, 1) for u in priority_urls]
-        + [(u, 1) for u in sorted(home_link_urls, key=_contact_priority)]
+        + [(u, 1) for u in sorted(planned_urls, key=_contact_priority)]
     )
 
     head = 0
@@ -1908,6 +2012,7 @@ async def process_single_lead(
     geo: str = "",
     country_code: str = "",
     phone_regex: str = "",
+    user_query: str = "",
 ) -> Dict[str, Any]:
     """Cache-check, STREAM-crawl the whole site (one page at a time, each page
     staged to storage the moment it's cleaned), then qualify the business from
@@ -1972,11 +2077,29 @@ async def process_single_lead(
                 country_code=country_code, phone_regex=phone_regex,
                 exclude_keywords=exclude_keywords,
                 include_keywords=include_keywords,
+                user_query=user_query, industry=industry,
             )
     except Exception:
         # A crawl abandoned mid-flight must not leave staged files behind.
         store.discard_domain(domain)
         raise
+
+    if crawl.get("is_directory"):
+        # Directory/aggregator/informational site: never a business in its
+        # own right, so its staged homepage is always discarded — never
+        # committed, regardless of qualify_lead. Its discovered_businesses
+        # are surfaced so the caller (run_pipeline) can queue each of them as
+        # its OWN crawl job.
+        store.discard_domain(domain)
+        logger.info(
+            "Not stored: %s — classified as %s, %d business(es) queued "
+            "for their own crawl.",
+            name, crawl["classification"]["category"],
+            len(crawl.get("discovered_businesses", [])),
+        )
+        return {"company_name": name, "website_url": url, "status": "directory",
+                "method": root_method, "classification": crawl["classification"],
+                "discovered_businesses": crawl.get("discovered_businesses", [])}
 
     if not crawl["pages_kept"]:
         logger.warning("No readable content on any page of %s", url)
@@ -2051,6 +2174,13 @@ async def run_pipeline(
         asyncio.get_running_loop().set_exception_handler(_quiet_dns_exception_handler)
     except RuntimeError:  # pragma: no cover - not inside a loop (shouldn't happen)
         pass
+
+    orphaned = get_store().cleanup_orphaned_staging()
+    if orphaned:
+        logger.info(
+            "Cleaned up %d orphaned staging director(ies) left by a previous "
+            "unclean shutdown: %s", len(orphaned), orphaned,
+        )
 
     cache = load_cache()
     logger.info("Loaded %d previously-analyzed leads from the crawl index.", len(cache))
@@ -2139,11 +2269,30 @@ async def run_pipeline(
                     targets, _ = await discover_targets(session, query, 1)
                 summary["discovered"] = len(targets)
                 for target in targets:
-                    results.append(await process_single_lead(
+                    r = await process_single_lead(
                         session, semaphore, target, cache, exclude_keywords,
                         include_keywords, industry, geo,
                         country_code=country_code, phone_regex=phone_regex,
-                    ))
+                        user_query=user_query,
+                    )
+                    results.append(r)
+                    if r.get("status") == "directory":
+                        # The requested "site" turned out to be a directory,
+                        # not a business — process the real businesses it
+                        # pointed to instead of returning nothing.
+                        discovered = r.get("discovered_businesses", [])
+                        logger.info(
+                            "%s classified as %s — processing its %d discovered "
+                            "business(es) directly.", r.get("website_url"),
+                            r["classification"]["category"], len(discovered),
+                        )
+                        for biz in discovered[:effective_limit]:
+                            results.append(await process_single_lead(
+                                session, semaphore, biz, cache, exclude_keywords,
+                                include_keywords, industry, geo,
+                                country_code=country_code, phone_regex=phone_regex,
+                                user_query=user_query,
+                            ))
         else:
             # GENERAL: keep discovering — deeper Serper pages, plus mining any
             # discovery sources (directories/associations/etc.) encountered —
@@ -2239,10 +2388,37 @@ async def run_pipeline(
                         session, semaphore, b.as_target(), cache, exclude_keywords,
                         include_keywords, industry, geo,
                         country_code=country_code, phone_regex=phone_regex,
+                        user_query=user_query,
                     )
                     for b in batch
                 ])
                 results.extend(batch_results)
+
+                # A "directory" result mined real business links from its
+                # homepage instead of being deep-crawled itself — queue each
+                # one as its OWN crawl job (own storage, own crawl planner),
+                # exactly like any other discovered business. Picked up
+                # automatically next round by the same pending()/attempted set.
+                mined_count = 0
+                for r in batch_results:
+                    if r.get("status") != "directory":
+                        continue
+                    for biz in r.get("discovered_businesses", []):
+                        if queue.add(dc.QueuedBusiness(
+                            website=biz["website"], title=biz.get("title", ""),
+                            snippet=biz.get("snippet", ""),
+                            discovered_from=list(biz.get("discovered_from") or []),
+                            confidence=dc.Confidence(
+                                biz.get("source_confidence", dc.Confidence.MEDIUM.value)
+                            ),
+                        )):
+                            mined_count += 1
+                if mined_count:
+                    logger.info(
+                        "Round %d: mined %d new business(es) from directory site(s) "
+                        "encountered this round.", round_num, mined_count,
+                    )
+
                 logger.info(
                     "Round %d: attempted %d business(es) -> %d/%d qualified leads "
                     "so far (queue: %d total, %d unattempted).",
@@ -2390,6 +2566,20 @@ async def _run_tech_stack_batch(ts_module, domains: Set[str]) -> Dict[str, Any]:
     return dict(zip(domains, profiles))
 
 
+async def _run_route_planner_batch(rp_module, domains: Set[str]) -> Dict[str, Any]:
+    """Run route_planner.plan_routes() for each domain concurrently.
+
+    plan_routes() reads the committed crawl index + a few cleaned .txt previews
+    and makes one Groq call per site, all synchronous — so each is offloaded
+    via asyncio.to_thread so N sites plan in parallel rather than serially.
+    """
+    domains = list(domains)
+    plans = await asyncio.gather(
+        *[asyncio.to_thread(rp_module.plan_routes, d) for d in domains]
+    )
+    return dict(zip(domains, plans))
+
+
 def main() -> None:
     # Windows consoles default to cp1252 and crash on Unicode (e.g. a non-break
     # hyphen) when printing the summary. Force UTF-8 output where supported.
@@ -2416,6 +2606,10 @@ def main() -> None:
     parser.add_argument(
         "--no-linkedin", action="store_true",
         help="Skip finding each business's LinkedIn page after cleaning.",
+    )
+    parser.add_argument(
+        "--no-route-planner", action="store_true",
+        help="Skip the LLM Route Planner (high_intent_pages) after scraping.",
     )
     args = parser.parse_args()
 
@@ -2463,13 +2657,37 @@ def main() -> None:
                 print(f"    [{s['confidence']:.2f}] {s['signal']} "
                       f"-> {', '.join(s['recommended_services'])}")
 
+    # Stage 1.6 — LLM Route Planner: pick each qualified business's most
+    # valuable pages (high_intent_pages) from the cleaned .txt files Phase 1
+    # already produced. Consumes stored data only (no crawl); the LLM decides
+    # from lightweight page previews, never full text. Independent of intent —
+    # always useful, unlike tech-stack which is gated.
+    routes: Dict[str, str] = {}
+    if not args.no_route_planner:
+        import json as _json
+        import route_planner as rp
+        rp_domains = {
+            _domain_key(q["website_url"]) for q in summary.get("qualified", [])
+            if q.get("website_url")
+        }
+        print("\n" + "#" * 64)
+        print(f"STEP 5 — LLM ROUTE PLANNER  ({len(rp_domains)} business(es))")
+        print("#" * 64)
+        plans = asyncio.run(_run_route_planner_batch(rp, rp_domains))
+        for domain, plan_result in plans.items():
+            pages = plan_result.get("selected_pages", [])
+            routes[domain] = _json.dumps(pages, ensure_ascii=False, default=str)
+            print(f"\n■ {domain}  (confidence: {plan_result.get('confidence', '?')})")
+            for p in pages:
+                print(f"    [{p['priority']}] {p['filename']} — {p['reason']}")
+
     # Stage 2 — clean + format: derive the governed dataset in the same command.
     # Imported lazily so data_pipeline (which imports this module) stays decoupled.
     if not args.no_clean:
         import os
         import data_pipeline
         print("\n[clean] Running data-quality pipeline...")
-        data_pipeline.run(tech_stacks=tech_stacks)
+        data_pipeline.run(tech_stacks=tech_stacks, routes=routes)
 
         # Stage 3 — enrich: add each business's LinkedIn page to the same sheet.
         if not args.no_linkedin and os.path.exists(data_pipeline.CLEAN_EXPORT):

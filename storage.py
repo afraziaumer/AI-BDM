@@ -15,6 +15,7 @@ Local layout:
             links.json           per-page extracted internal links (for Step 3)
             tech_stack.json      normalized tech capabilities (see tech_stack.py)
             website_profile.json full tech-intelligence profile (see tech_stack.py)
+            crawl_plan.json      cached LLM crawl plan (see crawl_planner.py)
     crawl_index.csv           per-page metadata index (NO page text, NO raw HTML)
 
 Staging & commit
@@ -107,6 +108,11 @@ class PageStore(ABC):
         alongside this domain's staged pages. Promoted/discarded together with
         them by commit_domain/discard_domain — no separate lifecycle needed."""
 
+    @abstractmethod
+    def stage_crawl_plan(self, domain: str, plan: Dict) -> None:
+        """Stage crawl_plan.json (see crawl_planner.py) alongside this domain's
+        staged pages. Promoted/discarded together with them."""
+
     # --- lifecycle ---------------------------------------------------------
     @abstractmethod
     def commit_domain(self, domain: str) -> None:
@@ -115,6 +121,18 @@ class PageStore(ABC):
     @abstractmethod
     def discard_domain(self, domain: str) -> None:
         """Delete staged pages and buffered metadata for a rejected business."""
+
+    @abstractmethod
+    def cleanup_orphaned_staging(self) -> List[str]:
+        """Delete any staged domain left over from a previous unclean shutdown
+        (killed process, crash outside the commit/discard try-block, etc.).
+
+        A domain's staging directory only ever outlives its own crawl if the
+        process died before reaching commit_domain/discard_domain — a normal
+        run always calls one or the other for every domain it touches. Call
+        this once, before a new run starts crawling anything. Returns the
+        domain names that were cleaned up.
+        """
 
     # --- reads (cache, rollup, Step 3) -------------------------------------
     @abstractmethod
@@ -144,6 +162,11 @@ class PageStore(ABC):
         """Write a tech profile straight to FINAL storage for an already-
         committed domain (query-time backfill scan — not part of an in-
         progress crawl, so there is no staging/commit decision to make)."""
+
+    @abstractmethod
+    def read_crawl_plan(self, domain: str) -> Optional[Dict]:
+        """Return the committed crawl_plan.json for a domain, or None if this
+        domain was never planned (or its committed run predates this feature)."""
 
 
 class LocalPageStore(PageStore):
@@ -202,6 +225,14 @@ class LocalPageStore(PageStore):
         d.mkdir(parents=True, exist_ok=True)
         self._write_tech_profile_files(d, capabilities, full_profile)
 
+    def stage_crawl_plan(self, domain: str, plan: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "crawl_plan.json").write_text(
+            json.dumps(plan, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
     # -- lifecycle --
     def commit_domain(self, domain: str) -> None:
         staged = self._staging_dir(domain)
@@ -231,6 +262,19 @@ class LocalPageStore(PageStore):
             self._index_buffers.pop(domain, None)
             self._link_buffers.pop(domain, None)
             self._staged_names.pop(domain, None)
+
+    def cleanup_orphaned_staging(self) -> List[str]:
+        if not self.staging_root.exists():
+            return []
+        orphaned = [d.name for d in self.staging_root.iterdir() if d.is_dir()]
+        for name in orphaned:
+            shutil.rmtree(self.staging_root / name, ignore_errors=True)
+        with self._lock:
+            for name in orphaned:
+                self._index_buffers.pop(name, None)
+                self._link_buffers.pop(name, None)
+                self._staged_names.pop(name, None)
+        return orphaned
 
     # -- index i/o --
     def _append_index(self, rows: List[Dict[str, str]]) -> None:
@@ -286,6 +330,15 @@ class LocalPageStore(PageStore):
         d = self._final_dir(domain)
         d.mkdir(parents=True, exist_ok=True)
         self._write_tech_profile_files(d, capabilities, full_profile)
+
+    def read_crawl_plan(self, domain: str) -> Optional[Dict]:
+        f = self._final_dir(domain) / "crawl_plan.json"
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
 
     @staticmethod
     def _write_tech_profile_files(

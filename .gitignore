@@ -24,6 +24,7 @@ crawl_index.csv
 scavenger_leads_cache.csv
 search_state.json
 last_run.json
+site_classifications.json
 leads_clean.csv
 leads_quarantine.csv
 leads_with_linkedin.csv

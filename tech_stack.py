@@ -68,6 +68,11 @@ import requests
 logger = logging.getLogger("ai_bdm.tech_stack")
 
 TECH_PROFILE_SCHEMA_VERSION = "1.0"
+TECH_PROFILE_TTL_DAYS = 60  # a stored profile older than this is refreshed on
+                            # next query-time read (see get_stored_profile) —
+                            # without this, a profile written once was NEVER
+                            # re-checked, so a business switching CRM/hosting
+                            # long after being crawled would go undetected forever
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -425,13 +430,31 @@ def build_website_profile(
 # ===========================================================================
 # Public entry point — storage-first, scan only as a last resort
 # ===========================================================================
+def _profile_age_days(profile: Dict[str, Any]) -> Optional[float]:
+    last_scanned = profile.get("last_scanned")
+    if not last_scanned:
+        return None
+    try:
+        scanned_at = datetime.fromisoformat(last_scanned)
+    except ValueError:
+        return None
+    if scanned_at.tzinfo is None:
+        scanned_at = scanned_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - scanned_at).total_seconds() / 86400
+
+
 def get_stored_profile(domain: str, allow_fallback_scan: bool = True) -> Dict[str, Any]:
     """The single query-time read path. ALWAYS checks storage first (per
-    requirement: never re-scan when a stored profile already exists).
+    requirement: never re-scan when a stored profile already exists AND it's
+    still fresh — see TECH_PROFILE_TTL_DAYS).
 
-    Falls back to one independent, single-request scan ONLY when this domain
-    was never profiled during its own Phase-1 crawl (e.g. crawled before this
-    feature existed) — and persists the result so future calls hit storage.
+    Falls back to one independent, single-request scan when either:
+      - this domain was never profiled during its own Phase-1 crawl (e.g.
+        crawled before this feature existed), or
+      - a profile exists but is older than TECH_PROFILE_TTL_DAYS (a business
+        can change CRM/hosting/analytics long after being crawled; without
+        this, a profile written once was never re-checked, ever).
+    Either way the refreshed result is persisted so future calls hit storage.
     """
     try:
         from storage import get_store
@@ -441,19 +464,29 @@ def get_stored_profile(domain: str, allow_fallback_scan: bool = True) -> Dict[st
         _domain_key = lambda d: d.strip().lower().removeprefix("www.")  # noqa: E731
 
     domain_key = _domain_key(domain)
-    if get_store is not None:
-        stored = get_store().read_tech_profile(domain_key)
-        if stored is not None:
+    stored = get_store().read_tech_profile(domain_key) if get_store is not None else None
+    if stored is not None:
+        age_days = _profile_age_days(stored)
+        if age_days is None or age_days <= TECH_PROFILE_TTL_DAYS:
             logger.info("Tech-stack profile HIT in storage for %s.", domain_key)
             stored.setdefault("sales_signals", generate_sales_signals_from_profile(stored))
             return stored
+        logger.info(
+            "Tech-stack profile for %s is %.0f day(s) old (> %d) — refreshing.",
+            domain_key, age_days, TECH_PROFILE_TTL_DAYS,
+        )
 
     if not allow_fallback_scan:
-        return {"error": "not_profiled", "domain": domain_key}
+        return stored if stored is not None else {"error": "not_profiled", "domain": domain_key}
 
-    logger.info("No stored tech profile for %s — running one-off fallback scan.", domain_key)
+    logger.info("Running one-off fallback scan for %s (missing or stale profile).", domain_key)
     raw = _fetch_and_analyze(domain_key)
     if not raw:
+        # Refresh failed (site down/blocking) — serve the stale profile rather
+        # than nothing; a stale-but-present profile beats an empty one.
+        if stored is not None:
+            stored.setdefault("sales_signals", generate_sales_signals_from_profile(stored))
+            return stored
         return {"error": "fetch_failed", "domain": domain_key,
                 "capabilities": {}, "sales_signals": []}
 

@@ -13,12 +13,19 @@ Pipeline:
         -> load_page_metadata      (Stage 0: read metadata, no file I/O beyond the index)
         -> build_link_graph        (Stage 0: which pages link to which, in what anchor text)
         -> rule_based_prefilter    (Stage 1: instant discard/boost, NO LLM — cheap)
-        -> maybe_fetch_snippets    (Stage 2: read a SMALL number of .txt files, only if
-                                    metadata alone left too few confident candidates)
-        -> build_prompt            (Stage 3: compact JSON per candidate)
+        -> build_page_previews     (Stage 2: a lightweight PREVIEW per shortlisted page —
+                                    filename, url, title, word_count, headings, first/last
+                                    2 non-empty lines. NEVER the full page text.)
+        -> build_prompt            (Stage 3: compact JSON per candidate, keyed by filename)
         -> call_planner_llm        (Stage 3: reuses LLM_planner.get_client/call_llm)
         -> parse_planner_response  (Stage 4: validate, clamp to MIN..MAX_SELECTED pages)
     -> {"selected_pages": [...], "confidence": "high|medium|low"}
+
+The LLM only ever sees previews — filenames, URLs, titles, headings, and a
+handful of lines from the top/bottom of each page. It never sees full page
+text. Full text is something a LATER stage would read, and only for the
+filenames this planner actually selected — reading every page up front is
+exactly what this design avoids.
 
 Explicitly OUT OF SCOPE (belongs to later stages, not here):
     - embeddings / cosine similarity
@@ -37,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -52,9 +60,11 @@ logger = logging.getLogger("ai_bdm.route_planner")
 MIN_SELECTED_PAGES = 3
 MAX_SELECTED_PAGES = 8
 MAX_LLM_CANDIDATES = 20     # only the top-N ranked pages are ever shown to the model
-MAX_SNIPPET_READS = 5       # hard cap on .txt files opened when metadata is ambiguous
-SNIPPET_CHARS = 400         # per-file peek size — enough context, not a page dump
-MIN_CONFIDENT_CANDIDATES = MIN_SELECTED_PAGES  # below this, read snippets for help
+                            # (also the cap on .txt files opened for previews — one
+                            # read per shortlisted candidate, never every page on site)
+PREVIEW_HEAD_LINES = 2      # first N non-empty, non-heading lines
+PREVIEW_TAIL_LINES = 2      # last N non-empty, non-heading lines
+PREVIEW_MAX_HEADINGS = 12   # cap so a heading-heavy page doesn't bloat the prompt
 
 PLANNER_MODEL = "openai/gpt-oss-20b"  # documented; call_llm handles primary/fallback
 
@@ -128,18 +138,33 @@ class LinkGraph:
 
 
 @dataclass
+class PagePreview:
+    """A lightweight preview of one page — the ONLY content signal the LLM sees.
+
+    Built from a single read of the .txt file: never the full page text, just
+    its filename, the structural headings, and the first/last couple of lines.
+    """
+    headings: List[str] = field(default_factory=list)
+    head_preview: List[str] = field(default_factory=list)
+    tail_preview: List[str] = field(default_factory=list)
+
+
+@dataclass
 class ScoredCandidate:
     """A page carried into ranking/LLM shortlisting, with its rule-based signals."""
     meta: PageMeta
     tier: str                 # "high" | "medium" | "low" | "unknown"
     score: float
     nav_linked: bool
+    filename: str             # basename of txt_path, e.g. "about.txt" — the LLM's key
     anchors: List[str] = field(default_factory=list)
-    snippet: str = ""          # optional short content peek (Stage 2)
+    preview: Optional[PagePreview] = None   # attached in Stage 2 (build_page_previews)
 
     def as_context(self) -> Dict[str, Any]:
-        """Compact JSON sent to the LLM — metadata + signals, never full text."""
+        """Compact preview JSON sent to the LLM — filename + metadata + a few
+        preview lines, NEVER the full page text."""
         ctx: Dict[str, Any] = {
+            "filename": self.filename,
             "url": self.meta.page_url,
             "title": self.meta.page_title,
             "tier": self.tier,
@@ -152,8 +177,13 @@ class ScoredCandidate:
             ctx["anchor_text"] = self.anchors[:3]
         if self.meta.word_count:
             ctx["word_count"] = self.meta.word_count
-        if self.snippet:
-            ctx["content_preview"] = self.snippet
+        if self.preview:
+            if self.preview.headings:
+                ctx["headings"] = self.preview.headings
+            if self.preview.head_preview:
+                ctx["head_preview"] = self.preview.head_preview
+            if self.preview.tail_preview:
+                ctx["tail_preview"] = self.preview.tail_preview
         return ctx
 
 
@@ -282,8 +312,10 @@ def rule_based_prefilter(
         tier, ignored = _match_tier(meta.page_url, meta.page_title, meta.page_type)
         nav_linked = meta.page_url in graph.homepage_linked
         anchors = graph.anchors_for.get(meta.page_url, [])
+        filename = os.path.basename(meta.txt_path) or (_domain_key(meta.page_url) + ".txt")
         candidate = ScoredCandidate(meta=meta, tier=tier, score=0.0,
-                                    nav_linked=nav_linked, anchors=anchors)
+                                    nav_linked=nav_linked, filename=filename,
+                                    anchors=anchors)
         if ignored:
             discarded.append(candidate)
             continue
@@ -301,27 +333,49 @@ def rule_based_prefilter(
 
 
 # ===========================================================================
-# Stage 2 — optional, bounded content peek
+# Stage 2 — lightweight per-page previews (one small read per shortlisted page)
 # ===========================================================================
-def maybe_fetch_snippets(candidates: Sequence[ScoredCandidate]) -> None:
-    """Read a SMALL number of .txt files only if metadata left too few confident
-    picks (fewer than MIN_CONFIDENT_CANDIDATES clear high/medium tier hits).
+def _preview_from_text(text: str) -> PagePreview:
+    """Build a PagePreview from one page's cleaned text WITHOUT keeping it.
 
-    Mutates candidates in place. Targets the highest-scoring "unknown" tier
-    pages first — these are exactly the ones a URL/title alone couldn't place,
-    so a short content peek is the cheapest way to disambiguate them.
+    The crawler's cleaner marks headings with a leading "#", list items with
+    "- " (see phase1_pipeline.clean_page_for_llm), so headings are recoverable
+    structure. head/tail previews are the first/last few substantive lines —
+    headings and bare list bullets are skipped so they read like real sentences.
     """
-    confident = sum(1 for c in candidates if c.tier in ("high", "medium"))
-    if confident >= MIN_CONFIDENT_CANDIDATES:
-        return
+    headings: List[str] = []
+    body: List[str] = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            headings.append(line.lstrip("# ").strip())
+        else:
+            # Drop the "- " list marker for readability; keep the item text.
+            body.append(line[2:].strip() if line.startswith("- ") else line)
+    return PagePreview(
+        headings=headings[:PREVIEW_MAX_HEADINGS],
+        head_preview=body[:PREVIEW_HEAD_LINES],
+        tail_preview=body[-PREVIEW_TAIL_LINES:] if len(body) > PREVIEW_HEAD_LINES else [],
+    )
 
+
+def build_page_previews(candidates: Sequence[ScoredCandidate]) -> None:
+    """Attach a lightweight PagePreview to every shortlisted candidate.
+
+    Reads each candidate's .txt file exactly ONCE and keeps only the preview
+    (headings + first/last lines) — the full text is dropped immediately. This
+    is the core I/O-minimizing design: the LLM decides from previews alone, and
+    only the pages it SELECTS would ever be fully read by a later stage.
+    """
     store = get_store()
-    ambiguous = [c for c in candidates if c.tier == "unknown" and c.meta.txt_path]
-    ambiguous.sort(key=lambda c: c.score, reverse=True)
-    for candidate in ambiguous[:MAX_SNIPPET_READS]:
+    for candidate in candidates:
+        if not candidate.meta.txt_path:
+            continue
         text = store.read_page_text(candidate.meta.txt_path)
         if text:
-            candidate.snippet = text[:SNIPPET_CHARS]
+            candidate.preview = _preview_from_text(text)
         del text
 
 
@@ -329,9 +383,11 @@ def maybe_fetch_snippets(candidates: Sequence[ScoredCandidate]) -> None:
 # Stage 3 — prompt generation + LLM interaction
 # ===========================================================================
 _PLANNER_SYSTEM_PROMPT = (
-    "You are a WEBSITE ROUTE PLANNER. You never analyze page content in depth "
-    "— you only decide which pages of a company's website are most likely to "
-    "contain important BUSINESS information, from compact page metadata.\n\n"
+    "You are a WEBSITE ROUTE PLANNER. For each page you are given ONLY a "
+    "lightweight preview — its filename, url, title, headings, and the first "
+    "and last couple of lines. You NEVER see full page text. From these "
+    "previews alone, decide which pages should be fully loaded later because "
+    "they most likely contain important BUSINESS information.\n\n"
     "Prioritize pages describing: products, services, solutions, capabilities, "
     "industries, manufacturing, engineering, equipment, technologies, "
     "portfolio, projects, case studies, company overview/about, business "
@@ -339,29 +395,31 @@ _PLANNER_SYSTEM_PROMPT = (
     "Medium priority: leadership, certifications, sustainability, innovation, "
     "locations.\n"
     "Low priority: careers, news, blog, events, press releases, investors, FAQs.\n"
-    "Each candidate already carries a rule-based 'tier' (high/medium/low/"
-    "unknown) and whether it is linked directly from the homepage — treat "
-    "these as strong hints, not absolute rules; use the title, url, anchor "
-    "text and any content preview to make the final call.\n\n"
-    f"Return between {MIN_SELECTED_PAGES} and {MAX_SELECTED_PAGES} pages — "
+    "Each preview also carries a rule-based 'tier' (high/medium/low/unknown) "
+    "and whether the page is linked directly from the homepage — treat these "
+    "as strong hints, not absolute rules; use the filename, title, headings "
+    "and head/tail preview lines to make the final call.\n\n"
+    f"Select between {MIN_SELECTED_PAGES} and {MAX_SELECTED_PAGES} pages — "
     "never more. Respond with ONLY valid JSON of exactly this form:\n"
-    '{"selected_pages": [{"url": "<url from the list>", "priority": 1, '
-    '"reason": "short honest reason grounded in the metadata shown"}], '
+    '{"selected_pages": ["about.txt", "services.txt"], '
+    '"reasoning": ["Company overview.", "Service offerings."], '
     '"confidence": "high"}\n'
-    'confidence reflects how clearly the site\'s pages map to the priority '
-    "categories above (\"high\", \"medium\", or \"low\"). Use ONLY urls from "
-    "the candidate list."
+    "selected_pages MUST be filenames copied EXACTLY from the previews' "
+    "\"filename\" fields. reasoning is a PARALLEL list: reasoning[i] is a short "
+    "phrase explaining why selected_pages[i] was chosen. confidence "
+    "(\"high\"/\"medium\"/\"low\") reflects how clearly the site's pages map to "
+    "the priority categories above."
 )
 
 
 def build_prompt(candidates: Sequence[ScoredCandidate]) -> List[Dict[str, str]]:
-    """Compact JSON-per-candidate user message. No raw page text is ever sent
-    in bulk — only the optional short preview attached in Stage 2."""
+    """Compact preview-per-candidate user message. Only lightweight previews
+    (filenames, titles, headings, a few lines) are sent — never full text."""
     payload = json.dumps([c.as_context() for c in candidates], ensure_ascii=False)
     user_content = (
-        f"Candidate pages (JSON, {len(candidates)} total):\n{payload}\n\n"
-        "Select the pages most likely to describe what this business actually "
-        "does."
+        f"Page previews (JSON, {len(candidates)} total):\n{payload}\n\n"
+        "Return the filenames of the pages most likely to describe what this "
+        "business actually does."
     )
     return [
         {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
@@ -405,14 +463,27 @@ def _loads_forgiving(text: str) -> Optional[Any]:
 _VALID_CONFIDENCE = frozenset({"high", "medium", "low"})
 
 
-def parse_planner_response(
-    raw: Optional[str], by_url: Dict[str, ScoredCandidate]
-) -> Optional[Dict[str, Any]]:
-    """Validate + normalize the model's output. Returns None if unusable (the
-    caller then falls back to the deterministic rule-based plan).
+def _coerce_filename_reason(item: Any) -> Tuple[Optional[str], str]:
+    """Accept either a bare filename string or a {"filename"/"file", "reason"}
+    object — models occasionally return one shape instead of the other."""
+    if isinstance(item, str):
+        return item.strip(), ""
+    if isinstance(item, dict):
+        name = item.get("filename") or item.get("file") or item.get("name")
+        if isinstance(name, str):
+            return name.strip(), str(item.get("reason", ""))[:200]
+    return None, ""
 
-    Only URLs from the candidate set survive (no hallucinated routes); results
-    are clamped to MIN..MAX_SELECTED_PAGES.
+
+def parse_planner_response(
+    raw: Optional[str], by_filename: Dict[str, ScoredCandidate]
+) -> Optional[Dict[str, Any]]:
+    """Validate + normalize the model's filename-based output. Returns None if
+    unusable (the caller then falls back to the deterministic rule-based plan).
+
+    Only filenames from the candidate set survive (no hallucinated pages); the
+    parallel `reasoning` list is aligned back to its filename, and results are
+    clamped to MIN..MAX_SELECTED_PAGES.
     """
     if raw is None:
         return None
@@ -423,34 +494,40 @@ def parse_planner_response(
     items = data.get("selected_pages")
     if not isinstance(items, list):
         return None
+    reasons = data.get("reasoning")
+    reasons = reasons if isinstance(reasons, list) else []
 
     seen: Set[str] = set()
     selected: List[Dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+    for i, item in enumerate(items):
+        filename, inline_reason = _coerce_filename_reason(item)
+        if not filename or filename not in by_filename or filename in seen:
             continue
-        url = item["url"]
-        if url not in by_url or url in seen:
-            continue
-        seen.add(url)
+        seen.add(filename)
+        # Prefer an inline reason; else the parallel reasoning[i]; else derive one.
+        parallel = reasons[i] if i < len(reasons) and isinstance(reasons[i], str) else ""
+        cand = by_filename[filename]
+        reason = (inline_reason or parallel).strip()[:200] or _default_reason(cand)
         selected.append({
-            "url": url,
-            "txt_path": by_url[url].meta.txt_path,
-            "reason": str(item.get("reason", ""))[:200] or _default_reason(by_url[url]),
+            "filename": filename,
+            "url": cand.meta.page_url,
+            "txt_path": cand.meta.txt_path,
+            "reason": reason,
         })
     if len(selected) < MIN_SELECTED_PAGES:
         # Top up from the highest-scoring unused candidates so the response
         # still meets the minimum, without ever exceeding the maximum.
-        for candidate in sorted(by_url.values(), key=lambda c: c.score, reverse=True):
+        for cand in sorted(by_filename.values(), key=lambda c: c.score, reverse=True):
             if len(selected) >= MIN_SELECTED_PAGES:
                 break
-            if candidate.meta.page_url in seen:
+            if cand.filename in seen:
                 continue
-            seen.add(candidate.meta.page_url)
+            seen.add(cand.filename)
             selected.append({
-                "url": candidate.meta.page_url,
-                "txt_path": candidate.meta.txt_path,
-                "reason": _default_reason(candidate),
+                "filename": cand.filename,
+                "url": cand.meta.page_url,
+                "txt_path": cand.meta.txt_path,
+                "reason": _default_reason(cand),
             })
     if not selected:
         return None
@@ -460,7 +537,7 @@ def parse_planner_response(
 
     confidence = str(data.get("confidence", "")).strip().lower()
     if confidence not in _VALID_CONFIDENCE:
-        confidence = _infer_confidence(selected, by_url)
+        confidence = _infer_confidence(selected, by_filename)
     return {"selected_pages": selected, "confidence": confidence}
 
 
@@ -474,11 +551,11 @@ def _default_reason(candidate: ScoredCandidate) -> str:
 
 
 def _infer_confidence(
-    selected: Sequence[Dict[str, Any]], by_url: Dict[str, ScoredCandidate]
+    selected: Sequence[Dict[str, Any]], by_filename: Dict[str, ScoredCandidate]
 ) -> str:
     """Derive an overall confidence from how cleanly the selection matches the
     known priority taxonomy — never the model's own unfounded claim."""
-    tiers = [by_url[s["url"]].tier for s in selected if s["url"] in by_url]
+    tiers = [by_filename[s["filename"]].tier for s in selected if s["filename"] in by_filename]
     strong = sum(1 for t in tiers if t in ("high", "medium"))
     if not tiers:
         return "low"
@@ -495,6 +572,7 @@ def heuristic_plan(candidates: Sequence[ScoredCandidate]) -> Dict[str, Any]:
     ranked = sorted(candidates, key=lambda c: c.score, reverse=True)[:MAX_SELECTED_PAGES]
     selected = [
         {
+            "filename": c.filename,
             "url": c.meta.page_url,
             "txt_path": c.meta.txt_path,
             "priority": i,
@@ -502,8 +580,8 @@ def heuristic_plan(candidates: Sequence[ScoredCandidate]) -> Dict[str, Any]:
         }
         for i, c in enumerate(ranked, 1)
     ]
-    by_url = {c.meta.page_url: c for c in candidates}
-    confidence = _infer_confidence(selected, by_url) if selected else "low"
+    by_filename = {c.filename: c for c in candidates}
+    confidence = _infer_confidence(selected, by_filename) if selected else "low"
     return {"selected_pages": selected, "confidence": confidence}
 
 
@@ -540,14 +618,19 @@ def plan_routes(website: str) -> Dict[str, Any]:
     if len(kept) <= MAX_SELECTED_PAGES:
         return heuristic_plan(kept)
 
+    # Shortlist by rule score, then read each shortlisted page ONCE to build a
+    # lightweight preview. The LLM sees only previews (filenames/headings/first
+    # + last lines) — never full text, and never every page on the site.
     shortlist = kept[:MAX_LLM_CANDIDATES]
-    maybe_fetch_snippets(shortlist)     # bounded, only if metadata was ambiguous
-    by_url = {c.meta.page_url: c for c in shortlist}
+    build_page_previews(shortlist)
+    by_filename = {c.filename: c for c in shortlist}
 
     messages = build_prompt(shortlist)
     raw = call_planner_llm(messages)
-    plan = parse_planner_response(raw, by_url)
+    plan = parse_planner_response(raw, by_filename)
     if plan is not None:
+        logger.info("Route Planner selected %d page(s) for %s via LLM.",
+                    len(plan["selected_pages"]), domain)
         return plan
 
     logger.info("Falling back to deterministic route plan for %s.", domain)
@@ -591,7 +674,7 @@ def _cli() -> None:
     print(f"Selected   : {len(plan['selected_pages'])} page(s)")
     print("-" * 66)
     for p in plan["selected_pages"]:
-        print(f"  [{p['priority']}] {p['url']}")
+        print(f"  [{p['priority']}] {p['filename']}  ({p['url']})")
         print(f"       txt_path : {p['txt_path']}")
         print(f"       reason   : {p['reason']}")
     print("=" * 66 + "\n")

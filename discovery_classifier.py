@@ -25,6 +25,7 @@ by extending DISCOVERY_SOURCE_REGISTRY below — never by touching the crawler.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -57,6 +58,33 @@ def domain_key(url_or_host: str) -> str:
 
 def _brand(host: str) -> str:
     return _TLD.extract_str(host).domain.lower()
+
+
+def compute_content_hash(html: str) -> str:
+    """Cheap structural+textual fingerprint of a page's content, for cache
+    invalidation across the website-intelligence caches (classification,
+    crawl plan, tech stack). Changes when title/meta/headings/link-count/
+    body-text-length meaningfully change; unaffected by whitespace, attribute,
+    or ad/tracker-script noise that isn't visible content.
+
+    A single shared function so every cache invalidates on the SAME notion of
+    "this page's content changed" — no dependency on phase1_pipeline or any of
+    the optional crawl-stage modules, so it stays a leaf with zero cycle risk.
+    """
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:  # noqa: BLE001 - a hash is never worth breaking a caller over
+        return hashlib.sha256((html or "")[:5000].encode("utf-8", "ignore")).hexdigest()[:16]
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    meta = soup.find("meta", attrs={"name": "description"})
+    meta_desc = (meta.get("content", "") if meta else "").strip()
+    headings = [h.get_text(" ", strip=True) for h in soup.find_all(["h1", "h2", "h3"])][:20]
+    link_count = len(soup.find_all("a", href=True))
+    text_len = len(soup.get_text(" ", strip=True))
+    fingerprint = "|".join([
+        title, meta_desc, "|".join(headings), str(link_count), str(text_len // 50),
+    ])
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
 
 
 # ===========================================================================
@@ -147,6 +175,12 @@ for _b, _n in (
     ("crunchbase", "Crunchbase"), ("trustpilot", "Trustpilot"),
     ("justdial", "Justdial"), ("healthgrades", "Healthgrades"),
     ("zocdoc", "Zocdoc"), ("opencare", "Opencare"), ("citysearch", "Citysearch"),
+    # restaurant/food discovery + booking directories — same shape as the
+    # general directories above: many businesses, real outbound listing pages.
+    ("opentable", "OpenTable"), ("zomato", "Zomato"), ("thefork", "TheFork"),
+    ("resy", "Resy"), ("squaremeal", "SquareMeal"), ("restaurantguru", "RestaurantGuru"),
+    ("sirved", "Sirved"), ("menupix", "MenuPix"), ("wanderlog", "Wanderlog"),
+    ("allmenus", "Allmenus"), ("timeout", "Time Out"), ("eater", "Eater"),
 ):
     _register(_b, _n, Confidence.MEDIUM)
 
@@ -180,6 +214,10 @@ NOISE_BRANDS = frozenset({
     "telegram", "linktree", "tinyurl", "reklam5",
     # job boards / employer reviews (not business directories in this sense)
     "indeed", "glassdoor",
+    # food delivery/ordering apps — transactional platforms designed to keep
+    # users in-app, not marketing directories with reliable outbound links to
+    # a restaurant's own website (unlike opentable/zomato/squaremeal above).
+    "foodpanda", "grubhub", "ubereats", "deliveroo", "doordash",
 })
 NOISE_EXACT_DOMAINS = frozenset({
     "wa.me", "t.me", "bit.ly", "linktr.ee", "apps.apple.com", "itunes.apple.com",
@@ -330,29 +368,25 @@ async def _native_get(session: aiohttp.ClientSession, url: str, timeout_s: int) 
     return None
 
 
-async def extract_businesses_from_source(
-    session: aiohttp.ClientSession,
+def extract_businesses_from_html(
+    html: str,
     source_url: str,
     source_name: str,
     confidence: Confidence,
     seen_hosts: Set[str],
     needed: int,
-    *,
-    fetch_timeout_s: int = 12,
 ) -> List[QueuedBusiness]:
-    """Fetch ONE discovery-source page and extract its outbound links to
-    individual business homepages. Never follows a link that is ITSELF another
-    discovery source or noise (no recursive directory mining) — only links
-    that classify as OFFICIAL become QueuedBusiness records.
+    """Extract outbound links to individual business homepages from HTML
+    ALREADY in memory (no fetch) — the shared core used both by the async
+    fetch-based path below and by website_classifier.py, which already has a
+    site's homepage HTML in memory from the crawl and would otherwise pay for
+    a second, redundant fetch of the same page.
 
-    Logs extraction stats (found / queued / skipped) so it's obvious where
-    businesses are being filtered out.
+    Never follows a link that is ITSELF another discovery source or noise (no
+    recursive directory mining) — only links that classify as OFFICIAL become
+    QueuedBusiness records. Logs extraction stats (found / queued / skipped)
+    so it's obvious where businesses are being filtered out.
     """
-    html = await _native_get(session, source_url, fetch_timeout_s)
-    if not html:
-        logger.info("Discovery source unreachable, skipped: %s (%s)", source_url, source_name)
-        return []
-
     source_domain = domain_key(source_url)
     found: List[QueuedBusiness] = []
     scanned = 0
@@ -408,6 +442,29 @@ async def extract_businesses_from_source(
         skipped_noise, skipped_recursive, skipped_utility, skipped_duplicate,
     )
     return found
+
+
+async def extract_businesses_from_source(
+    session: aiohttp.ClientSession,
+    source_url: str,
+    source_name: str,
+    confidence: Confidence,
+    seen_hosts: Set[str],
+    needed: int,
+    *,
+    fetch_timeout_s: int = 12,
+) -> List[QueuedBusiness]:
+    """Fetch ONE discovery-source page and extract its outbound links to
+    individual business homepages. See extract_businesses_from_html for the
+    extraction logic — this just adds the fetch for callers (discover_targets)
+    that don't already have the page's HTML in memory."""
+    html = await _native_get(session, source_url, fetch_timeout_s)
+    if not html:
+        logger.info("Discovery source unreachable, skipped: %s (%s)", source_url, source_name)
+        return []
+    return extract_businesses_from_html(
+        html, source_url, source_name, confidence, seen_hosts, needed
+    )
 
 
 # ===========================================================================
