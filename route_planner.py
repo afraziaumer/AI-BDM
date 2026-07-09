@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -628,13 +629,31 @@ def plan_routes(website: str) -> Dict[str, Any]:
     messages = build_prompt(shortlist)
     raw = call_planner_llm(messages)
     plan = parse_planner_response(raw, by_filename)
-    if plan is not None:
+    used_llm = plan is not None
+    if used_llm:
         logger.info("Route Planner selected %d page(s) for %s via LLM.",
                     len(plan["selected_pages"]), domain)
-        return plan
+    else:
+        logger.info("Falling back to deterministic route plan for %s.", domain)
+        plan = heuristic_plan(kept)
 
-    logger.info("Falling back to deterministic route plan for %s.", domain)
-    return heuristic_plan(kept)
+    # The exact LLM request/response, alongside the resulting plan — written
+    # into the domain's own storage folder for transparency/audit/reuse
+    # (route_planner_request.json), same query-time-write pattern as
+    # tech_stack's write_tech_profile_now. Best-effort: never breaks routing.
+    try:
+        get_store().write_route_planner_request(domain, {
+            "domain": domain,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "messages": messages,
+            "raw_response": raw,
+            "used_llm": used_llm,
+            "plan": plan,
+        })
+    except Exception as exc:  # noqa: BLE001 - this artifact is best-effort
+        logger.warning("Failed to persist route planner request for %s: %s", domain, exc)
+
+    return plan
 
 
 # ===========================================================================

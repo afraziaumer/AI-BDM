@@ -54,8 +54,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -118,6 +120,54 @@ _DIRECTORY_TECH_HINTS = (
     "brilliant directory", "sabai directory", "directoryengine", "listeo",
 )
 
+# Coarse, dependency-free language check — NOT a translator, just enough to
+# know "the English-only phrase/listicle signals below can't be trusted on
+# this page". Primary signal is the page's own <html lang> attribute (set by
+# almost every real site); the stopword-frequency table is only a fallback
+# for the rarer case where that attribute is missing or wrong. Deliberately
+# NOT a per-language DIRECTORY_PHRASES translation — that doesn't scale to
+# every language a site might be in, whereas "is this even English?" does.
+_ENGLISH_STOPWORDS = frozenset({
+    "the", "and", "of", "to", "is", "for", "in", "on", "with", "are",
+    "this", "your", "our", "we", "you", "from", "as", "at", "by",
+})
+_NON_ENGLISH_STOPWORDS: Dict[str, frozenset] = {
+    "it": frozenset({"il", "la", "di", "che", "per", "un", "una", "sono",
+                     "questo", "nel", "della", "con", "non", "sei", "gli"}),
+    "fr": frozenset({"le", "la", "de", "et", "pour", "un", "une", "les",
+                      "des", "est", "dans", "que", "vous", "nous"}),
+    "de": frozenset({"der", "die", "das", "und", "ist", "für", "mit",
+                      "nicht", "ein", "eine", "sie", "auf", "wir"}),
+    "es": frozenset({"el", "la", "de", "que", "para", "un", "una", "los",
+                      "las", "es", "en", "con", "no", "nosotros"}),
+    "pt": frozenset({"o", "a", "de", "que", "para", "um", "uma", "os",
+                      "as", "em", "com", "não", "nós"}),
+}
+
+
+def is_non_english(html_lang: str, text_blob: str) -> bool:
+    """True if the homepage is confidently NOT English. False (i.e. "assume
+    English") whenever the signal is missing or genuinely ambiguous — this
+    only ever needs to catch the CONFIDENT non-English case (see its call
+    site: it forces an LLM check instead of trusting English-only phrase
+    matching), so an uncertain result must default to not tripping it."""
+    if html_lang:
+        code = html_lang.split("-")[0].strip()
+        if code and code != "en":
+            return True
+        if code == "en":
+            return False
+    tokens = re.findall(r"[a-zà-ÿ]+", text_blob.lower())
+    if len(tokens) < 20:
+        return False  # not enough text to say anything confidently
+    counts = Counter(tokens)
+    en_hits = sum(counts[w] for w in _ENGLISH_STOPWORDS)
+    for words in _NON_ENGLISH_STOPWORDS.values():
+        other_hits = sum(counts[w] for w in words)
+        if other_hits >= 5 and other_hits > en_hits * 1.5:
+            return True
+    return False
+
 
 @dataclass
 class HomepageSignals:
@@ -132,6 +182,7 @@ class HomepageSignals:
     directory_tech: List[str] = field(default_factory=list)
     pattern_count: int = 0
     pattern_names: List[str] = field(default_factory=list)
+    html_lang: str = ""
 
 
 def extract_homepage_signals(
@@ -147,6 +198,7 @@ def extract_homepage_signals(
     from crawl_planner import detect_patterns, extract_homepage_candidates
 
     soup = BeautifulSoup(html, "lxml")
+    html_lang = (soup.html.get("lang", "") if soup.html else "").strip().lower()
     title = soup.title.get_text(strip=True) if soup.title else ""
     meta = (
         soup.find("meta", attrs={"name": "description"})
@@ -215,6 +267,7 @@ def extract_homepage_signals(
         outbound_domains=outbound_domains, schema_types=schema_types,
         matched_phrases=matched_phrases, directory_tech=directory_tech,
         pattern_count=len(patterns), pattern_names=[p.pattern for p in patterns],
+        html_lang=html_lang,
     )
 
 
@@ -433,7 +486,20 @@ def _classify_uncached(
             action="extract_businesses", method="rule_based",
             reasoning="; ".join(reasons) or "high directory-likeness score",
         )
-    if score <= DIRECTORY_SCORE_LOW:
+
+    # DIRECTORY_PHRASES/LISTICLE_TITLE_RE are English-only word lists — on a
+    # non-English homepage they can only ever contribute 0, so a genuine
+    # non-English directory (wrong CTA language, not wrong signals) can land
+    # here with a falsely "confident" low score, never reaching the LLM that
+    # would actually understand it. Force the LLM path instead of trusting an
+    # English-tuned score on content that isn't English — the "confidently
+    # directory" branch above is unaffected (those signals are language-
+    # independent: schema.org types, outbound-domain count, tech, patterns).
+    non_english = is_non_english(signals.html_lang, " ".join(
+        [signals.title, signals.meta_description] + signals.headings
+        + signals.nav_anchor_texts + signals.footer_anchor_texts
+    ))
+    if score <= DIRECTORY_SCORE_LOW and not non_english:
         logger.info("[Classifier] %s: rule-based OFFICIAL BUSINESS (score=%d).", domain, score)
         return ClassificationResult(
             category=SiteCategory.OFFICIAL_BUSINESS.value, confidence=max(60, 90 - score),
@@ -441,9 +507,15 @@ def _classify_uncached(
             reasoning="low directory-likeness score; no directory/CTA signals found",
         )
 
-    # Ambiguous — ask the LLM. Falls back to deep_crawl (never drop a real
+    # Ambiguous (or a low score we can't trust because the page isn't
+    # English) — ask the LLM. Falls back to deep_crawl (never drop a real
     # business over an ambiguous signal) if the LLM is unavailable or junk.
-    logger.info("[Classifier] %s: ambiguous rule score (%d) — asking LLM.", domain, score)
+    if non_english:
+        logger.info("[Classifier] %s: non-English homepage (lang=%r) with low rule "
+                    "score (%d) — asking LLM instead of trusting English-only "
+                    "phrase signals.", domain, signals.html_lang, score)
+    else:
+        logger.info("[Classifier] %s: ambiguous rule score (%d) — asking LLM.", domain, score)
     messages = build_prompt(signals, url, user_query)
     raw = call_classifier_llm(messages)
     parsed = parse_classifier_response(raw)

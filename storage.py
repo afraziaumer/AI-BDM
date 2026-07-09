@@ -11,11 +11,24 @@ changes.
 Local layout:
     storage/
         <domain>/
-            <page>.txt           cleaned, LLM-ready page text (one file per page)
+            <page>.txt           cleaned, LLM-ready page text (one file per page,
+                                  named after the page's own URL slug — see
+                                  page_name_for)
+            page_index.json      master per-page manifest {"pages": [...]} —
+                                  future components (routing, embeddings, RAG,
+                                  search) should read THIS, not scan the
+                                  filesystem. Written incrementally, one entry
+                                  per page, as the crawl streams (see
+                                  stage_page_index_entry)
             links.json           per-page extracted internal links (for Step 3)
             tech_stack.json      normalized tech capabilities (see tech_stack.py)
             website_profile.json full tech-intelligence profile (see tech_stack.py)
-            crawl_plan.json      cached LLM crawl plan (see crawl_planner.py)
+            crawl_plan.json      cached LLM crawl plan (see crawl_planner.py;
+                                  currently unused — ENABLE_CRAWL_PLANNER is off)
+            route_planner_request.json  the exact LLM request (messages),
+                                  raw response, and resulting plan from the
+                                  LLM Route Planner (see route_planner.py) —
+                                  written at query time, after commit
     crawl_index.csv           per-page metadata index (NO page text, NO raw HTML)
 
 Staging & commit
@@ -44,7 +57,7 @@ import shutil
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 # Per-page metadata columns for the crawl index. Deliberately excludes page TEXT
@@ -77,14 +90,23 @@ class PageStore(ABC):
     # --- filename helper (shared; deterministic across backends) -----------
     @staticmethod
     def page_name_for(url: str) -> str:
-        """Deterministic, filesystem/key-safe base name for a page URL.
+        """Deterministic, filesystem/key-safe base name for a page URL, from
+        its LAST path segment only — human-readable regardless of how deeply
+        the URL is nested.
 
-        Homepage -> "home"; "/about/team" -> "about-team". Bounded length.
+        Homepage -> "home"; "/about" -> "about"; "/services/plumbing" ->
+        "plumbing" (not "services-plumbing" — the full nested path used to be
+        concatenated, producing long, ugly names for any multi-segment URL).
+        Two different URLs that happen to share a last segment are
+        disambiguated by _unique_name's numeric suffix ("plumbing-2"), not by
+        lengthening the name up front.
         """
         path = urlsplit(url).path.strip("/")
         if not path:
             return "home"
-        name = re.sub(r"[^A-Za-z0-9._-]+", "-", path).strip("-").lower()
+        segments = [s for s in path.split("/") if s]
+        leaf = segments[-1] if segments else ""
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", leaf).strip("-").lower()
         return (name or "home")[:120]
 
     # --- streaming writes (staging) ----------------------------------------
@@ -99,6 +121,15 @@ class PageStore(ABC):
     @abstractmethod
     def buffer_links(self, domain: str, page_url: str, links: List[Dict[str, str]]) -> None:
         """Buffer one page's extracted internal links (written on commit)."""
+
+    @abstractmethod
+    def stage_page_index_entry(self, domain: str, entry: Dict[str, Any]) -> None:
+        """Append one page's metadata to this domain's page_index.json and
+        persist it to the staging area IMMEDIATELY (not just buffered in RAM,
+        unlike buffer_index_row/buffer_links) — the master per-page manifest
+        future components (routing, embeddings, RAG, search) read instead of
+        scanning the filesystem. Promoted/discarded together with the rest of
+        this domain's staged files by commit_domain/discard_domain."""
 
     @abstractmethod
     def stage_tech_profile(
@@ -164,9 +195,24 @@ class PageStore(ABC):
         progress crawl, so there is no staging/commit decision to make)."""
 
     @abstractmethod
+    def write_route_planner_request(self, domain: str, record: Dict) -> None:
+        """Write route_planner_request.json straight to FINAL storage for an
+        already-committed domain (query-time artifact, same pattern as
+        write_tech_profile_now — route_planner.py only ever runs AFTER a
+        domain is committed). Captures the exact LLM request (messages sent),
+        raw response, and resulting plan for transparency/audit/reuse."""
+
+    @abstractmethod
     def read_crawl_plan(self, domain: str) -> Optional[Dict]:
         """Return the committed crawl_plan.json for a domain, or None if this
         domain was never planned (or its committed run predates this feature)."""
+
+    @abstractmethod
+    def read_page_index(self, domain: str) -> Optional[Dict]:
+        """Return the committed page_index.json ({"pages": [...]})  for a
+        domain, or None if it was never built (crawled before this feature
+        existed). The master per-page manifest — future components should
+        read this instead of scanning the filesystem."""
 
 
 class LocalPageStore(PageStore):
@@ -179,6 +225,7 @@ class LocalPageStore(PageStore):
         # Buffered per-domain metadata (lightweight, one business at a time).
         self._index_buffers: Dict[str, List[Dict[str, str]]] = {}
         self._link_buffers: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+        self._page_index_buffers: Dict[str, List[Dict[str, Any]]] = {}
         self._staged_names: Dict[str, set] = {}
         self._lock = threading.Lock()
 
@@ -218,6 +265,18 @@ class LocalPageStore(PageStore):
         with self._lock:
             self._link_buffers.setdefault(domain, {})[page_url] = links
 
+    def stage_page_index_entry(self, domain: str, entry: Dict[str, Any]) -> None:
+        with self._lock:
+            entries = self._page_index_buffers.setdefault(domain, [])
+            entries.append(entry)
+            snapshot = list(entries)
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "page_index.json").write_text(
+            json.dumps({"pages": snapshot}, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
     def stage_tech_profile(
         self, domain: str, capabilities: Dict, full_profile: Dict
     ) -> None:
@@ -246,6 +305,7 @@ class LocalPageStore(PageStore):
         with self._lock:
             links = self._link_buffers.pop(domain, {})
             rows = self._index_buffers.pop(domain, [])
+            self._page_index_buffers.pop(domain, None)
             self._staged_names.pop(domain, None)
         if links:
             final.mkdir(parents=True, exist_ok=True)
@@ -261,6 +321,7 @@ class LocalPageStore(PageStore):
         with self._lock:
             self._index_buffers.pop(domain, None)
             self._link_buffers.pop(domain, None)
+            self._page_index_buffers.pop(domain, None)
             self._staged_names.pop(domain, None)
 
     def cleanup_orphaned_staging(self) -> List[str]:
@@ -273,6 +334,7 @@ class LocalPageStore(PageStore):
             for name in orphaned:
                 self._index_buffers.pop(name, None)
                 self._link_buffers.pop(name, None)
+                self._page_index_buffers.pop(name, None)
                 self._staged_names.pop(name, None)
         return orphaned
 
@@ -331,8 +393,25 @@ class LocalPageStore(PageStore):
         d.mkdir(parents=True, exist_ok=True)
         self._write_tech_profile_files(d, capabilities, full_profile)
 
+    def write_route_planner_request(self, domain: str, record: Dict) -> None:
+        d = self._final_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "route_planner_request.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
     def read_crawl_plan(self, domain: str) -> Optional[Dict]:
         f = self._final_dir(domain) / "crawl_plan.json"
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def read_page_index(self, domain: str) -> Optional[Dict]:
+        f = self._final_dir(domain) / "page_index.json"
         if not f.exists():
             return None
         try:

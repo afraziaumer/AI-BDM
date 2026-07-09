@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -260,11 +261,35 @@ _LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
 _ROBOTS_SITEMAP_RE = re.compile(r"(?im)^\s*sitemap:\s*(\S+)\s*$")
 
 # Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
-# the LLM relevance classifier (Step 5.5). ENABLED: discovery heuristics catch
-# obvious junk (directories/blogs/app-stores) but can't catch everything, so the
-# classifier is the semantic backstop that drops aggregators, product shops,
-# wrong-location and unrelated results before they're stored as leads.
+# the LLM relevance classifier (Step 5.5, LLM_planner.classify_business). This
+# is the ONLY stage in the whole pipeline that validates a candidate's actual
+# industry + location match — discovery_classifier.py (Step 2/3) only screens
+# noise/other-directories, and website_classifier.py (Layer 2) only screens
+# directory-vs-official; neither is query-aware. Turned back ON after briefly
+# being disabled: with it off, e.g. "5 salons in Spain" let through acxiom.com
+# (a US data/martech company, mined off some directory's footer credit link)
+# because literally nothing downstream ever checked industry/geo for ANY
+# candidate. Flip to False only if you deliberately want zero relevance
+# filtering again (every discovered business kept, unfiltered).
 LEAD_FILTERING_ENABLED = True
+
+# Website Classification (directory/aggregator detection, website_classifier.py)
+# is ENABLED — this is the ONLY thing standing between "a directory/aggregator
+# site (expat.com, locallista.com, a brand's salon-finder page...) gets crawled
+# and stored as if it were itself the business" and a clean result set. It's
+# independent of the other two flags below: it decides deep_crawl vs discard,
+# NOT which pages to crawl (that's ENABLE_CRAWL_PLANNER) or whether a business
+# passes a relevance check (that's LEAD_FILTERING_ENABLED). Flip to False only
+# if you deliberately want directories treated as businesses.
+ENABLE_WEBSITE_CLASSIFIER = True
+
+# LLM Crawl Planner (crawl_planner.py) is DISABLED for now — AI-BDM should
+# become a long-term knowledge base: every internal page that passes the
+# existing crawler constraints (MAX_PAGES_PER_SITE, MAX_CRAWL_DEPTH, noise
+# filtering, etc. — unchanged) is crawled, not just the pages an LLM judged
+# relevant to the CURRENT query. The code is untouched; flip this back to True
+# to re-enable query-scoped, credit-efficient crawling.
+ENABLE_CRAWL_PLANNER = False
 
 # When True, each chosen email's domain is MX-validated (DNS only, no mail sent)
 # before it is accepted. Undeliverable/dead domains are dropped, so stored emails
@@ -343,8 +368,23 @@ BROWSER_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    # Strong (not "0.5") preference for English — content-negotiating sites
+    # should serve their English variant instead of defaulting to whatever
+    # the crawler's own network location implies. Sites that ignore
+    # Accept-Language entirely (URL-path or GeoIP-based language selection,
+    # or simply no English content at all) aren't affected by this header —
+    # see FORCE_ENGLISH_GEO_CODE below for the GeoIP case, handled via
+    # Scrape.do's proxy exit-country instead.
+    "Accept-Language": "en-US,en;q=0.9",
 }
+
+# Scrape.do (Tier-2) exit-node country. Many sites pick their served language
+# from the VISITOR'S apparent country (GeoIP), not the Accept-Language header
+# — Accept-Language alone can't override that since it's a different signal.
+# Forcing the proxy's exit IP to a native-English country makes those sites
+# serve English the same way a real visitor browsing from the US would see.
+# Sites with no English content at all are still unaffected either way.
+FORCE_ENGLISH_GEO_CODE = "us"
 
 ANTI_BOT_SIGNATURES = [
     "just a moment...",
@@ -819,20 +859,33 @@ async def _scrapedo_fetch(
     HTTP 200s, so failed cheap attempts cost nothing. Headers are Scrape.do's
     own response headers (best-effort passthrough), not guaranteed identical to
     the origin's — still useful bonus signal for tech detection when present.
+
+    Forces English content two ways: `geoCode` pins the proxy's exit IP to
+    FORCE_ENGLISH_GEO_CODE (defeats GeoIP-based language selection — the site
+    sees a US visitor, same as it would for a real one), and `customHeaders`
+    forwards our own Accept-Language header instead of Scrape.do's default
+    (defeats content-negotiation-based language selection). Sites with no
+    English content at all are unaffected by either — there's nothing to
+    switch to.
     """
-    params: Dict[str, str] = {"token": SCRAPEDO_API_KEY, "url": target_url}
+    params: Dict[str, str] = {
+        "token": SCRAPEDO_API_KEY, "url": target_url,
+        "geoCode": FORCE_ENGLISH_GEO_CODE,
+        "customHeaders": "true",
+    }
     if render:
         params["render"] = "true"       # execute JavaScript (headless browser)
         params["super"] = "true"        # premium residential proxies
         if SCRAPEDO_BLOCK_RESOURCES:
             params["blockResources"] = "true"   # skip images/css/fonts → faster
     mode = "render" if render else "plain"
+    forwarded_headers = {"Accept-Language": BROWSER_HEADERS["Accept-Language"]}
 
     for attempt in range(SCRAPEDO_MAX_RETRIES + 1):
         try:
             async with _scrapedo_semaphore:       # cap concurrent proxied calls
                 async with session.get(
-                    SCRAPEDO_URL, params=params,
+                    SCRAPEDO_URL, params=params, headers=forwarded_headers,
                     timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
                 ) as resp:
                     if resp.status == 200:
@@ -877,7 +930,8 @@ async def execute_scavenger_scrape(
             waf_detected = any(sig in body.lower() for sig in ANTI_BOT_SIGNATURES)
             if resp.status in HTTP_OK and not waf_detected:
                 logger.info("Tier-1 success: %s", target_url)
-                return {"html": body, "method": "NATIVE", "headers": dict(resp.headers)}
+                return {"html": body, "method": "NATIVE", "headers": dict(resp.headers),
+                        "status_code": resp.status}
             logger.warning(
                 "Tier-1 blocked (status=%s, waf=%s): %s",
                 resp.status, waf_detected, target_url,
@@ -887,21 +941,22 @@ async def execute_scavenger_scrape(
             # 404 came WITH an anti-bot signature it may be a faked block, so we
             # still escalate that case.)
             if resp.status == 404 and not waf_detected:
-                return {"html": "", "method": "FAILED", "headers": {}}
+                return {"html": "", "method": "FAILED", "headers": {}, "status_code": 404}
     except Exception as exc:  # noqa: BLE001
         logger.warning("Tier-1 connection failed for %s: %s", target_url, exc)
 
     # --- Tier 2: Scrape.do — cheap proxy first, JS-render fallback on failure ---
     if not SCRAPEDO_API_KEY:
         logger.error("Scrape.do token missing; cannot escalate %s", target_url)
-        return {"html": "", "method": "FAILED", "headers": {}}
+        return {"html": "", "method": "FAILED", "headers": {}, "status_code": None}
 
     logger.info("Tier-2 Scrape.do escalation: %s", target_url)
     # 2a — cheap: raw HTML through the proxy, no browser (cheapest, ~1 credit).
     html, headers = await _scrapedo_fetch(session, target_url, render=False)
     if html:
         logger.info("Tier-2 success (plain): %s", target_url)
-        return {"html": html, "method": "SCRAPEDO", "headers": headers}
+        # Scrape.do bills (and therefore returns HTML) only for HTTP 200s.
+        return {"html": html, "method": "SCRAPEDO", "headers": headers, "status_code": 200}
 
     # 2b — fallback: only sites that failed cheap get the expensive JS render +
     # premium proxy (images/css/fonts blocked for speed). Cost-safe: the cheap
@@ -910,9 +965,10 @@ async def execute_scavenger_scrape(
         html, headers = await _scrapedo_fetch(session, target_url, render=True)
         if html:
             logger.info("Tier-2 success (render): %s", target_url)
-            return {"html": html, "method": "SCRAPEDO_RENDER", "headers": headers}
+            return {"html": html, "method": "SCRAPEDO_RENDER", "headers": headers,
+                    "status_code": 200}
 
-    return {"html": "", "method": "FAILED", "headers": {}}
+    return {"html": "", "method": "FAILED", "headers": {}, "status_code": None}
 
 
 # === Step 3.5: Whole-site crawl ============================================
@@ -970,6 +1026,81 @@ def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[
     """Return same-domain, crawlable page links found in `html`."""
     soup = BeautifulSoup(html, "lxml")
     return [p["url"] for p in _extract_internal_link_pairs(soup, base_url, root_domain)]
+
+
+# === Language handling: prefer a site's own declared English variant =======
+# General, not hardcoded per domain — reads the SAME standard mechanism every
+# properly internationalized site already exposes for browsers/search engines:
+# <link rel="alternate" hreflang="xx" href="..."> in <head>. If a site declares
+# no such alternates at all, none of this changes anything (Requirement 4:
+# crawl the default/original language as before).
+def _parse_language_alternates(html: str, base_url: str) -> Dict[str, str]:
+    """{hreflang code (lowercased) -> absolute url} for every alternate the
+    homepage declares, from <link rel="alternate" hreflang="..." href="...">
+    tags in <head>. "x-default" is skipped (it's a fallback marker, not a
+    language). Best-effort: never raises, empty dict on any parse failure."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:  # noqa: BLE001 - a bad parse just means no alternates found
+        return {}
+    alternates: Dict[str, str] = {}
+    for link in soup.find_all("link", hreflang=True):
+        rel = link.get("rel") or []
+        if isinstance(rel, str):
+            rel = [rel]
+        if not any("alternate" in r.lower() for r in rel):
+            continue
+        code = (link.get("hreflang") or "").strip().lower()
+        href = (link.get("href") or "").strip()
+        if not code or not href or code == "x-default":
+            continue
+        alternates[code] = urljoin(base_url, href)
+    return alternates
+
+
+def _select_english_alternate(alternates: Dict[str, str]) -> Optional[str]:
+    """The declared English variant's URL, e.g. from hreflang "en", "en-us",
+    "en-GB" — any code whose primary subtag is "en". None if the site
+    declares no English alternate at all."""
+    for code, url in alternates.items():
+        if code.split("-")[0] == "en":
+            return url
+    return None
+
+
+def _other_language_path_prefixes(alternates: Dict[str, str], domain: str) -> Set[str]:
+    """Path prefixes (e.g. "/it/", "/fr/") belonging to the site's OWN
+    non-English declared alternates — used to keep the crawl from wandering
+    into other locales once the English variant has been selected. Only
+    considers alternates on the SAME registered domain (an hreflang pointing
+    at a different domain/regional site is out of scope here)."""
+    prefixes: Set[str] = set()
+    for code, url in alternates.items():
+        if code.split("-")[0] == "en":
+            continue
+        if _domain_key(url) != domain:
+            continue
+        path = urlparse(url).path.strip("/")
+        if not path:
+            continue
+        prefixes.add(f"/{path.split('/')[0]}/")
+    return prefixes
+
+
+def _drop_other_language_links(urls: List[str], other_lang_prefixes: Set[str]) -> List[str]:
+    """Filter out URLs that fall under one of the site's OWN other-language
+    path prefixes (see _other_language_path_prefixes) — a no-op list copy
+    when no other-language prefixes were found (the common case: most sites
+    have no declared alternates at all)."""
+    if not other_lang_prefixes:
+        return urls
+    kept = []
+    for u in urls:
+        path = urlparse(u).path
+        if any(path == p.rstrip("/") or path.startswith(p) for p in other_lang_prefixes):
+            continue
+        kept.append(u)
+    return kept
 
 
 def _contact_priority(url: str) -> int:
@@ -1084,6 +1215,7 @@ async def crawl_site(
     root_method: str,
     *,
     root_headers: Optional[Dict[str, str]] = None,
+    root_status_code: Optional[int] = None,
     company_name: str = "",
     country_code: str = "",
     phone_regex: str = "",
@@ -1134,7 +1266,9 @@ async def crawl_site(
     discovered_urls: Set[str] = set()    # every page/link URL seen (tech profile's
                                           # login/portal path-hint check, at the end)
 
-    async def _process_one(page_url: str, html: str, method: str) -> List[str]:
+    async def _process_one(
+        page_url: str, html: str, method: str, status_code: Optional[int] = None
+    ) -> List[str]:
         """Process ONE page end-to-end and stage it. Returns its internal links.
 
         Everything heavy (soup, html, text) is local to this call and freed on
@@ -1199,8 +1333,18 @@ async def crawl_site(
             sample_parts.append(part)
             sample_chars += len(part)
 
+        # This is THE homepage of the crawl (first page kept) regardless of
+        # its URL path — e.g. a site's English variant may live at "/en/",
+        # not "/", once the language-alternate switch above has run. Deciding
+        # by position (not by an empty URL path) keeps page_name_for/_page_type
+        # correct for route_planner's homepage lookup either way.
+        is_home_page = pages_kept == 0
+        page_type = "home" if is_home_page else _page_type(page_url)
+
         # Stage the cleaned text + metadata NOW (not after the crawl finishes).
-        txt_path = store.stage_page(domain, store.page_name_for(page_url), text)
+        page_name = "home" if is_home_page else store.page_name_for(page_url)
+        txt_path = store.stage_page(domain, page_name, text)
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         store.buffer_index_row(domain, {
             "company_name": company_name,
             "domain": domain,
@@ -1217,14 +1361,62 @@ async def crawl_site(
             "content_length": str(len(text)),
             "word_count": str(cleaned["word_count"]),
             "timestamp": now_iso,
-            "page_type": _page_type(page_url),
+            "page_type": page_type,
         })
         store.buffer_links(domain, page_url, link_pairs)
+        # Master per-page manifest entry — see storage.py's module docstring.
+        # Written incrementally (one entry per page) so page_index.json stays
+        # current throughout a long crawl, not just at the very end.
+        store.stage_page_index_entry(domain, {
+            "page_name": page_name,
+            "url": page_url,
+            "storage_path": txt_path,
+            "http_status": status_code,
+            "word_count": cleaned["word_count"],
+            "content_length": len(text),
+            "last_crawled": now_iso,
+            "content_hash": content_hash,
+            "page_type": page_type,
+        })
         pages_kept += 1
         return link_urls
 
-    # --- Homepage (already fetched by the caller's two-tier scrape) ---------
-    home_link_urls = await _process_one(root_url, root_html, root_method)
+    # --- Language handling: prefer the site's OWN declared English variant,
+    # if any (Requirements 1-5). Runs BEFORE the homepage is staged, so if an
+    # English alternate exists, its content — not the default-locale
+    # homepage's — becomes "home.txt". If the site declares no alternates at
+    # all, root_url/root_html are untouched and the crawl proceeds exactly as
+    # before (original/default language). Best-effort: any failure here just
+    # means the crawl continues on whatever homepage was already fetched.
+    other_lang_prefixes: Set[str] = set()
+    try:
+        alternates = _parse_language_alternates(root_html, root_url)
+        english_url = _select_english_alternate(alternates)
+        if english_url and _normalize_page_url(english_url) != _normalize_page_url(root_url):
+            logger.info("%s declares an English variant (%s) — switching to it.",
+                        domain, english_url)
+            fetched = await execute_scavenger_scrape(session, english_url)
+            if fetched.get("html"):
+                root_url = english_url
+                root_html = fetched["html"]
+                root_method = fetched.get("method", root_method)
+                root_headers = fetched.get("headers") or root_headers
+                root_status_code = fetched.get("status_code")
+                alternates = _parse_language_alternates(root_html, root_url)
+            else:
+                logger.warning("English variant declared for %s but fetch failed "
+                               "(%s) — keeping the original homepage.",
+                               domain, english_url)
+        other_lang_prefixes = _other_language_path_prefixes(alternates, domain)
+    except Exception as exc:  # noqa: BLE001 - language handling is best-effort
+        logger.warning("Language-alternate handling failed for %s: %s", domain, exc)
+
+    # --- Homepage (already fetched by the caller's two-tier scrape, or just
+    # switched above to the site's own English variant) ---------------------
+    home_link_urls = _drop_other_language_links(
+        await _process_one(root_url, root_html, root_method, root_status_code),
+        other_lang_prefixes,
+    )
 
     # Tech Stack Detection: Wappalyzer runs on the SAME raw HTML above, still
     # in memory, before it is freed on the next line — never a second request.
@@ -1252,7 +1444,7 @@ async def crawl_site(
     # can only ever waste credits on an undetected directory, never drop a
     # real business.
     classification = None
-    if website_classifier is not None:
+    if ENABLE_WEBSITE_CLASSIFIER and website_classifier is not None:
         try:
             classification = await asyncio.to_thread(
                 website_classifier.classify_homepage,
@@ -1306,7 +1498,7 @@ async def crawl_site(
     # (module missing, LLM down, bad response) so a planner outage can only
     # ever mean less credit savings for this site, never less recall.
     planned_urls = home_link_urls
-    if crawl_planner is not None:
+    if ENABLE_CRAWL_PLANNER and crawl_planner is not None:
         try:
             planned = await asyncio.to_thread(
                 crawl_planner.plan_site_crawl,
@@ -1324,10 +1516,17 @@ async def crawl_site(
     visited: Set[str] = {_normalize_page_url(root_url)}
     # High-value contact pages first (sitemap/robots/probe), then the crawl
     # planner's selected homepage links (or all of them, if planning fell back).
-    priority_urls = await _discover_contact_urls(session, root_url, domain)
+    # Both are filtered against the site's OWN other-language path prefixes (if
+    # any were declared) so the crawl never wanders into another locale.
+    priority_urls = _drop_other_language_links(
+        await _discover_contact_urls(session, root_url, domain), other_lang_prefixes,
+    )
     queue: List[tuple[str, int]] = (
         [(u, 1) for u in priority_urls]
-        + [(u, 1) for u in sorted(planned_urls, key=_contact_priority)]
+        + [(u, 1) for u in sorted(
+            _drop_other_language_links(planned_urls, other_lang_prefixes),
+            key=_contact_priority,
+        )]
     )
 
     head = 0
@@ -1351,10 +1550,13 @@ async def crawl_site(
         fetched = await execute_scavenger_scrape(session, page_url)
         html = fetched.get("html") or ""
         method = fetched.get("method", "FAILED")
+        status_code = fetched.get("status_code")
         del fetched
         if not html:
             continue
-        inner_links = await _process_one(page_url, html, method)
+        inner_links = _drop_other_language_links(
+            await _process_one(page_url, html, method, status_code), other_lang_prefixes,
+        )
         del html  # raw HTML freed immediately after processing
 
         if depth < MAX_CRAWL_DEPTH:
@@ -2095,9 +2297,11 @@ async def process_single_lead(
                         "status": "failed", "method": "FAILED"}
             root_method = root["method"]
             root_headers = root.get("headers", {})
+            root_status_code = root.get("status_code")
             crawl = await crawl_site(
                 session, url, root.pop("html"), root_method,
                 root_headers=root_headers,
+                root_status_code=root_status_code,
                 company_name=name or "",
                 country_code=country_code, phone_regex=phone_regex,
                 exclude_keywords=exclude_keywords,

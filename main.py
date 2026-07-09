@@ -5,17 +5,23 @@ One natural-language query runs the whole pipeline:
 
     Step 1  Intent planning        (LLM_planner via phase1_pipeline)
     Step 2  Discovery + scraping   (phase1_pipeline.run_pipeline -> stores raw HTML)
-    Step 3  High-intent routing    (route_filter, per scraped business)
+    Step 3  High-intent routing    (route_planner, per committed business)
     Step 4  Tech Stack Detection   (tech_stack, ONLY if the query's intent needs it)
 
 Usage:
     ./env/bin/python main.py --query "give me 10 marinas in dubai with no mobile apps"
     ./env/bin/python main.py --query "does acme-marina.com use a CRM?"
 
-Step 3 reads each business's persisted link metadata from the storage layer
-(storage/<domain>/links.json — written by the streaming crawler), plus the
-user's query and the knowledge gaps the planner derived (e.g. "no mobile apps"
--> mobile-app signals to look for). Raw HTML is never stored.
+Step 3 reads each business's committed cleaned .txt previews from the storage
+layer (written by the streaming crawler) and picks the highest-intent pages —
+see route_planner.py. Raw HTML is never stored.
+
+Note: this used to call the older route_filter.select_routes_for_site(), a
+second, separate LLM call doing the same job as route_planner.py's Step 5
+(phase1_pipeline.py's own main() already uses route_planner). That duplicate
+LLM layer has been removed — both entry points now go through the same
+route_planner.py. route_filter.py itself is still used (its normalize_urls
+helper is a dependency of route_planner.py), just not its LLM call anymore.
 
 Step 4 is optional and gated entirely by the planner's `needs_tech_stack` flag
 (set only for tech/CRM/CMS/redesign-style questions — see LLM_planner.py). It
@@ -32,7 +38,7 @@ import logging
 from typing import Dict
 
 import phase1_pipeline as p1
-import route_filter as rf
+import route_planner as rp
 
 logger = logging.getLogger("ai_bdm.main")
 
@@ -43,8 +49,6 @@ async def run(query: str, concurrency: int = 5) -> None:
     p1.print_summary(summary)
 
     plan = summary.get("plan") or {}
-    # Knowledge gaps for Step 3 = what the planner says to look for on each site.
-    knowledge_gaps = plan.get("exclude_keywords") or []
 
     # Every distinct business discovered in Step 2 (homepage HTML is in the store).
     businesses: Dict[str, str] = {}
@@ -54,8 +58,7 @@ async def run(query: str, concurrency: int = 5) -> None:
             businesses[website] = r.get("company_name") or ""
 
     print("\n" + "#" * 68)
-    print(f"STEP 3 — HIGH-INTENT ROUTE FILTERING  ({len(businesses)} business(es))")
-    print(f"knowledge gaps: {', '.join(knowledge_gaps) or '(none)'}")
+    print(f"STEP 3 — LLM ROUTE PLANNER  ({len(businesses)} business(es))")
     print("#" * 68)
 
     if not businesses:
@@ -65,20 +68,21 @@ async def run(query: str, concurrency: int = 5) -> None:
     routed = 0
     # domain -> JSON list of that business's high-intent routes (for leads_clean.csv).
     routes: Dict[str, str] = {}
-    for website, name in businesses.items():
-        # Step 3 reads the persisted link metadata (storage/<domain>/links.json)
-        # written by the streaming crawler — no raw HTML is stored or re-parsed.
-        result = rf.select_routes_for_site(website, query, knowledge_gaps)
-        if result is None:
-            logger.info("No stored link metadata for %s — skipping Step 3.", website)
+    entries = list(businesses.items())  # [(website, name), ...], stable order
+    domains = [p1._domain_key(website) for website, _ in entries]
+    plans = await asyncio.gather(
+        *[asyncio.to_thread(rp.plan_routes, d) for d in domains]
+    )
+    for (website, name), domain, plan_result in zip(entries, domains, plans):
+        pages = plan_result.get("selected_pages", [])
+        if not pages:
+            logger.info("No route plan for %s — skipping.", domain)
             continue
         routed += 1
-        routes[p1._domain_key(website)] = json.dumps(result.selected, ensure_ascii=False)
-        print(f"\n■ {name or website}")
-        print(f"    candidates: {len(result.candidate_links)}  |  method: {result.selection_method}")
-        for s in result.selected:
-            print(f"    [{s['priority']}] ({s.get('confidence', '?')}) {s['url']}")
-            print(f"         reason: {s.get('reason', '')}")
+        routes[domain] = json.dumps(pages, ensure_ascii=False, default=str)
+        print(f"\n■ {name or website}  (confidence: {plan_result.get('confidence', '?')})")
+        for s in pages:
+            print(f"    [{s['priority']}] {s['filename']} — {s.get('reason', '')}")
 
     print(f"\nStep 3 complete: routed {routed}/{len(businesses)} business(es).")
 
