@@ -1,0 +1,10 @@
+# Extra dependencies for the RAG layer (Developer B).
+# Install with:  pip install -r rag/requirements-rag.txt
+
+sentence-transformers        # all-MiniLM-L6-v2 embeddings (pulls in torch)
+langchain-text-splitters     # RecursiveCharacterTextSplitter for chunking
+chromadb                     # local dev vector store
+pymongo                      # production store (MongoDB Atlas Vector Search)
+groq                         # LLM client for answer generation
+python-dotenv                # load Groq API key from .env
+pyspellchecker               # offline typo correction before fuzzy word matching

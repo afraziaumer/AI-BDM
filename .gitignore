@@ -12,6 +12,7 @@ __pycache__/
 
 # rag layer — local vector store data (generated)
 rag/.chroma/
+rag/.chroma_eval/
 
 # virtualenvs
 .venv/
@@ -26,6 +27,7 @@ search_state.json
 last_run.json
 site_classifications.json
 leads_clean.csv
+leads_clean.json
 leads_quarantine.csv
 leads_with_linkedin.csv
 data_quality_report.txt
