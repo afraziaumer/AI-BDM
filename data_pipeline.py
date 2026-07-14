@@ -21,6 +21,7 @@ READS them and DERIVES the clean outputs.
 
 Outputs:
   - leads_clean.csv                  readable per-business dataset (no page text)
+  - leads_clean.json                 the SAME per-business dataset, as JSON
   - leads_quarantine.csv             rows rejected by governance + the reason
   - data_quality_report.txt          human-readable, wrapped profiling/report
 
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 import textwrap
@@ -50,6 +52,7 @@ from storage import INDEX_COLUMNS, get_store
 
 RAW_STORE = pp.CRAWL_INDEX_FILE                # crawl_index.csv (metadata only)
 CLEAN_EXPORT = "leads_clean.csv"
+CLEAN_EXPORT_JSON = "leads_clean.json"          # same data as CLEAN_EXPORT, as JSON
 QUARANTINE = "leads_quarantine.csv"
 REPORT = "data_quality_report.txt"
 
@@ -345,6 +348,42 @@ def write_clean_export(businesses: List[Dict[str, Any]], path: str) -> None:
             writer.writerow({c: pp._csv_safe(b.get(c, "")) for c in CLEAN_COLUMNS})
 
 
+# Columns that hold a JSON-encoded string in the CSV (nested list/dict flattened
+# to fit one cell) — for the JSON export these are parsed back into real nested
+# JSON rather than left as double-encoded strings.
+_JSON_ENCODED_COLUMNS = frozenset({"high_intent_pages", "tech_stack"})
+
+
+def _json_field(raw: Any) -> Any:
+    """Parse a JSON-encoded CSV cell back into a real object; None if empty/bad."""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def write_clean_export_json(businesses: List[Dict[str, Any]], path: str) -> None:
+    """Write the same per-business dataset as write_clean_export, as JSON.
+
+    One JSON array, one object per business, same fields as CLEAN_COLUMNS. No
+    pp._csv_safe() here — that escaping guards against spreadsheet formula
+    injection and would corrupt values for a JSON consumer; JSON has no such
+    risk. high_intent_pages/tech_stack are decoded into real nested JSON
+    instead of staying as escaped strings.
+    """
+    records = []
+    for b in businesses:
+        record: Dict[str, Any] = {}
+        for c in CLEAN_COLUMNS:
+            value = b.get(c, "")
+            record[c] = _json_field(value) if c in _JSON_ENCODED_COLUMNS else value
+        records.append(record)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2, default=str)
+
+
 def write_quarantine(rejected_pages: List[Dict[str, str]],
                      invalid_biz: List[Dict[str, Any]], path: str) -> None:
     """Write everything that was dropped/failed, with a reason column."""
@@ -501,12 +540,14 @@ def run(path: str = RAW_STORE, dry_run: bool = False,
         print(f"[report]  {REPORT}")
         return {"valid": len(valid), "invalid": len(invalid)}
 
-    # Derive (read-only on the raw store): clean export, quarantine, report.
+    # Derive (read-only on the raw store): clean export (CSV + JSON), quarantine, report.
     write_clean_export(valid, CLEAN_EXPORT)
+    write_clean_export_json(valid, CLEAN_EXPORT_JSON)
     write_quarantine(rejected, invalid, QUARANTINE)
     write_report(prof, stats, valid, len(rejected), len(invalid), REPORT, last_run)
 
     print(f"[write]   clean export -> {CLEAN_EXPORT}  ({len(valid)} businesses)")
+    print(f"[write]   clean export -> {CLEAN_EXPORT_JSON}  ({len(valid)} businesses)")
     print(f"[write]   quarantine   -> {QUARANTINE}  ({len(rejected)} rows)")
     print(f"[write]   report       -> {REPORT}")
     return {"valid": len(valid), "invalid": len(invalid),
