@@ -10,22 +10,26 @@ actually does?" (products, services, capabilities, projects, company overview
 
 Pipeline:
     crawl_index.csv (per-page metadata) + storage/<domain>/links.json
+    + storage/<domain>/<page>_context.json (page_intelligence.py)
         -> load_page_metadata      (Stage 0: read metadata, no file I/O beyond the index)
         -> build_link_graph        (Stage 0: which pages link to which, in what anchor text)
         -> rule_based_prefilter    (Stage 1: instant discard/boost, NO LLM — cheap)
-        -> build_page_previews     (Stage 2: a lightweight PREVIEW per shortlisted page —
-                                    filename, url, title, word_count, headings, first/last
-                                    2 non-empty lines. NEVER the full page text.)
+        -> build_page_previews     (Stage 2: attach each shortlisted page's page_intelligence
+                                    context JSON — page_type, meta, structure (h1/h2s),
+                                    content (intro/outro), metrics. Falls back to a lightweight
+                                    on-the-fly PREVIEW (headings + first/last 2 lines) only for
+                                    pages crawled before that feature existed. NEVER the full
+                                    page text either way.)
         -> build_prompt            (Stage 3: compact JSON per candidate, keyed by filename)
         -> call_planner_llm        (Stage 3: reuses LLM_planner.get_client/call_llm)
         -> parse_planner_response  (Stage 4: validate, clamp to MIN..MAX_SELECTED pages)
     -> {"selected_pages": [...], "confidence": "high|medium|low"}
 
-The LLM only ever sees previews — filenames, URLs, titles, headings, and a
-handful of lines from the top/bottom of each page. It never sees full page
-text. Full text is something a LATER stage would read, and only for the
-filenames this planner actually selected — reading every page up front is
-exactly what this design avoids.
+The LLM only ever sees the compact page_intelligence context (or, for legacy
+pages, the older lightweight preview) — never full page text. Full text is
+something a LATER stage would read, and only for the filenames this planner
+actually selected — reading every page up front is exactly what this design
+avoids.
 
 Explicitly OUT OF SCOPE (belongs to later stages, not here):
     - embeddings / cosine similarity
@@ -38,6 +42,8 @@ Reuses existing infrastructure instead of duplicating it:
     - phase1_pipeline._domain_key          canonical domain key
     - route_filter.normalize_urls          URL canonicalization (mechanical, not policy)
     - LLM_planner.get_client / call_llm    the shared Groq client + primary/fallback model
+    - page_intelligence.py                 the generic per-page context JSON this stage now
+                                            reads (built during the crawl, NOT by this module)
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -159,11 +166,16 @@ class ScoredCandidate:
     nav_linked: bool
     filename: str             # basename of txt_path, e.g. "about.txt" — the LLM's key
     anchors: List[str] = field(default_factory=list)
-    preview: Optional[PagePreview] = None   # attached in Stage 2 (build_page_previews)
+    preview: Optional[PagePreview] = None   # legacy fallback (attached in build_page_previews)
+    page_context: Optional[Dict[str, Any]] = None  # page_intelligence context JSON, if present
 
     def as_context(self) -> Dict[str, Any]:
-        """Compact preview JSON sent to the LLM — filename + metadata + a few
-        preview lines, NEVER the full page text."""
+        """Compact JSON sent to the LLM — filename + metadata, NEVER the full
+        page text. Prefers the rich page_intelligence context JSON (page
+        type, meta, structure, content, metrics) when the page was crawled
+        with it; falls back to the older headings/head/tail preview for pages
+        crawled before this feature existed, so a mixed-age crawl_index never
+        breaks routing."""
         ctx: Dict[str, Any] = {
             "filename": self.filename,
             "url": self.meta.page_url,
@@ -178,7 +190,34 @@ class ScoredCandidate:
             ctx["anchor_text"] = self.anchors[:3]
         if self.meta.word_count:
             ctx["word_count"] = self.meta.word_count
-        if self.preview:
+
+        pc = self.page_context
+        if pc:
+            # A richer page_type classification than the crawler's own
+            # narrower _page_type() (see page_intelligence.PAGE_TYPES).
+            if pc.get("page_type"):
+                ctx["page_type"] = pc["page_type"]
+            meta = pc.get("meta") or {}
+            if meta.get("description"):
+                ctx["meta_description"] = meta["description"]
+            if meta.get("og_title"):
+                ctx["og_title"] = meta["og_title"]
+            structure = pc.get("structure") or {}
+            if structure.get("h1"):
+                ctx["h1"] = structure["h1"]
+            if structure.get("h2s"):
+                ctx["h2s"] = structure["h2s"]
+            content = pc.get("content") or {}
+            if content.get("intro"):
+                ctx["intro"] = content["intro"]
+            if content.get("outro"):
+                ctx["outro"] = content["outro"]
+            metrics = pc.get("metrics") or {}
+            if metrics.get("reading_time_minutes"):
+                ctx["reading_time_minutes"] = metrics["reading_time_minutes"]
+            if metrics.get("internal_links") is not None:
+                ctx["internal_links"] = metrics["internal_links"]
+        elif self.preview:
             if self.preview.headings:
                 ctx["headings"] = self.preview.headings
             if self.preview.head_preview:
@@ -362,16 +401,24 @@ def _preview_from_text(text: str) -> PagePreview:
     )
 
 
-def build_page_previews(candidates: Sequence[ScoredCandidate]) -> None:
-    """Attach a lightweight PagePreview to every shortlisted candidate.
+def build_page_previews(candidates: Sequence[ScoredCandidate], domain: str) -> None:
+    """Attach page_intelligence's context JSON to every shortlisted candidate
+    when it exists (page type, meta, structure, content, metrics — see
+    page_intelligence.build_page_context) — this is the RICH signal the LLM
+    now routes on, not filenames/URLs alone.
 
-    Reads each candidate's .txt file exactly ONCE and keeps only the preview
-    (headings + first/last lines) — the full text is dropped immediately. This
-    is the core I/O-minimizing design: the LLM decides from previews alone, and
-    only the pages it SELECTS would ever be fully read by a later stage.
+    Falls back to the older on-the-fly PagePreview (headings + first/last
+    lines, one .txt read) only for pages crawled BEFORE this feature existed
+    and so have no "<stem>_context.json" — never breaks routing on a
+    mixed-age crawl_index.
     """
     store = get_store()
     for candidate in candidates:
+        stem = Path(candidate.filename).stem if candidate.filename.endswith(".txt") else candidate.filename
+        ctx = store.read_page_context(domain, f"{stem}_context.json")
+        if ctx:
+            candidate.page_context = ctx
+            continue
         if not candidate.meta.txt_path:
             continue
         text = store.read_page_text(candidate.meta.txt_path)
@@ -384,22 +431,34 @@ def build_page_previews(candidates: Sequence[ScoredCandidate]) -> None:
 # Stage 3 — prompt generation + LLM interaction
 # ===========================================================================
 _PLANNER_SYSTEM_PROMPT = (
-    "You are a WEBSITE ROUTE PLANNER. For each page you are given ONLY a "
-    "lightweight preview — its filename, url, title, headings, and the first "
-    "and last couple of lines. You NEVER see full page text. From these "
-    "previews alone, decide which pages should be fully loaded later because "
-    "they most likely contain important BUSINESS information.\n\n"
+    "You are a WEBSITE ROUTE PLANNER. For each page you are given a compact "
+    "PAGE INTELLIGENCE summary — never the full page text. Most pages carry: "
+    "page_type (a specific classification like 'pricing', 'case_study', "
+    "'services', 'faq' — NOT just the URL slug), title, meta_description, "
+    "og_title, h1, h2s (main headings), intro/outro (real body-content "
+    "excerpts, cookie banners and navigation already stripped out), "
+    "reading_time_minutes and internal_links (metrics), a rule-based 'tier' "
+    "(high/medium/low/unknown), whether it's linked from the homepage, and "
+    "incoming anchor_text from other pages on the SAME site (e.g. \"view "
+    "pricing\", \"contact sales\" — strong intent signals for what OTHER "
+    "pages consider this page to be about). Some pages (crawled before this "
+    "richer signal existed) instead carry only a filename/url/title/headings/"
+    "head+tail preview — use whatever fields are present.\n\n"
+    "Use page_type, title, meta_description, h1/h2s, intro/outro, and "
+    "anchor_text TOGETHER to judge what a page is actually about — never "
+    "rely on the filename or URL slug alone; a URL like '/p/4471' or a vague "
+    "title tells you little, but its page_type, headings, and intro/outro "
+    "usually do.\n\n"
     "Prioritize pages describing: products, services, solutions, capabilities, "
-    "industries, manufacturing, engineering, equipment, technologies, "
+    "pricing, industries, manufacturing, engineering, equipment, technologies, "
     "portfolio, projects, case studies, company overview/about, business "
     "units, markets served, expertise, what the company does.\n"
     "Medium priority: leadership, certifications, sustainability, innovation, "
     "locations.\n"
     "Low priority: careers, news, blog, events, press releases, investors, FAQs.\n"
-    "Each preview also carries a rule-based 'tier' (high/medium/low/unknown) "
-    "and whether the page is linked directly from the homepage — treat these "
-    "as strong hints, not absolute rules; use the filename, title, headings "
-    "and head/tail preview lines to make the final call.\n\n"
+    "Treat 'tier' and 'linked_from_homepage' as strong hints, not absolute "
+    "rules — the richer page_type/content signals should dominate whenever "
+    "they clearly point a different way.\n\n"
     f"Select between {MIN_SELECTED_PAGES} and {MAX_SELECTED_PAGES} pages — "
     "never more. Respond with ONLY valid JSON of exactly this form:\n"
     '{"selected_pages": ["about.txt", "services.txt"], '
@@ -414,11 +473,12 @@ _PLANNER_SYSTEM_PROMPT = (
 
 
 def build_prompt(candidates: Sequence[ScoredCandidate]) -> List[Dict[str, str]]:
-    """Compact preview-per-candidate user message. Only lightweight previews
-    (filenames, titles, headings, a few lines) are sent — never full text."""
+    """Compact page-intelligence-per-candidate user message. Only the compact
+    context JSON (or, for legacy pages, the old lightweight preview) is sent
+    — never full page text."""
     payload = json.dumps([c.as_context() for c in candidates], ensure_ascii=False)
     user_content = (
-        f"Page previews (JSON, {len(candidates)} total):\n{payload}\n\n"
+        f"Page intelligence (JSON, {len(candidates)} total):\n{payload}\n\n"
         "Return the filenames of the pages most likely to describe what this "
         "business actually does."
     )
@@ -623,7 +683,7 @@ def plan_routes(website: str) -> Dict[str, Any]:
     # lightweight preview. The LLM sees only previews (filenames/headings/first
     # + last lines) — never full text, and never every page on the site.
     shortlist = kept[:MAX_LLM_CANDIDATES]
-    build_page_previews(shortlist)
+    build_page_previews(shortlist, domain)
     by_filename = {c.filename: c for c in shortlist}
 
     messages = build_prompt(shortlist)

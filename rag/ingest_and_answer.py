@@ -138,7 +138,8 @@ def main() -> None:
     # its own section with 10 rows and visually looks like "everything came
     # from one site," while a business with just 1-2 chunks gets its own tiny
     # section that's easy to miss even if its match is the single best one.
-    matches = top_matches(query, k=args.k, business=committed_domains)
+    matches = top_matches(query, k=args.k, business=committed_domains,
+                         embedder=pipe.embedder)
     print(f"\nTop {len(matches)} chunk(s) overall, hybrid score "
           f"(semantic + keyword bonus)")
     print("=" * 70)
@@ -162,7 +163,7 @@ def main() -> None:
     # Distinguishes an explicit statement (present/absent) from silence,
     # since silence is not proof of absence.
     all_matches = top_matches(query, k=len(committed_domains) * 10_000,
-                              business=committed_domains)
+                              business=committed_domains, embedder=pipe.embedder)
     focus_word = all_matches[0]["focus_word"] if all_matches else ""
     focus_partner = all_matches[0].get("focus_partner", "") if all_matches else ""
     evidence_by_domain: Dict[str, List[str]] = {}
@@ -191,10 +192,8 @@ def main() -> None:
     if focus_word and (focus_word in _LOCATION_ANCHOR_WORDS or focus_partner in _LOCATION_ANCHOR_WORDS):
         location_related = True
     elif focus_word:
-        from .embedder import Embedder
-        _embedder = Embedder()
-        location_related = _is_location_related(focus_word, _embedder) or \
-            _is_location_related(focus_partner, _embedder)
+        location_related = _is_location_related(focus_word, pipe.embedder) or \
+            _is_location_related(focus_partner, pipe.embedder)
     else:
         location_related = False
     if location_related:

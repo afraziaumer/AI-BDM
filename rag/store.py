@@ -49,12 +49,19 @@ class ChromaStore(VectorStore):
     def add(self, chunks: List[Chunk]) -> None:
         if not chunks:
             return
-        self._col.upsert(
-            ids=[c.chunk_id or f"{c.url}#{c.chunk_no}" for c in chunks],
-            embeddings=[c.embedding for c in chunks],
-            documents=[c.text for c in chunks],
-            metadatas=[c.as_metadata() for c in chunks],
-        )
+        # Chroma's rust binding rejects a single upsert bigger than its max
+        # batch size (a fixed server-side limit, ~5461 in this build) — a
+        # single ingest() with many pages easily produces more chunks than
+        # that, so split into safe-sized batches.
+        max_batch = self._client.get_max_batch_size()
+        for start in range(0, len(chunks), max_batch):
+            batch = chunks[start:start + max_batch]
+            self._col.upsert(
+                ids=[c.chunk_id or f"{c.url}#{c.chunk_no}" for c in batch],
+                embeddings=[c.embedding for c in batch],
+                documents=[c.text for c in batch],
+                metadatas=[c.as_metadata() for c in batch],
+            )
 
     def search(self, query_vector, k=config.TOP_K, where=None) -> List[Chunk]:
         res = self._col.query(

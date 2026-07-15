@@ -34,6 +34,16 @@ class Embedder:
             # require torch to be installed until you actually embed.
             from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(self._model_name)
+            # Every load otherwise makes a live network round-trip to the HF
+            # Hub to check for a newer revision, even when the weights are
+            # already cached locally — on a flaky/firewalled connection this
+            # can hang far longer than the (near-instant) local weight load
+            # itself. Once one load has succeeded in this process, the model
+            # is confirmed cached, so force offline mode for any further
+            # Embedder() instances created in the same run (see
+            # ingest_and_answer.py, which otherwise re-instantiates this
+            # class up to 3-4 times per invocation).
+            os.environ["HF_HUB_OFFLINE"] = "1"
 
     def warmup(self) -> None:
         """Load the model now. Call this BEFORE creating a Chroma store — on

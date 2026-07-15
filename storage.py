@@ -81,6 +81,10 @@ INDEX_COLUMNS: List[str] = [
     "word_count",
     "timestamp",        # ISO-8601 UTC
     "page_type",        # home | contact | about | services | products | blog | legal | other
+    "relevance_category",  # classify_business() verdict: match | unrelated | ...
+    "relevance_reason",     # short LLM reason for that verdict
+    "validated_industry",   # the industry this business was validated against
+    "validated_geo",        # the location this business was validated against
 ]
 
 
@@ -132,6 +136,30 @@ class PageStore(ABC):
         this domain's staged files by commit_domain/discard_domain."""
 
     @abstractmethod
+    def stage_page_context(self, domain: str, page_name: str, context: Dict[str, Any]) -> None:
+        """Stage `<page_name>_context.json` (see page_intelligence.py) next to
+        this page's staged .txt — a generic, reusable per-page semantic
+        summary (page type, meta, structure, content, metrics; anchors filled
+        later by page_intelligence.enrich_anchors). Promoted/discarded with
+        the rest of this domain's staged files by commit_domain/discard_domain."""
+
+    @abstractmethod
+    def read_page_context(self, domain: str, filename: str) -> Optional[Dict[str, Any]]:
+        """Read one COMMITTED page's context JSON by its context filename
+        (e.g. "about_context.json"). None if missing/unreadable."""
+
+    @abstractmethod
+    def write_page_context(self, domain: str, filename: str, context: Dict[str, Any]) -> None:
+        """Overwrite one COMMITTED page's context JSON in place — used by
+        page_intelligence.enrich_anchors to back-fill `anchors` once the
+        whole site's link graph is known (i.e. AFTER commit_domain)."""
+
+    @abstractmethod
+    def list_page_context_filenames(self, domain: str) -> List[str]:
+        """Filenames (e.g. "about_context.json") of every COMMITTED page
+        context file for this domain."""
+
+    @abstractmethod
     def stage_tech_profile(
         self, domain: str, capabilities: Dict, full_profile: Dict
     ) -> None:
@@ -146,12 +174,25 @@ class PageStore(ABC):
 
     # --- lifecycle ---------------------------------------------------------
     @abstractmethod
-    def commit_domain(self, domain: str) -> None:
-        """Promote staged pages to final storage; write links + index rows."""
+    def commit_domain(
+        self, domain: str, extra_fields: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Promote staged pages to final storage; write links + index rows.
+
+        `extra_fields` (e.g. relevance_category/reason, validated_industry/geo)
+        is merged into every buffered index row before it's written — the
+        relevance verdict is only known after the whole crawl finishes, well
+        after each page's row was buffered, so it's attached here at commit
+        time rather than per-page."""
 
     @abstractmethod
     def discard_domain(self, domain: str) -> None:
         """Delete staged pages and buffered metadata for a rejected business."""
+
+    @abstractmethod
+    def retire_domain(self, domain: str) -> None:
+        """Remove an already-committed domain from final storage + the index
+        (a cache-hit that no longer qualifies under re-evaluation)."""
 
     @abstractmethod
     def cleanup_orphaned_staging(self) -> List[str]:
@@ -257,6 +298,37 @@ class LocalPageStore(PageStore):
         # Final path recorded in the index (where the file will live post-commit).
         return str(self._final_dir(domain) / f"{name}.txt")
 
+    def stage_page_context(self, domain: str, page_name: str, context: Dict[str, Any]) -> None:
+        # `page_name` must be the EXACT deduped stem `stage_page` already
+        # picked for this page (e.g. Path(txt_path).stem) — NOT re-deduped
+        # here, so "pricing_context.json" reliably pairs with "pricing.txt".
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{page_name}_context.json").write_text(
+            json.dumps(context, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def read_page_context(self, domain: str, filename: str) -> Optional[Dict[str, Any]]:
+        f = self._final_dir(domain) / filename
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def write_page_context(self, domain: str, filename: str, context: Dict[str, Any]) -> None:
+        f = self._final_dir(domain) / filename
+        f.write_text(
+            json.dumps(context, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def list_page_context_filenames(self, domain: str) -> List[str]:
+        d = self._final_dir(domain)
+        if not d.exists():
+            return []
+        return sorted(p.name for p in d.glob("*_context.json"))
+
     def buffer_index_row(self, domain: str, row: Dict[str, str]) -> None:
         with self._lock:
             self._index_buffers.setdefault(domain, []).append(row)
@@ -293,7 +365,9 @@ class LocalPageStore(PageStore):
         )
 
     # -- lifecycle --
-    def commit_domain(self, domain: str) -> None:
+    def commit_domain(
+        self, domain: str, extra_fields: Optional[Dict[str, str]] = None
+    ) -> None:
         staged = self._staging_dir(domain)
         final = self._final_dir(domain)
         # Move staged text files into final storage (replace any prior copy).
@@ -312,6 +386,8 @@ class LocalPageStore(PageStore):
             (final / "links.json").write_text(
                 json.dumps(links, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+        if extra_fields:
+            rows = [{**row, **extra_fields} for row in rows]
         self._append_index(rows)
 
     def discard_domain(self, domain: str) -> None:
@@ -337,6 +413,31 @@ class LocalPageStore(PageStore):
                 self._page_index_buffers.pop(name, None)
                 self._staged_names.pop(name, None)
         return orphaned
+
+    def retire_domain(self, domain: str) -> None:
+        """Remove a PREVIOUSLY COMMITTED domain from final storage entirely:
+        deletes storage/<domain>/ and drops its rows from crawl_index.csv.
+
+        Used when a cache-hit re-qualification finds that a domain committed
+        under an earlier query (or before a relevance-classifier fix existed)
+        no longer qualifies — it must not keep sitting in final storage where
+        a later, unrelated query could resurface it as a "clean" cached lead."""
+        final = self._final_dir(domain)
+        if final.exists():
+            shutil.rmtree(final, ignore_errors=True)
+        if not self.index_path.exists():
+            return
+        with self._lock:
+            with open(self.index_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            kept = [r for r in rows if r.get("domain") != domain]
+            if len(kept) == len(rows):
+                return
+            with open(self.index_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=INDEX_COLUMNS, extrasaction="ignore")
+                writer.writeheader()
+                for row in kept:
+                    writer.writerow({c: row.get(c, "") for c in INDEX_COLUMNS})
 
     # -- index i/o --
     def _append_index(self, rows: List[Dict[str, str]]) -> None:

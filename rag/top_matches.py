@@ -588,6 +588,7 @@ def top_matches(query: str, k: int = 10,
                 keyword_boost: float = DEFAULT_KEYWORD_BOOST,
                 chroma_dir: Optional[str] = None,
                 collection_name: Optional[str] = None,
+                embedder: Optional[Any] = None,
                 ) -> List[Dict[str, Any]]:
     """Return the top-k chunks closest to `query`, ranked together in ONE
     combined list — never split into per-business sections, so a strong match
@@ -624,13 +625,21 @@ def top_matches(query: str, k: int = 10,
     Set keyword_boost=0 for pure semantic ranking (the old behavior) — this
     also disables the tiering, since it relies on the same match data.
     """
-    # Load torch (via the embedder) BEFORE importing chromadb — on Windows,
-    # chromadb pulls in onnxruntime, and if that initializes before torch the
-    # two libraries' conflicting OpenMP runtimes segfault the process (see
-    # embedder.py / pipeline.py for the same ordering requirement).
-    from .embedder import Embedder
-    embedder = Embedder()
-    embedder.warmup()
+    # Reuse a caller-supplied, already-loaded embedder when given (e.g.
+    # ingest_and_answer.py's single RagPipeline instance) instead of
+    # instantiating a fresh one — each Embedder() reloads the model AND makes
+    # a live HF Hub network check, even when the weights are already cached;
+    # a caller that calls top_matches() more than once (as ingest_and_answer.py
+    # does, twice) must not pay that cost again on every call.
+    if embedder is None:
+        # Load torch (via the embedder) BEFORE importing chromadb — on
+        # Windows, chromadb pulls in onnxruntime, and if that initializes
+        # before torch the two libraries' conflicting OpenMP runtimes segfault
+        # the process (see embedder.py / pipeline.py for the same ordering
+        # requirement).
+        from .embedder import Embedder
+        embedder = Embedder()
+        embedder.warmup()
     query_vector = embedder.embed_one(query)
 
     import chromadb

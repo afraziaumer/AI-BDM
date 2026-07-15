@@ -146,9 +146,22 @@ def _clean_multi(raw: str, is_valid, lower: bool = False) -> str:
 
 
 def clean_rows(
-    rows: List[Dict[str, str]]
+    rows: List[Dict[str, str]],
+    expected_industry: str = "", expected_geo: str = "",
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-    """Normalize fields and drop noisy rows. Returns (clean_pages, rejected)."""
+    """Normalize fields and drop noisy rows. Returns (clean_pages, rejected).
+
+    Defense-in-depth: `expected_industry`/`expected_geo` (the CURRENT query's
+    plan, when known) are cross-checked against each row's persisted
+    `validated_industry`/`validated_geo` (written by phase1_pipeline.py at
+    commit time — see INDEX_COLUMNS in storage.py). A row committed under a
+    different industry/location than what THIS query asked for is rejected
+    here even if it's sitting in the raw index — this is what stops a stale
+    or previously-mis-committed business from resurfacing as a "clean" lead
+    just because it happens to intersect with the current last_run.json scope.
+    A row missing these fields (index predates this check) is not rejected on
+    this basis alone — only on the pre-existing structural noise filters.
+    """
     clean: List[Dict[str, str]] = []
     rejected: List[Dict[str, str]] = []
 
@@ -166,6 +179,21 @@ def clean_rows(
             continue
         if host and dc.is_utility_link(host, pp.urlparse(site).path):
             rejected.append({**r, "_reason": "utility_domain"})
+            continue
+        # --- relevance defense-in-depth --------------------------------------
+        relevance = (r.get("relevance_category") or "").strip().lower()
+        if relevance and relevance != "match":
+            rejected.append({**r, "_reason": f"failed_relevance:{relevance}"})
+            continue
+        if expected_industry and r.get("validated_industry") and (
+            r["validated_industry"].strip().lower() != expected_industry.strip().lower()
+        ):
+            rejected.append({**r, "_reason": "validated_for_different_industry"})
+            continue
+        if expected_geo and r.get("validated_geo") and (
+            r["validated_geo"].strip().lower() != expected_geo.strip().lower()
+        ):
+            rejected.append({**r, "_reason": "validated_for_different_location"})
             continue
 
         # The index stores metadata only; page text lives in storage/*.txt.
@@ -515,7 +543,11 @@ def run(path: str = RAW_STORE, dry_run: bool = False,
             print("[scope]   no last_run.json found — processing entire store.")
 
     prof = profile(raw)
-    clean, rejected = clean_rows(raw)
+    clean, rejected = clean_rows(
+        raw,
+        expected_industry=last_run.get("industry", ""),
+        expected_geo=last_run.get("geo", ""),
+    )
     deduped = dedupe_pages(clean)
     businesses = to_business_level(deduped)
     # Attach Step 3 high-intent pages (JSON list of routes) per business by domain.

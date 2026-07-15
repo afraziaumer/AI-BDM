@@ -212,6 +212,13 @@ NOISE_BRANDS = frozenset({
     "doubleclick", "googlesyndication", "googleadservices", "taboola",
     "outbrain", "adnxs", "apple", "itunes", "microsoft", "whatsapp",
     "telegram", "linktree", "tinyurl", "reklam5",
+    # ubiquitous utility/embed links (sign-in, maps, search, analytics) that
+    # show up on almost every business's site or in directory footers — never
+    # a business candidate for ANY industry/location query, regardless of
+    # what the query is (google.com was previously missing here and got
+    # mined off a directory page, fully deep-crawled, and nearly stored as a
+    # "marina in Dubai"; only its ad-tech subdomains were listed before).
+    "google",
     # job boards / employer reviews (not business directories in this sense)
     "indeed", "glassdoor",
     # food delivery/ordering apps — transactional platforms designed to keep

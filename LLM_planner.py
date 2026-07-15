@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
-from groq import Groq
+from groq import APIStatusError, Groq
 
 
 def get_client() -> Groq:
@@ -23,6 +24,27 @@ def get_client() -> Groq:
     return Groq(api_key=api_key)
 
 
+_CALL_LLM_RETRIES = 2          # attempts per model (1 initial + 1 retry)
+_CALL_LLM_BACKOFF_S = 1.5      # base backoff between retries of the SAME model
+_CALL_LLM_MAX_TOKENS = 4000    # generous cap: the planner's verbose reasoning
+                                # + expanded keyword lists can run long; a too-
+                                # low default cuts the response off mid-JSON,
+                                # which surfaces as a "json_validate_failed" /
+                                # "max completion tokens reached" 400 — not a
+                                # transient error, so retrying it is pointless.
+# Status codes worth retrying the SAME model for: rate limits and server-side
+# errors are transient. 4xx client errors (bad request, invalid JSON schema,
+# auth, not-found) are deterministic — retrying them wastes time and just
+# delays falling through to the fallback model.
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in _RETRYABLE_STATUS_CODES
+    return True  # connection errors, timeouts, etc. — no status_code at all
+
+
 def call_llm(
     client: Groq,
     messages: List[Dict[str, str]],
@@ -32,25 +54,44 @@ def call_llm(
 
     `response_format={"type": "json_object"}` forces strict JSON output (used
     by the planner). Temperature is pinned to 0 for deterministic plans.
+
+    Each model gets up to `_CALL_LLM_RETRIES` attempts with a short backoff
+    before falling through to the next model — but only for TRANSIENT
+    failures (429/5xx/timeouts/connection errors); a deterministic 4xx (e.g.
+    a schema-invalid or truncated JSON response) skips straight to the next
+    model instead of retrying something that will fail identically every
+    time. Callers whose failure mode is "silently treat as unavailable"
+    (e.g. the lead relevance classifier) rely on this to make that failure
+    mode rare, not routine.
     """
     primary_model = "openai/gpt-oss-20b"
     fallback_model = "openai/gpt-oss-120b"
 
-    kwargs: Dict[str, Any] = {"temperature": 0}
+    kwargs: Dict[str, Any] = {
+        "temperature": 0,
+        "max_completion_tokens": _CALL_LLM_MAX_TOKENS,
+    }
     if response_format is not None:
         kwargs["response_format"] = response_format
 
-    try:
-        response = client.chat.completions.create(
-            model=primary_model, messages=messages, **kwargs
-        )
-    except Exception as e:
-        print(f"Primary model failed ({primary_model}): {e}")
-        response = client.chat.completions.create(
-            model=fallback_model, messages=messages, **kwargs
-        )
+    last_exc: Exception | None = None
+    for model in (primary_model, fallback_model):
+        for attempt in range(_CALL_LLM_RETRIES):
+            try:
+                response = client.chat.completions.create(
+                    model=model, messages=messages, **kwargs
+                )
+                return response.choices[0].message.content
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                print(f"Model {model} failed (attempt {attempt + 1}/"
+                      f"{_CALL_LLM_RETRIES}): {e}")
+                if not _is_retryable(e):
+                    break  # deterministic failure — don't retry, try next model
+                if attempt < _CALL_LLM_RETRIES - 1:
+                    time.sleep(_CALL_LLM_BACKOFF_S * (attempt + 1))
 
-    return response.choices[0].message.content
+    raise last_exc  # both models exhausted their retries
 
 
 # System role: explains the WHOLE pipeline to the model so it knows exactly how
@@ -99,7 +140,14 @@ Always qualify them into a 2+ word phrase ("mobile app", "online booking", \
 Decomposition steps you must perform internally before writing JSON:
   A. Identify the core business CATEGORY to search for (singular, generic).
   B. Identify and normalize the LOCATION (city + region/country if inferable).
-  C. Extract the requested COUNT into result_limit (default 20 if none given).
+  C. Extract the requested COUNT. Set `count_explicit` to true ONLY if the \
+user's text itself states a number of businesses (e.g. "50 marinas", "find 10 \
+salons", "give me twenty..."). If NO number appears anywhere in the request \
+(e.g. "find salons in Spain", "marinas in Dubai with no CRM"), set \
+`count_explicit` to false and `result_limit` to 20 — the caller ignores that \
+default value whenever count_explicit is false, so its exact number doesn't \
+matter, but it must still be present and > 0. When count_explicit is true, \
+result_limit MUST be the exact number the user stated.
   D. Detect NEGATIVE constraints (no / without / lacking / excluding / not using) \
 -> exclude_keywords. Expand each per the rule above. Note: business jargon and \
 acronyms count — e.g. "no crm" must expand to "crm", "customer relationship \
@@ -153,6 +201,7 @@ PLANNER_EXAMPLE = {
     "broad_industry": "marina",
     "search_query": "marinas in Miami",
     "result_limit": 20,
+    "count_explicit": False,
     "search_type": "general",
     "target_domain": "",
     "intent": "find_and_filter",
@@ -168,8 +217,11 @@ PLANNER_EXAMPLE = {
     "include_keywords": [],
     "reasoning": (
         "User wants marinas in Miami that do NOT use smart/IoT monitoring "
-        "technology. exclude_keywords cover the realistic surface forms such "
-        "tech uses on marina websites so the Step-5 filter can detect them."
+        "technology. No number of businesses was stated, so count_explicit is "
+        "false and result_limit is a placeholder the caller will ignore in "
+        "favor of its own small default. exclude_keywords cover the realistic "
+        "surface forms such tech uses on marina websites so the Step-5 filter "
+        "can detect them."
     ),
 }
 
@@ -181,7 +233,11 @@ def plan_query(user_query: str) -> Dict[str, Any]:
       geo_location      - normalized place string
       broad_industry    - singular business category to search for
       search_query      - natural Google web-search query for Serper discovery
-      result_limit      - how many businesses to pull (from the query; default 20)
+      result_limit      - how many businesses to pull; meaningful ONLY when
+                          count_explicit is true (the caller substitutes its
+                          own small default otherwise)
+      count_explicit    - True only if the user's own text stated a number of
+                          businesses; False means no count was given at all
       search_type       - "general" (category+place) or "specific" (one business)
       target_domain     - bare domain for a specific search, else ""
       intent            - "find" or "find_and_filter"
@@ -245,8 +301,9 @@ def classify_business(
       unrelated     - not an `industry` business at all
       wrong_location- a real business but NOT in the requested location
 
-    On malformed/uncertain output we default to "match" so a classifier hiccup
-    never silently discards a real lead.
+    On malformed output (unparseable JSON, unexpected category string) this
+    fails CLOSED to "unrelated" — a classifier hiccup must never silently
+    admit a bad lead; it should simply mean one fewer qualified result.
     """
     snippet = (page_text or "")[:1800]  # cap tokens; the gist is near the top
     system = (
@@ -271,7 +328,21 @@ def classify_business(
         "media, unrelated company, error page).\n\n"
         "Be STRICT: if the page lists many different businesses, it is an "
         "aggregator or listicle, never a match. When the location clearly differs "
-        f"from '{geo}', return wrong_location.\n"
+        f"from '{geo}', return wrong_location.\n\n"
+        "WATCH FOR NAME/PLACE COINCIDENCE: the word "
+        f"'{industry}' appearing on the page is NOT enough by itself. It may "
+        "appear only because it's part of a NEIGHBORHOOD, BUILDING, or AREA "
+        f"NAME (e.g. a hotel, restaurant, or shop that happens to be located "
+        f"in a place called 'Marina del Rey' will mention \"marina\" constantly "
+        f"without itself being a marina). Judge by what the business's OWN "
+        f"CORE OFFERING actually is — what it sells or does — not by incidental "
+        f"word overlap with its address, neighborhood, or view. Likewise, a "
+        f"business in a related or adjacent field (e.g. a boat rental/club, a "
+        f"boat tour company, a marine-supply store) is NOT the same as a "
+        f"'{industry}' business unless its own core service literally IS what a "
+        f"'{industry}' provides — return \"unrelated\" for merely adjacent or "
+        "themed businesses, even if boats/water/the industry word feature "
+        "heavily in their marketing copy.\n"
         'Respond with ONLY JSON: {"category": "...", "reason": "<one short line>"}.'
     )
     user = f"BUSINESS NAME: {name}\n\nWEBSITE TEXT:\n{snippet}"
@@ -293,8 +364,84 @@ def classify_business(
 
     category = str(data.get("category", "")).strip().lower()
     if category not in VALID_CATEGORIES:
-        category = "match"
-    return {"category": category, "reason": str(data.get("reason", ""))}
+        # A malformed/unexpected category string is a classifier hiccup, not
+        # evidence the business matches — fail CLOSED (caller's _is_lead()
+        # treats anything other than "match" as not-a-lead), same principle
+        # as the model-unavailable path in phase1_pipeline.classify_relevance.
+        category = "unrelated"
+    return {"category": category, "reason": str(data.get("reason", "")) or "malformed_classifier_output"}
+
+
+def generate_query_variations(
+    user_query: str, industry: str, geo: str, exclude: List[str], max_variations: int = 5
+) -> List[str]:
+    """Generate additional Google search-query variations that preserve the
+    SAME industry + location intent as the original request — used ONLY when
+    the original query's discovery has been fully exhausted and more
+    candidates are still needed to reach an explicitly-requested count.
+
+    NEVER broadens the industry or the country/region: a variation may vary
+    phrasing/synonyms, add search operators (e.g. "site:.es"), or narrow to
+    specific well-known cities within the SAME requested location — never
+    widen to a different industry or a different country.
+
+    Returns up to `max_variations` new query strings not already in `exclude`
+    (case-insensitive). Raises on failure (missing client, bad response) —
+    the caller degrades to "no more variations" (treats discovery as
+    genuinely exhausted) rather than ever broadening scope to compensate.
+    """
+    exclude_lower = {q.strip().lower() for q in exclude}
+    system = (
+        "You generate ADDITIONAL Google search queries for a B2B lead-generation "
+        "crawler whose first search query didn't turn up enough real businesses. "
+        f"The user wants '{industry}' businesses located in '{geo}' — every "
+        "variation you produce MUST preserve exactly that industry and exactly "
+        "that location/country. NEVER broaden the industry (e.g. don't widen "
+        "'hair salon' to 'beauty business') and NEVER broaden the location (e.g. "
+        "don't widen 'Spain' to 'Europe', don't switch to a different country). "
+        f"You MAY narrow the location to specific well-known cities within "
+        f"'{geo}', vary the industry phrasing with close synonyms, or add search "
+        'operators (e.g. "site:.es").\n\n'
+        "Respond with ONLY valid JSON of exactly this form: "
+        '{"variations": ["query one", "query two", ...]}\n'
+        f"Produce up to {max_variations} variations, each a short natural Google "
+        "search query (no explanation, no surrounding quotes)."
+    )
+    user = (
+        f"Original request: {user_query}\n"
+        f"Already-tried search queries (do not repeat these): "
+        f"{json.dumps(exclude, ensure_ascii=False)}"
+    )
+
+    client = get_client()
+    text = call_llm(
+        client,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+    )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        data = json.loads(text[start : end + 1]) if start != -1 and end > start else {}
+
+    raw_variations = data.get("variations")
+    if not isinstance(raw_variations, list):
+        return []
+    variations: List[str] = []
+    for v in raw_variations:
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if v and v.lower() not in exclude_lower:
+            exclude_lower.add(v.lower())
+            variations.append(v)
+        if len(variations) >= max_variations:
+            break
+    return variations
 
 
 def main() -> None:
