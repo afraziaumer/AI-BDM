@@ -131,6 +131,16 @@ async def run_pipeline_endpoint(req: PipelineRequest) -> Dict[str, Any]:
     summary = await pipeline.run_pipeline(
         req.query, concurrency=req.concurrency
     )
+    if summary.get("blocked"):
+        # Query rejected by the moderation gate -- a client-side problem
+        # with the REQUEST itself, not a server/upstream failure, so 400
+        # (not 502) is the correct status. Detail is deliberately short and
+        # generic -- the specific category/reason stays in the server log
+        # (see moderate_user_query), not handed back to the caller.
+        raise HTTPException(
+            status_code=400,
+            detail="This request violates our usage policy and was not processed.",
+        )
     if summary.get("error"):
         # Intent/LLM stage failed (e.g. provider down) -> surface as 502.
         raise HTTPException(status_code=502, detail=summary["error"])

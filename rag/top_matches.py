@@ -90,6 +90,7 @@ Run (from the project root):
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import re
 import sys
@@ -174,6 +175,37 @@ MIN_FUZZY_SIMILARITY = 0.60   # cosine similarity threshold for treating two
                               # while keeping genuine matches like
                               # "application" (0.73) and "android" (0.675).
 
+STEM_MATCH_STRENGTH = 0.9    # confidence assigned to a same-root match found
+                              # via suffix-stripping (see _word_stem) when
+                              # neither literal nor fuzzy matching fired.
+                              # Near-literal, not 1.0, since it's a heuristic,
+                              # not a guaranteed match.
+
+_STEM_SUFFIXES = ("ing", "edly", "ed", "es", "s")
+
+
+def _word_stem(word: str) -> str:
+    """Strip common English suffixes to find a word's root, independent of
+    embedding-based meaning-similarity. Exists because fuzzy matching can
+    MISS genuinely same-root words when one form has a dominant, unrelated
+    common sense that pulls its embedding away from the other form's meaning
+    -- e.g. "book" (the noun, a physical book) vs "booking" (a reservation):
+    measured similarity is only 0.356, far below MIN_FUZZY_SIMILARITY, even
+    though "Book online" and "no online booking" are obviously the same
+    concept to a person. "booked" (0.801) has no such ambiguity and already
+    matches fine via the embedding path -- this stemming fallback exists
+    specifically for the words embeddings get wrong this way. Deliberately
+    simple (not a full linguistic stemmer): good enough to unify common
+    grammatical variants (book/books/booked/booking), not meant to be
+    perfect for every irregular form.
+    """
+    w = word.lower()
+    for suffix in _STEM_SUFFIXES:
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            return w[: -len(suffix)]
+    return w
+
+
 # Generic English negation cues — same category as _STOPWORDS, not specific to
 # any business/industry/query. "n't" is checked separately since the word
 # tokenizer (_WORD_RE) splits on apostrophes, so "doesn't"/"isn't"/"won't"
@@ -254,6 +286,19 @@ FOCUS_SEMANTIC_WEIGHT = 0.55
 SATURATION_START = 0.35
 SATURATION_FULL = 0.80
 
+# Minimum cosine similarity a chain word's OWN embedding must have to the
+# FULL PHRASE's embedding to be trusted as a standalone corroboration
+# partner (see focus_partner selection in top_matches()). A word being
+# merely "less rare than its chain-mates" isn't enough -- "online" is common
+# in restaurant copy but only weakly represents "online table reservation
+# system" on its own (measured 0.267: it's just as often "order food
+# online"), while "table" (0.527) or the validated "office" in "physical
+# office" (0.702) genuinely stand in for the fuller concept alone. Doc-
+# frequency/saturation alone can't tell these apart (both "online" and
+# "office" are moderately common words) -- only checking against the
+# PHRASE's own meaning can.
+PARTNER_PHRASE_SIMILARITY_MIN = 0.35
+
 
 def _significant_words(text: str) -> Set[str]:
     """Lowercase words (3+ chars), stopwords removed — the query's real signal."""
@@ -279,27 +324,70 @@ def _query_bigrams(query: str) -> List[tuple[str, str]]:
     return [(a, b) for a, b in zip(tokens, tokens[1:]) if _sig(a) and _sig(b)]
 
 
-def _phrase_proximity_match(text_lower: str, word_a: str, word_b: str,
-                            window_chars: int = NEGATION_WINDOW_CHARS) -> bool:
-    """True if `word_a` and `word_b` (the actual matched words in a chunk --
-    literal or fuzzy) occur within `window_chars` of each other ANYWHERE in
-    the text. A phrase-gate check that only asks "are both words present
-    somewhere in this chunk" is not enough: two words can each genuinely
-    appear in a short chunk while describing two UNRELATED things (e.g. a
-    chunk mentioning both "a physical certificate" and "our office address"
-    is not evidence of a "physical office"). Requiring them to sit near each
-    other is a much better proxy for "these words are actually being used
-    together as one concept," the same proximity-heuristic spirit as
-    negation detection elsewhere in this file.
+def _merge_bigrams_into_chains(bigrams: List[tuple[str, str]]) -> List[List[str]]:
+    """Merge overlapping adjacent-word pairs into contiguous phrase CHAINS.
+
+    A query's real ask is often more than two words -- "no user login
+    system" produces two overlapping bigrams, ("user","login") and
+    ("login","system"), sharing "login". Treating these as two independent
+    2-word phrases (the old behavior) loses information: one word gets
+    chosen as "the focus" and at most ONE other becomes its partner, leaving
+    a third chained word effectively orphaned. Merging them into one chain
+    -- ["user", "login", "system"] -- lets the rest of this file treat the
+    query's ENTIRE compound ask as a single concept, of whatever length it
+    actually is (1 word if there's no chain at all, 2, 3, or more).
     """
-    if not word_a or not word_b:
+    chains: List[List[str]] = []
+    for a, b in bigrams:
+        attached = False
+        for chain in chains:
+            if chain[-1] == a:
+                chain.append(b)
+                attached = True
+                break
+            if chain[0] == b:
+                chain.insert(0, a)
+                attached = True
+                break
+        if not attached:
+            chains.append([a, b])
+    return chains
+
+
+def _phrase_proximity_match(text_lower: str, words: List[str],
+                            window_chars: int = NEGATION_WINDOW_CHARS) -> bool:
+    """True if ALL given words (the actual matched words in a chunk --
+    literal, fuzzy, or stemmed) occur together, with some combination of
+    their positions all falling within one `window_chars` span of each
+    other, ANYWHERE in the text. A phrase-gate check that only asks "are
+    these words present somewhere in this chunk" is not enough: several
+    words can each genuinely appear in a short chunk while describing
+    UNRELATED things (e.g. a chunk mentioning both "a physical certificate"
+    and "our office address" is not evidence of a "physical office").
+    Requiring them to sit near each other is a much better proxy for "these
+    words are actually being used together as one concept," the same
+    proximity-heuristic spirit as negation detection elsewhere in this file.
+
+    Generalizes the old 2-word-only version -- for exactly 2 words this is
+    byte-for-byte the same check as before (same default window), so it's a
+    strict extension, not a behavior change, for already-validated 2-word
+    phrases like "physical office".
+    """
+    if not words or any(not w for w in words):
         return False
     try:
-        positions_a = [m.start() for m in re.finditer(rf"\b{re.escape(word_a)}\b", text_lower)]
-        positions_b = [m.start() for m in re.finditer(rf"\b{re.escape(word_b)}\b", text_lower)]
+        positions_per_word = []
+        for w in words:
+            positions = [m.start() for m in re.finditer(rf"\b{re.escape(w)}\b", text_lower)]
+            if not positions:
+                return False
+            positions_per_word.append(positions)
     except re.error:
         return False
-    return any(abs(a - b) <= window_chars for a in positions_a for b in positions_b)
+    for combo in itertools.product(*positions_per_word):
+        if max(combo) - min(combo) <= window_chars:
+            return True
+    return False
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -412,6 +500,15 @@ def _match_strengths(query_words: Set[str], docs: List[str], embedder,
                         if sim > best:
                             best, best_word = sim, w
                 s, matched_word = (best, best_word) if best >= MIN_FUZZY_SIMILARITY else (0.0, "")
+                if s <= 0:
+                    # Fuzzy matching found nothing -- try same-root stemming
+                    # as a last resort (catches "book"/"booking" style cases
+                    # embeddings get wrong; see _word_stem's docstring).
+                    q_stem = _word_stem(q)
+                    for w in words:
+                        if w != q and _word_stem(w) == q_stem:
+                            s, matched_word = STEM_MATCH_STRENGTH, w
+                            break
 
             mismatch = False
             if s > 0:
@@ -545,7 +642,7 @@ def _keyword_bonus_for_chunk(doc_idx: int, query_words: Set[str],
                 partner_vals[doc_idx] if doc_idx < len(partner_vals) else (0.0, "", False)
             )
             if partner_s <= 0 or not _phrase_proximity_match(
-                text_lower, matched_word, partner_matched_word
+                text_lower, [matched_word, partner_matched_word]
             ):
                 # No NEARBY sign of its phrase partner -- weaker evidence
                 # (dampened, not dropped: the generic word can still be
@@ -703,38 +800,49 @@ def top_matches(query: str, k: int = 10,
     # concept).
     bigrams = _query_bigrams(query)
     phrase_words = {w for pair in bigrams for w in pair}
+    # Merge overlapping bigrams into full CHAINS -- "no user login system"
+    # produces two overlapping pairs sharing "login"; merged, that's one
+    # 3-word chain, not two independent 2-word phrases (see
+    # _merge_bigrams_into_chains's docstring for why this matters).
+    chains = _merge_bigrams_into_chains(bigrams)
 
-    # For each adjacent word-pair the query used as a phrase (e.g. "new
-    # york"), the word with the LOWER idf_weight (more common across this
-    # candidate set -> more likely being used in its ordinary, generic sense
-    # rather than as part of the specific phrase) gets gated behind requiring
-    # its rarer partner to also match NEARBY in the same chunk (computed
-    # BEFORE focus-word selection below, since the fallback there needs it).
-    # The rarer partner is never gated, so a standalone match on it (e.g.
+    # Within each chain, every word maps to that chain's own ANCHOR (its
+    # highest-idf/rarest member) -- for a 2-word chain this is identical to
+    # the old generic->rare pair mapping; for a 3+-word chain ("online
+    # booking system"), EVERY non-anchor word (not just one) gets gated
+    # behind the SAME shared anchor, requiring it to also match NEARBY in
+    # the same chunk (see _phrase_proximity_match, computed BEFORE
+    # focus-word selection below since the fallback there needs it). The
+    # anchor itself is never gated, so a standalone match on it (e.g.
     # "york" fuzzy-matching "NYC") is untouched.
     phrase_gate: Dict[str, str] = {}
-    for w1, w2 in bigrams:
-        if w1 not in idf_weights or w2 not in idf_weights or w1 == w2:
+    for chain in chains:
+        valid_chain = [w for w in chain if w in idf_weights]
+        if len(valid_chain) < 2:
             continue
-        generic, rare = (w1, w2) if idf_weights[w1] < idf_weights[w2] else (w2, w1)
-        phrase_gate[generic] = rare
+        anchor = max(valid_chain, key=lambda w: idf_weights[w])
+        for w in valid_chain:
+            if w != anchor:
+                phrase_gate[w] = anchor
 
-    # FOCUS-SEMANTIC: the query's single most discriminating term (highest
-    # post-saturation weight among NON-phrase words -- here "app", not the
-    # saturated "marina" nor the location word "york"). Each chunk is scored by
-    # MEANING-similarity to it, lifting chunks that are about that concept even
-    # in different words ("application", "platform", "digital portal").
-    # Requires stored chunk embeddings; degrades gracefully to no lift if the
-    # store didn't return them.
+    # FOCUS-SEMANTIC: the query's real ask, as a WHOLE PHRASE of however many
+    # words it actually is -- 1 word for "no app", 2 for "no physical
+    # office", 3+ for "no online booking system" -- not a single word picked
+    # by IDF-rarity with at most one bolted-on partner (the old design, which
+    # left additional chained words orphaned and let a generic word like
+    # "system" alone become "the focus," exactly the kind of word already
+    # found colliding with unrelated text like "service"). Each chunk is
+    # scored by MEANING-similarity to the FULL PHRASE (embedded as one
+    # string below), lifting chunks that are about that concept even in
+    # different words.
     # A query-NEGATED word ("no user login system" -> "user"/"login"/"system"
     # each sit right after "no") is a direct, explicit signal for "this is
     # the feature being asked about" -- a much stronger signal than mere
     # IDF-rarity. Prefer these first: without this, a query whose entire real
-    # ask is a multi-word chain ("user login system" -> TWO overlapping
-    # bigrams: "user"+"login", "login"+"system") gets ALL of its real-ask
-    # words excluded as "phrase words" by the block below, leaving only an
-    # unrelated non-chained word (e.g. "miami", the location FILTER) to win
-    # by elimination -- exactly backwards from what the query intended.
+    # ask is a multi-word chain gets ALL of its real-ask words excluded as
+    # "phrase words" by the block below, leaving only an unrelated
+    # non-chained word (e.g. "miami", the location FILTER) to win by
+    # elimination -- exactly backwards from what the query intended.
     negated_non_phrase = {w: iw for w, iw in idf_weights.items()
                           if w not in phrase_words and query_negation.get(w, False)}
     negated_any = {w: iw for w, iw in idf_weights.items() if query_negation.get(w, False)}
@@ -742,31 +850,54 @@ def top_matches(query: str, k: int = 10,
     if negated_non_phrase:
         focus_candidates = negated_non_phrase
     elif negated_any:
-        # Every negated word got swept into a phrase pair too -- still prefer
-        # one of THEM over a non-negated, unrelated word.
+        # Every negated word got swept into a phrase chain too -- still
+        # prefer one of THEM over a non-negated, unrelated word.
         focus_candidates = negated_any
     elif not focus_candidates:
         # No negated word at all, AND every significant query word got swept
-        # into a phrase pair (e.g. "no physical office" chains with "new
+        # into a phrase chain (e.g. "no physical office" chains with "new
         # york" and "driving schools" -- short natural-language queries are
         # often ALL adjacent pairs). There is no word outside a phrase left
         # to pick. Falling back to the full idf_weights (old behavior) would
-        # silently re-admit each phrase's GENERIC member too (e.g. "office",
+        # silently re-admit each chain's GENERIC members too (e.g. "office",
         # "new") -- exactly what phrase exclusion exists to prevent. Instead
-        # fall back to only the RARE half of each phrase pair -- the
-        # never-gated partner that already carries real discriminating
-        # signal on its own.
-        focus_candidates = {w: idf_weights[w] for w in phrase_gate.values() if w in idf_weights}
+        # fall back to only each chain's own ANCHOR -- the never-gated
+        # member that already carries real discriminating signal on its own.
+        focus_candidates = {w: idf_weights[w] for w in set(phrase_gate.values()) if w in idf_weights}
     focus_pool = focus_candidates or idf_weights  # absolute last resort
     focus_word = max(focus_pool, key=focus_pool.get) if focus_pool else None
-    focus_vec = embedder.embed_one(focus_word) if focus_word else None
-    # If the chosen focus word is itself the rare half of a phrase pair (e.g.
-    # "physical" in "physical office"), a bare match on it alone isn't
-    # reliable evidence for the full two-word concept -- its partner must
-    # also match NEAR it in the same chunk (see _phrase_proximity_match),
-    # checked per-chunk below.
-    _rare_to_generic = {rare: generic for generic, rare in phrase_gate.items()}
-    focus_partner = _rare_to_generic.get(focus_word)
+
+    # The full chain the chosen focus_word belongs to (if any) -- this IS
+    # "the whole phrase," used for the semantic embedding below and for
+    # requiring ALL of its members to be present (not just the anchor alone)
+    # before crediting a chunk with real evidence. A focus_word with no
+    # chain (a true single-word ask like "app") gets a length-1 chain of
+    # itself, so a lone word is just the N=1 case of the same mechanism, not
+    # a separately maintained code path.
+    ask_chain = next((c for c in chains if focus_word in c), [focus_word] if focus_word else [])
+    focus_phrase = " ".join(ask_chain) if ask_chain else (focus_word or "")
+    focus_vec = embedder.embed_one(focus_phrase) if focus_phrase else None
+    # The single most GENERIC other member of ask_chain (lowest idf, if any)
+    # -- kept for the cross-page corroboration mechanism in
+    # ingest_and_answer.py, which trusts a standalone match on this ONE word
+    # if it repeats across multiple of a business's own pages (e.g. "office"
+    # mentioned on 4 different pages of a "physical office" search).
+    #
+    # Eligibility requires the word's OWN embedding to be a decent semantic
+    # stand-in for the FULL PHRASE (see PARTNER_PHRASE_SIMILARITY_MIN) --
+    # merely being "less rare than its chain-mates" isn't enough. Doc-
+    # frequency/rarity alone can't tell "office" (specific, safe to trust
+    # alone) apart from "online" (comparably common, but overloaded --
+    # "order food online" is just as common a use as "book online," so
+    # repeated appearances prove nothing about the specific compound concept
+    # being asked about); only checking against the phrase's own meaning can.
+    _other_chain_members = [w for w in ask_chain if w != focus_word and w in idf_weights]
+    _eligible_partners = [
+        w for w in _other_chain_members
+        if focus_vec is not None
+        and _cosine(embedder.embed_one(w), focus_vec) >= PARTNER_PHRASE_SIMILARITY_MIN
+    ]
+    focus_partner = min(_eligible_partners, key=lambda w: idf_weights[w]) if _eligible_partners else None
 
     results = []
     for doc_idx, (text, meta, dist) in enumerate(zip(docs, metas, dists)):
@@ -798,20 +929,35 @@ def top_matches(query: str, k: int = 10,
             # gets tiered above no-signal filler; polarity only affects HOW
             # much it's lifted, via the existing mismatch penalty below.
             has_focus_signal = fs > 0
-            if has_focus_signal and focus_partner:
-                # focus_word is the rare half of a two-word phrase ask (e.g.
-                # "physical" in "physical office") -- require its partner to
-                # ALSO match NEAR it in this chunk, or this is likely two
+            if has_focus_signal and len(ask_chain) > 1:
+                # focus_word is (part of) a multi-word phrase ask -- a bare
+                # match on it alone isn't reliable evidence for the FULL
+                # concept; EVERY other word in the chain must ALSO match,
+                # clustered near it in this same chunk (see
+                # _phrase_proximity_match), or this is likely several
                 # unrelated occurrences sharing a chunk by coincidence (e.g.
                 # "a physical certificate" ... "our office address"). Solo
                 # occurrences still nudge ranking a little (dampened lift),
                 # but do NOT count as EVIDENCE (has_focus_signal stays False,
                 # so the per-business summary won't claim confirmed_present/
                 # absent off a coincidental, unrelated word match).
-                pvals = strengths.get(focus_partner, [])
-                ps, partner_matched_word, _ = pvals[doc_idx] if doc_idx < len(pvals) else (0.0, "", False)
-                if ps <= 0 or not _phrase_proximity_match(
-                    text_lower, focus_matched_word, partner_matched_word
+                chain_matched_words = [focus_matched_word]
+                all_present = True
+                for other in ask_chain:
+                    if other == focus_word:
+                        continue
+                    ovals = strengths.get(other, [])
+                    other_s, other_mw, _ = ovals[doc_idx] if doc_idx < len(ovals) else (0.0, "", False)
+                    if other_s <= 0:
+                        all_present = False
+                        break
+                    chain_matched_words.append(other_mw)
+                # Window scales with chain length -- a 3-word phrase
+                # naturally spans more characters than a 2-word one; the
+                # 2-word case keeps EXACTLY the old default window.
+                window = NEGATION_WINDOW_CHARS * max(1, len(ask_chain) - 1)
+                if not all_present or not _phrase_proximity_match(
+                    text_lower, chain_matched_words, window_chars=window
                 ):
                     has_focus_signal = False
                     focus_lift *= PHRASE_SOLO_WEIGHT
@@ -840,20 +986,28 @@ def top_matches(query: str, k: int = 10,
         # using a word the same way across several of its own pages is a much
         # stronger signal than one coincidental mention.
         #
-        # Requires a LITERAL match only (matched_word == focus_partner), not
-        # fuzzy -- fuzzy word-similarity is inherently less certain, and a
-        # fuzzy false positive (e.g. "system"~"service" = 0.62, just over the
-        # fuzzy threshold) can repeat across many pages NATURALLY, simply
-        # because the confused word ("service") is itself common generic
-        # business copy. Repetition alone doesn't distinguish a genuine
-        # pattern from a systematic embedding error -- only a literal match
-        # is unambiguous enough to trust as standalone, corroborated evidence.
+        # Requires a LITERAL or STEM match (matched_word == focus_partner, or
+        # same word root -- e.g. "book" for "booking"), not FUZZY -- fuzzy
+        # word-similarity is inherently less certain, and a fuzzy false
+        # positive (e.g. "system"~"service" = 0.62, just over the fuzzy
+        # threshold) can repeat across many pages NATURALLY, simply because
+        # the confused word ("service") is itself common generic business
+        # copy. Repetition alone doesn't distinguish a genuine pattern from a
+        # systematic embedding error. Stemming is a DIFFERENT, higher-
+        # confidence mechanism than fuzzy matching though -- it only fires
+        # for genuine same-root grammatical variants (see _word_stem), not
+        # coincidental meaning-similarity, so it's trusted the same way a
+        # literal match is: "Book Your Appointment" repeated across a
+        # business's own pages is exactly the kind of real, corroborated
+        # evidence this mechanism exists to catch.
         partner_has_signal = False
         partner_evidence = "no_evidence"
         if focus_partner:
             pvals = strengths.get(focus_partner, [])
             ps, pmw, p_mismatch = pvals[doc_idx] if doc_idx < len(pvals) else (0.0, "", False)
-            partner_has_signal = ps > 0 and pmw == focus_partner
+            partner_has_signal = ps > 0 and (
+                pmw == focus_partner or _word_stem(pmw) == _word_stem(focus_partner)
+            )
             if partner_has_signal:
                 p_negated = p_mismatch != query_negation.get(focus_partner, False)
                 partner_evidence = "confirmed_absent" if p_negated else "confirmed_present"
@@ -864,6 +1018,7 @@ def top_matches(query: str, k: int = 10,
             "keyword_bonus": bonus,
             "focus_lift": focus_lift,
             "focus_word": focus_word or "",
+            "focus_phrase": focus_phrase or "",
             "has_focus_signal": has_focus_signal,
             "focus_evidence": focus_evidence,
             "focus_partner": focus_partner or "",
@@ -884,7 +1039,25 @@ def top_matches(query: str, k: int = 10,
     # actually addressing the query's real question -- positive or negative --
     # outranks chunks that don't address it at all, regardless of how high
     # their raw semantic score happens to be in a dense, single-topic corpus.
-    results.sort(key=lambda r: (r["has_focus_signal"], r["score"]), reverse=True)
+    #
+    # `partner_has_signal` chunks (a standalone match on the phrase partner,
+    # e.g. "appointment" without "booking" nearby) are ALSO real evidence --
+    # this is exactly what the per-business summary's cross-page
+    # corroboration relies on (see ingest_and_answer.py) to confirm a
+    # business. Without including it here, the chunk that actually PROVES a
+    # "CONFIRMED PRESENT"/"CONFIRMED ABSENT" verdict could rank far outside
+    # the visible top-k, so a reader would see the verdict but never the
+    # evidence behind it. Ranked below true has_focus_signal matches (a
+    # direct/proximate hit is stronger than a standalone partner mention),
+    # both tiers rank above chunks with neither.
+    results.sort(
+        key=lambda r: (
+            r["has_focus_signal"] or r["partner_has_signal"],
+            r["has_focus_signal"],
+            r["score"],
+        ),
+        reverse=True,
+    )
     return results[:k]
 
 
@@ -932,7 +1105,8 @@ def main() -> None:
     for rank, m in enumerate(matches, 1):
         print(f"\n[{rank}] score={m['score']:.4f}  "
               f"(semantic={m['semantic_score']:.4f} + keyword={m['keyword_bonus']:.4f} "
-              f"+ focus[{m.get('focus_word','')}]={m.get('focus_lift', 0.0):.4f})  "
+              f"+ focus[{m.get('focus_phrase') or m.get('focus_word','')}]="
+              f"{m.get('focus_lift', 0.0):.4f})  "
               f"evidence={m.get('focus_evidence', 'no_evidence')}  "
               f"domain={m['domain']}  chunk={m['chunk_no']}")
         if m["matched_keywords"]:

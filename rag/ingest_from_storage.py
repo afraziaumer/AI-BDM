@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict, Iterator, Optional
@@ -33,6 +34,52 @@ from collections import Counter
 from .contract import SourceDoc
 
 DEFAULT_LEADS_JSON = "leads_clean.json"
+
+# Unambiguous cookie-CONSENT-widget vocabulary -- deliberately specific
+# phrases, not the bare word "cookie" (also a legitimate food/bakery business
+# term), so a cookie shop's own page text is never touched.
+_COOKIE_CONSENT_MARKERS = (
+    "necessary cookies", "functional cookies", "analytical cookies",
+    "advertisement cookies", "performance cookies", "targeting cookies",
+    "strictly necessary cookies", "accept all cookies", "reject all",
+    "manage cookie preferences", "cookie preference", "consent preference",
+    "cookie policy", "cookie settings", "collecting feedback, and enabling third-party tools",
+    "track visitor interactions", "personalized ads based on your previous visits",
+)
+_COOKIE_CATEGORY_HEADING_RE = re.compile(
+    r"^(necessary|functional|analytical|advertisement|performance|targeting|marketing|"
+    r"strictly necessary)\s+cookies$",
+    re.IGNORECASE,
+)
+
+
+def _strip_cookie_consent_boilerplate(content: str) -> str:
+    """Remove a cookie-consent/GDPR widget's text from a SINGLE page, before
+    any cross-page comparison happens.
+
+    _strip_repeated_boilerplate (below) only catches chrome repeated across
+    2+ of a business's OWN high-intent pages -- but a cookie-consent panel is
+    often injected on just one crawled page (e.g. only the homepage), so
+    cross-page repetition alone never flags it. Left in, a long consent block
+    gets split across several chunks by the chunker, and each of those chunks
+    inherits the page's title context (e.g. "Gym in Lahore") in its embedding,
+    letting pure legal boilerplate rank alongside -- or even above -- chunks
+    that actually describe the business, simply by matching generic query
+    words like the city name.
+
+    Detection is deliberately narrow and phrase-specific, not the bare word
+    "cookie" -- see _COOKIE_CONSENT_MARKERS's docstring note above.
+    """
+    kept = []
+    for ln in content.splitlines():
+        stripped = ln.strip()
+        low = stripped.lower()
+        if _COOKIE_CATEGORY_HEADING_RE.match(stripped):
+            continue
+        if any(marker in low for marker in _COOKIE_CONSENT_MARKERS):
+            continue
+        kept.append(ln)
+    return "\n".join(kept)
 
 
 def _strip_repeated_boilerplate(page_contents: List[str]) -> List[str]:
@@ -175,7 +222,7 @@ def iter_source_docs_from_high_intent(
             url = page.get("url", "")
             if not txt_path:
                 continue
-            content = store.read_page_text(txt_path)
+            content = _strip_cookie_consent_boilerplate(store.read_page_text(txt_path))
             if not content.strip():
                 continue
             raw_pages.append((url, content))

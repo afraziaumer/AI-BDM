@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 from email_extractor import EmailExtractor
 
 # Reuse the already-tested Step-1 planner instead of duplicating LLM logic.
-from LLM_planner import plan_query, classify_business, generate_query_variations
+from LLM_planner import plan_query, classify_business, generate_query_variations, moderate_query
 
 # Generic, reusable per-page semantic summary (page type, meta, structure,
 # content, anchors, metrics) — built once per crawled page, consumed by the
@@ -309,13 +309,14 @@ LEAD_FILTERING_ENABLED = True
 # if you deliberately want directories treated as businesses.
 ENABLE_WEBSITE_CLASSIFIER = True
 
-# LLM Crawl Planner (crawl_planner.py) is DISABLED for now — AI-BDM should
-# become a long-term knowledge base: every internal page that passes the
-# existing crawler constraints (MAX_PAGES_PER_SITE, MAX_CRAWL_DEPTH, noise
-# filtering, etc. — unchanged) is crawled, not just the pages an LLM judged
-# relevant to the CURRENT query. The code is untouched; flip this back to True
-# to re-enable query-scoped, credit-efficient crawling.
-ENABLE_CRAWL_PLANNER = False
+# LLM Crawl Planner (crawl_planner.py) is ENABLED — trades some knowledge-base
+# completeness (only the LLM-judged query-relevant pages get crawled, not
+# every internal page) for a large reduction in per-business scrape time and
+# Scrape.do credit usage: fewer pages fetched per site means fewer paid Tier-2
+# calls, the slowest operation in the pipeline. Flip back to False to return
+# to crawling every page that passes MAX_PAGES_PER_SITE/MAX_CRAWL_DEPTH/noise
+# filtering, unchanged, for a more durable long-term knowledge base instead.
+ENABLE_CRAWL_PLANNER = True
 
 # When True, each chosen email's domain is MX-validated (DNS only, no mail sent)
 # before it is accepted. Undeliverable/dead domains are dropped, so stored emails
@@ -436,6 +437,24 @@ ANTI_BOT_SIGNATURES = [
     "cf-browser-verification",
     "attention required",
 ]
+
+# === Step 0: Query moderation ===============================================
+async def moderate_user_query(user_prompt: str) -> Dict[str, Any]:
+    """Block a policy-violating query BEFORE any resources (Serper, Scrape.do,
+    the intent/route-planner LLM calls, storage) are spent on it.
+
+    Delegates to LLM_planner.moderate_query (sync, with its own primary/
+    fallback model failover, and fails OPEN on any error — see its
+    docstring) and runs it off the event loop so we stay non-blocking.
+    """
+    result = await asyncio.to_thread(moderate_query, user_prompt)
+    if not result["safe"]:
+        logger.warning(
+            "Query blocked by moderation (%s): %r — %s",
+            result["category"], user_prompt, result["reason"],
+        )
+    return result
+
 
 # === Step 1: Intent deconstruction =========================================
 async def deconstruct_intent(user_prompt: str) -> Dict[str, Any]:
@@ -2624,7 +2643,20 @@ async def run_pipeline(
         "counts": {},
         "qualified_count": 0,
         "error": None,
+        "blocked": False,
+        "block_reason": "",
     }
+
+    # Step 0: moderation gate — runs before ANY other resource (Serper,
+    # Scrape.do, the intent/route-planner LLM calls, storage) is touched, so
+    # a policy-violating query costs at most this one small check, not a
+    # full discovery+scrape+classify run.
+    moderation = await moderate_user_query(user_query)
+    if not moderation["safe"]:
+        summary["blocked"] = True
+        summary["block_reason"] = f"{moderation['category']}: {moderation['reason']}"
+        summary["error"] = "blocked_by_moderation"
+        return summary
 
     try:
         plan = await deconstruct_intent(user_query)
@@ -3033,6 +3065,15 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print("\n" + "=" * 64)
     print("PHASE 1 OUTPUT RETURN")
     print("=" * 64)
+    if summary.get("blocked"):
+        # User-facing message is deliberately short and generic -- the
+        # detailed category/reason is still captured in summary["block_reason"]
+        # and the warning log for internal review, but isn't surfaced here
+        # (avoids handing back a roadmap for rephrasing around the filter).
+        print(f"Query      : {summary['query']}")
+        print("Status     : This request violates our usage policy and was not processed.")
+        print("=" * 64)
+        return
     print(f"Query      : {summary['query']}")
     print(f"Search type: {summary.get('search_type', 'general')}")
     if summary.get("serper_pages_used"):

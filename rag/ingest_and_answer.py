@@ -146,7 +146,8 @@ def main() -> None:
     for rank, m in enumerate(matches, 1):
         print(f"\n[{rank}] score={m['score']:.4f}  "
               f"(semantic={m['semantic_score']:.4f} + keyword={m['keyword_bonus']:.4f} "
-              f"+ focus[{m.get('focus_word','')}]={m.get('focus_lift', 0.0):.4f})  "
+              f"+ focus[{m.get('focus_phrase') or m.get('focus_word','')}]="
+              f"{m.get('focus_lift', 0.0):.4f})  "
               f"domain={m['domain']}  chunk={m['chunk_no']}")
         if m["matched_keywords"]:
             weights = m["matched_keyword_weights"]
@@ -165,6 +166,7 @@ def main() -> None:
     all_matches = top_matches(query, k=len(committed_domains) * 10_000,
                               business=committed_domains, embedder=pipe.embedder)
     focus_word = all_matches[0]["focus_word"] if all_matches else ""
+    focus_phrase = all_matches[0].get("focus_phrase") or focus_word if all_matches else ""
     focus_partner = all_matches[0].get("focus_partner", "") if all_matches else ""
     evidence_by_domain: Dict[str, List[str]] = {}
     # Distinct PAGE URLs (not chunk count) where the phrase partner (e.g.
@@ -206,7 +208,7 @@ def main() -> None:
                 address_domains.add(dom)
 
     if focus_word:
-        print(f"\nPer-business evidence summary for focus concept: \"{focus_word}\"")
+        print(f"\nPer-business evidence summary for focus concept: \"{focus_phrase}\"")
         print("=" * 70)
         for domain in committed_domains:
             evidences = evidence_by_domain.get(domain, [])
@@ -229,13 +231,13 @@ def main() -> None:
                 via_address = " + a street address is on file for this business"
             if has_present and has_absent:
                 verdict = (f"MIXED signals — found chunks both confirming and "
-                          f"contradicting \"{focus_word}\"{via_partner}{via_address}")
+                          f"contradicting \"{focus_phrase}\"{via_partner}{via_address}")
             elif has_present:
-                verdict = f"CONFIRMED PRESENT — explicitly mentions {focus_word}{via_partner}{via_address}"
+                verdict = f"CONFIRMED PRESENT — explicitly mentions {focus_phrase}{via_partner}{via_address}"
             elif has_absent:
-                verdict = f"CONFIRMED ABSENT — explicitly states no {focus_word} (or not yet available){via_partner}"
+                verdict = f"CONFIRMED ABSENT — explicitly states no {focus_phrase} (or not yet available){via_partner}"
             else:
-                verdict = (f"NO EVIDENCE FOUND — \"{focus_word}\" never mentioned; "
+                verdict = (f"NO EVIDENCE FOUND — \"{focus_phrase}\" never mentioned; "
                           f"absence is unconfirmed, not proven")
             print(f"  {domain}: {verdict}")
         print("=" * 70)

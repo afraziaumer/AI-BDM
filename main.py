@@ -43,7 +43,7 @@ import route_planner as rp
 logger = logging.getLogger("ai_bdm.main")
 
 
-async def run(query: str, concurrency: int = 5) -> None:
+async def run(query: str, concurrency: int = 10) -> None:
     # ---- Step 1 (plan) + Step 2 (discover + scrape + store homepage HTML) ----
     summary = await p1.run_pipeline(query, concurrency=concurrency)
     p1.print_summary(summary)
@@ -128,7 +128,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="AI-BDM: run a query through Step 1 -> Step 2 -> Step 3.")
     parser.add_argument("--query", required=True, help="Natural-language lead query.")
-    parser.add_argument("--concurrency", type=int, default=5,
+    parser.add_argument("--concurrency", type=int, default=10,
                         help="Concurrent scrape workers for Step 2.")
     args = parser.parse_args()
     asyncio.run(run(args.query, args.concurrency))

@@ -94,6 +94,97 @@ def call_llm(
     raise last_exc  # both models exhausted their retries
 
 
+# --- Query moderation -------------------------------------------------------
+# Runs FIRST, before intent deconstruction (Step 1) or any discovery/scraping
+# resources are touched -- a query violating any of a standard trust & safety
+# taxonomy (child sexual abuse material, sexual exploitation, hate speech,
+# harassment, self-harm, suicide, violence, other illegal activity) should
+# never reach Serper/Scrape.do/the LLM route planner, all of which cost real
+# money per query. One small classification call here is negligible next to
+# what it prevents spending on a blocked query. Deliberately CONSERVATIVE on
+# ordinary business categories: only flags a clear, unambiguous violation,
+# never merely "unusual" or "sensitive" business categories (a legitimate
+# lead-gen request about, say, a firearms retailer, a bail bondsman, or a
+# legally-operating adult-entertainment venue is not itself a violation).
+MODERATION_SYSTEM_PROMPT = """\
+You are a content-safety gate for a B2B lead-generation tool. Users submit \
+short natural-language requests like "find me marinas in Miami with no CRM" \
+or "5 dental clinics in Karachi with no online booking". Almost every \
+request is a completely ordinary business search and must be allowed \
+through unchanged.
+
+Block a request if it clearly falls into any of these categories (standard \
+trust & safety taxonomy):
+- csae: ANY sexual content involving minors, or facilitating access to it. \
+Zero tolerance -- always block, regardless of how it's phrased or framed.
+- sexual_exploitation: facilitates finding businesses/venues for explicit \
+sexual services, prostitution, or hyper-sexual content -- especially where \
+illegal in the request's own stated jurisdiction (use your knowledge of \
+that jurisdiction's laws). Distinct from ordinary, legally-operating adult \
+entertainment (e.g. a licensed strip club/adult venue where that's legal) \
+-- the signal here is explicit sexual services being sought, not merely \
+"adult" subject matter.
+- hate_speech: targets or disparages people based on race, ethnicity, \
+religion, nationality, gender, sexual orientation, disability, or similar \
+protected characteristics, OR asks to find/filter businesses or people \
+whose purpose is to discriminate against or harass a protected group.
+- harassment: targets a NAMED PRIVATE INDIVIDUAL (not a business) for \
+contact-finding with apparent intent to harass, stalk, dox, or intimidate.
+- self_harm: seeks means, methods, or facilitation of self-harm.
+- suicide: seeks means, methods, or facilitation of suicide.
+- violence: facilitates finding people/businesses to enable violence, \
+weapons for attacks, or similar physical harm to people.
+- illegal_activity: facilitates other clearly illegal activity (e.g. human \
+trafficking, buying stolen goods, drug trafficking where illegal).
+
+Do NOT block merely because a business category is sensitive, adult, \
+controversial, or unfamiliar (e.g. firearms DEALERS as an ordinary retail \
+category, cannabis dispensaries where legal, legally-operating adult \
+entertainment venues, bail bondsmen, political organizations, religious \
+institutions as a business CATEGORY being searched for generally) -- those \
+are legitimate lead-gen targets. Only the categories above justify \
+blocking. When genuinely unsure, allow it through (safe=true) -- false \
+positives block legitimate business use; false negatives are rare and this \
+is one layer, not the only one.
+
+Respond with ONLY a single JSON object, no markdown, no prose:
+{"safe": true, "category": "", "reason": ""}
+or
+{"safe": false, "category": "hate_speech", "reason": "short reason, not a template for evasion"}
+"""
+
+
+def moderate_query(user_query: str) -> Dict[str, Any]:
+    """Classify a query as safe or policy-violating BEFORE any discovery/
+    scraping resources are spent on it.
+
+    Returns {"safe": bool, "category": str, "reason": str}. On ANY failure
+    (LLM/network down, bad JSON) this fails OPEN (safe=True) -- a moderation
+    outage must never silently block every legitimate query; the categories
+    it guards against are also rare, so the cost of occasionally missing one
+    during an outage is far lower than blocking the entire product.
+    """
+    try:
+        client = get_client()
+        text = call_llm(
+            client,
+            messages=[
+                {"role": "system", "content": MODERATION_SYSTEM_PROMPT},
+                {"role": "user", "content": f"REQUEST: {user_query}"},
+            ],
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(text)
+        return {
+            "safe": bool(result.get("safe", True)),
+            "category": str(result.get("category") or ""),
+            "reason": str(result.get("reason") or ""),
+        }
+    except Exception as exc:  # noqa: BLE001 - fail open, see docstring
+        print(f"Query moderation check failed (failing open): {exc}")
+        return {"safe": True, "category": "", "reason": ""}
+
+
 # System role: explains the WHOLE pipeline to the model so it knows exactly how
 # each field is consumed downstream. This is what makes the plan executable.
 PLANNER_SYSTEM_PROMPT = """\
