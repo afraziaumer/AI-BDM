@@ -182,8 +182,17 @@ class PageStore(ABC):
         linkedin_enrichment.py)."""
 
     @abstractmethod
-    def stage_decision_makers(self, domain: str, people: List[Dict]) -> None:
-        """Stage decision_makers.json (see decision_maker_extractor.py)."""
+    def stage_decision_makers(self, domain: str, data: Dict) -> None:
+        """Stage decision_makers.json — {"people": [...]} — (see
+        decision_maker_extractor.py)."""
+
+    @abstractmethod
+    def stage_organization(self, domain: str, data: Dict) -> None:
+        """Stage organization.json (see organization.py)."""
+
+    @abstractmethod
+    def stage_business_intelligence(self, domain: str, data: Dict) -> None:
+        """Stage business_intelligence.json (see business_intelligence.py)."""
 
     # --- lifecycle ---------------------------------------------------------
     @abstractmethod
@@ -288,14 +297,33 @@ class PageStore(ABC):
         refresh — same pattern as write_tech_profile_now)."""
 
     @abstractmethod
-    def read_decision_makers(self, domain: str) -> Optional[List[Dict]]:
-        """Return the committed decision_makers.json list for a domain, or
-        None if it was never built."""
+    def read_decision_makers(self, domain: str) -> Optional[Dict]:
+        """Return the committed decision_makers.json ({"people": [...]}) for
+        a domain, or None if it was never built."""
 
     @abstractmethod
-    def write_decision_makers_now(self, domain: str, people: List[Dict]) -> None:
+    def write_decision_makers_now(self, domain: str, data: Dict) -> None:
         """Write decision_makers.json straight to FINAL storage (query-time
         refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_organization(self, domain: str) -> Optional[Dict]:
+        """Return the committed organization.json for a domain, or None."""
+
+    @abstractmethod
+    def write_organization_now(self, domain: str, data: Dict) -> None:
+        """Write organization.json straight to FINAL storage (query-time
+        refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_business_intelligence(self, domain: str) -> Optional[Dict]:
+        """Return the committed business_intelligence.json for a domain, or
+        None."""
+
+    @abstractmethod
+    def write_business_intelligence_now(self, domain: str, data: Dict) -> None:
+        """Write business_intelligence.json straight to FINAL storage
+        (query-time refresh — same pattern as write_tech_profile_now)."""
 
 
 class LocalPageStore(PageStore):
@@ -422,11 +450,27 @@ class LocalPageStore(PageStore):
             encoding="utf-8",
         )
 
-    def stage_decision_makers(self, domain: str, people: List[Dict]) -> None:
+    def stage_decision_makers(self, domain: str, data: Dict) -> None:
         d = self._staging_dir(domain)
         d.mkdir(parents=True, exist_ok=True)
         (d / "decision_makers.json").write_text(
-            json.dumps(people, ensure_ascii=False, indent=2, default=str),
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_organization(self, domain: str, data: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "organization.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_business_intelligence(self, domain: str, data: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "business_intelligence.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
 
@@ -598,11 +642,23 @@ class LocalPageStore(PageStore):
     def write_linkedin_company_now(self, domain: str, data: Dict) -> None:
         self._write_final_json(domain, "linkedin_company.json", data)
 
-    def read_decision_makers(self, domain: str) -> Optional[List[Dict]]:
+    def read_decision_makers(self, domain: str) -> Optional[Dict]:
         return self._read_final_json(domain, "decision_makers.json")
 
-    def write_decision_makers_now(self, domain: str, people: List[Dict]) -> None:
-        self._write_final_json(domain, "decision_makers.json", people)
+    def write_decision_makers_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "decision_makers.json", data)
+
+    def read_organization(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "organization.json")
+
+    def write_organization_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "organization.json", data)
+
+    def read_business_intelligence(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "business_intelligence.json")
+
+    def write_business_intelligence_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "business_intelligence.json", data)
 
     def _read_final_json(self, domain: str, filename: str):
         f = self._final_dir(domain) / filename

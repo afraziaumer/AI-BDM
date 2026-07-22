@@ -2,7 +2,16 @@
 no LinkedIn link on the business's own site, try to find its official
 LinkedIn Company page.
 
-IMPORTANT — this module NEVER fetches linkedin.com. It only:
+Also the shared engine behind the SAME fallback for Facebook/Instagram/X
+(see `discover_profile_via_search`, used directly by phase1_pipeline.py's
+orchestration for those three) — one confidence-scoring/search
+implementation, not four near-identical copies of it. `discover_linkedin_company`
+is kept as its own function (not just a thin call site) because LinkedIn is
+the one platform this project also builds a full enrichment layer on top of
+(linkedin_enrichment.py) and callers already depend on its exact return type.
+
+IMPORTANT — this module NEVER fetches linkedin.com (or facebook.com/
+instagram.com/x.com). It only:
   1. Generates candidate URL slugs from the company name/domain (cheap,
      local, no network) — these are CANDIDATES to check, never accepted on
      their own.
@@ -104,11 +113,15 @@ def _title_confidence(company_name: str, result_title: str) -> float:
 
 
 @dataclass
-class LinkedInMatch:
+class ProfileMatch:
     url: str
     title: str
     snippet: str
     confidence: float
+
+
+LinkedInMatch = ProfileMatch  # backward-compat name — linkedin_enrichment.py
+                              # and others already import this exact name.
 
 
 async def _serper_search(session: aiohttp.ClientSession, query: str) -> List[Dict[str, Any]]:
@@ -150,51 +163,75 @@ async def _serper_search(session: aiohttp.ClientSession, query: str) -> List[Dic
     return []
 
 
-def _best_company_match(company_name: str, results: List[Dict[str, Any]]) -> Optional[LinkedInMatch]:
-    best: Optional[LinkedInMatch] = None
+def _best_match_in_results(
+    company_name: str, results: List[Dict[str, Any]], path_ok,
+) -> Optional[ProfileMatch]:
+    best: Optional[ProfileMatch] = None
     for item in results:
         link = item.get("link", "")
-        path = urlparse(link).path.lower()
-        if "linkedin.com" not in link or not path.startswith("/company/"):
+        if not path_ok(link):
             continue
         title = item.get("title", "") or ""
         confidence = _title_confidence(company_name, title)
         if best is None or confidence > best.confidence:
-            best = LinkedInMatch(
+            best = ProfileMatch(
                 url=link, title=title, snippet=item.get("snippet", "") or "",
                 confidence=confidence,
             )
     return best
 
 
+async def discover_profile_via_search(
+    session: aiohttp.ClientSession, queries: List[str], company_name: str,
+    path_ok, min_confidence: float = MIN_CONFIDENCE,
+) -> Optional[ProfileMatch]:
+    """Generic engine: try `queries` in order against Serper, keep the
+    highest-confidence result whose URL passes `path_ok` (a platform-specific
+    "is this actually a profile page, not a login/help/permalink" check —
+    see social_discovery.py's `_is_noise_url` for the same idea applied to
+    links already found on a site, vs. here applied to search results).
+    Stops early once a near-certain match is found. None if nothing clears
+    `min_confidence` — never the best-of-a-bad-lot guess.
+
+    Shared by discover_linkedin_company below and, directly, by
+    phase1_pipeline.py's Facebook/Instagram/X fallback discovery — one
+    implementation of "search, score, verify," not one per platform.
+    """
+    best: Optional[ProfileMatch] = None
+    for query in queries:
+        results = await _serper_search(session, query)
+        match = _best_match_in_results(company_name, results, path_ok)
+        if match and (best is None or match.confidence > best.confidence):
+            best = match
+        if best and best.confidence >= 0.95:
+            break  # already about as confident as this method gets
+
+    if best is None or best.confidence < min_confidence:
+        if best is not None:
+            logger.info(
+                "Profile candidate below confidence floor (%.2f < %.2f): %s",
+                best.confidence, min_confidence, best.url,
+            )
+        return None
+    return best
+
+
+def _linkedin_company_path_ok(link: str) -> bool:
+    return "linkedin.com" in link and urlparse(link).path.lower().startswith("/company/")
+
+
 async def discover_linkedin_company(
     session: aiohttp.ClientSession, company_name: str, domain: str,
-) -> Optional[LinkedInMatch]:
+) -> Optional[ProfileMatch]:
     """Try, in order: a direct name search, then each generated slug as a
-    targeted site: search. Returns the highest-confidence match found across
-    all of them, or None if nothing clears MIN_CONFIDENCE — never the
-    best-of-a-bad-lot guess."""
+    targeted site: search. See discover_profile_via_search for the shared
+    scoring/verification engine."""
     queries = [f'site:linkedin.com/company "{company_name}"'] if company_name else []
     queries += [
         f"site:linkedin.com/company {slug}"
         for slug in generate_candidate_slugs(company_name, domain)
     ]
     queries.append(f"site:linkedin.com {domain}")
-
-    best: Optional[LinkedInMatch] = None
-    for query in queries:
-        results = await _serper_search(session, query)
-        match = _best_company_match(company_name, results)
-        if match and (best is None or match.confidence > best.confidence):
-            best = match
-        if best and best.confidence >= 0.95:
-            break  # already about as confident as this method gets
-
-    if best is None or best.confidence < MIN_CONFIDENCE:
-        if best is not None:
-            logger.info(
-                "LinkedIn candidate for %s below confidence floor (%.2f < %.2f): %s",
-                domain, best.confidence, MIN_CONFIDENCE, best.url,
-            )
-        return None
-    return best
+    return await discover_profile_via_search(
+        session, queries, company_name, _linkedin_company_path_ok,
+    )

@@ -65,6 +65,13 @@ import social_discovery
 import linkedin_discovery
 import linkedin_enrichment
 import decision_maker_extractor
+import schema_org_extractor
+import public_search_decision_makers
+import organization
+import buying_committee
+import business_intelligence
+import github_enrichment
+import youtube_enrichment
 
 # Modular storage layer: cleaned page text + link metadata + per-page index.
 # Local filesystem today; swap the backend in storage.get_store() for R2 later.
@@ -1426,6 +1433,11 @@ async def crawl_site(
                                           # never same-domain, so these never show
                                           # up in link_pairs/links.json at all)
     decision_makers: List[Dict[str, Any]] = []  # site-wide, for decision_maker_extractor.py
+                                          # (this domain's website + schema.org sources —
+                                          # contact_page/linkedin/search sources are added
+                                          # later, post-commit, in process_single_lead)
+    schema_organization: Optional[Dict[str, Any]] = None  # first Organization schema.org
+                                          # node found on any page, if any
 
     async def _process_one(
         page_url: str, html: str, method: str, status_code: Optional[int] = None
@@ -1435,7 +1447,7 @@ async def crawl_site(
         Everything heavy (soup, html, text) is local to this call and freed on
         return; only the enclosing lightweight accumulators are updated.
         """
-        nonlocal pages_kept, address, sample_chars, home_lines
+        nonlocal pages_kept, address, sample_chars, home_lines, schema_organization
         soup = BeautifulSoup(html, "lxml")
         # Hyperlinks FIRST, from the raw soup, so cleaning can't lose them.
         link_pairs = _extract_internal_link_pairs(soup, page_url, domain)
@@ -1450,6 +1462,14 @@ async def crawl_site(
             {"page_url": page_url, "url": p["url"], "anchor": p["anchor"]}
             for p in external_pairs
         )
+        # Decision-maker source #2 (schema.org JSON-LD) — MUST run before
+        # clean_page_for_llm below, which strips <script> tags (that's where
+        # JSON-LD lives) as part of turning the page into LLM-ready text.
+        schema_data = schema_org_extractor.extract_schema_org(soup, page_url)
+        if schema_data["people"]:
+            decision_makers.extend(schema_data["people"])
+        if schema_data["organization"] and schema_organization is None:
+            schema_organization = schema_data["organization"]
         # Tracked regardless of whether this page's content is kept — a login/
         # portal path is itself a signal for tech profiling, even off a thin or
         # duplicate-content page. Cheap: just strings, not page content.
@@ -1570,14 +1590,21 @@ async def crawl_site(
                 is_home=is_home_page,
             )
             store.stage_page_context(domain, stem, context)
-            # Decision-maker extraction (Step 4): only on pages already
-            # classified as team/about — see decision_maker_extractor.py's
-            # module docstring for why this is scoped to the business's OWN
-            # site rather than LinkedIn, and why it's precision-gated to
-            # these page types rather than scanned on every page.
-            if context.get("page_type") in ("team", "about"):
+            # Decision-maker extraction (Step 4, sources #1/#3): only on
+            # pages already classified as team/about/contact/support — see
+            # decision_maker_extractor.py's module docstring for why this is
+            # scoped to the business's OWN site rather than LinkedIn, and why
+            # it's precision-gated to these page types rather than scanned
+            # on every page.
+            page_type_for_dm = context.get("page_type")
+            if page_type_for_dm in ("team", "about"):
                 people = decision_maker_extractor.extract_decision_makers(
                     page_url, text, company_name, external_pairs,
+                )
+                decision_makers.extend(people)
+            elif page_type_for_dm in ("contact", "support"):
+                people = decision_maker_extractor.extract_contact_page_people(
+                    page_url, text, external_pairs,
                 )
                 decision_makers.extend(people)
         except Exception as exc:  # noqa: BLE001 - best-effort, never breaks the crawl
@@ -1824,7 +1851,7 @@ async def crawl_site(
 
     if decision_makers:
         try:
-            store.stage_decision_makers(domain, decision_makers)
+            store.stage_decision_makers(domain, {"people": decision_makers})
         except Exception as exc:  # noqa: BLE001 - never break the crawl over this
             logger.warning("Failed to stage decision makers for %s: %s", domain, exc)
 
@@ -1840,6 +1867,7 @@ async def crawl_site(
         "sample_text": " ".join(sample_parts),
         "external_links": external_links,
         "decision_makers": decision_makers,
+        "schema_organization": schema_organization,
     }
 
 
@@ -2644,13 +2672,15 @@ async def process_single_lead(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Anchor enrichment failed for %s: %s", domain, exc)
 
-        # LinkedIn discovery (Step 2) — gated to committed/qualified leads
-        # only, since (unlike social-link extraction above) this costs real
-        # Serper API calls; never worth spending on a business that just got
-        # discarded. Cached: only runs when social_profiles.json doesn't
-        # already have a linkedin URL (see storage.read_social_profiles) —
-        # a future run against the same committed domain skips straight past
+        # Social/LinkedIn fallback discovery (Step 2) — gated to committed/
+        # qualified leads only, since (unlike social-link extraction above)
+        # this costs real Serper API calls; never worth spending on a
+        # business that just got discarded. Cached: only runs for whichever
+        # platforms social_profiles.json doesn't already have a URL for — a
+        # future run against the same committed domain skips straight past
         # this, satisfying "reuse cached data, don't repeat discovery."
+        social_profiles: Dict[str, Any] = {}
+        li_data: Optional[Dict[str, Any]] = None
         try:
             social_profiles = store.read_social_profiles(domain) or {}
             if not social_profiles.get("linkedin"):
@@ -2666,8 +2696,88 @@ async def process_single_lead(
                         "LinkedIn company page found for %s: %s (confidence=%.2f)",
                         domain, match.url, match.confidence,
                     )
+            else:
+                li_data = store.read_linkedin_company(domain)
+
+            # Same fallback engine, generalized to Facebook/Instagram/X (see
+            # linkedin_discovery.discover_profile_via_search's docstring —
+            # one search/confidence implementation, not four near-copies).
+            # Still never scrapes any of these platforms directly.
+            _FALLBACK_PLATFORMS = (
+                ("facebook", "facebook.com"),
+                ("instagram", "instagram.com"),
+                ("x", "x.com"),
+            )
+            for platform, host in _FALLBACK_PLATFORMS:
+                if social_profiles.get(platform):
+                    continue
+                queries = [f'site:{host} "{name}"'] if name else []
+                queries.append(f"site:{host} {domain}")
+                match = await linkedin_discovery.discover_profile_via_search(
+                    session, queries, name or "",
+                    lambda link, h=host: h in link,
+                )
+                if match:
+                    social_profiles[platform] = match.url
+                    logger.info(
+                        "%s profile found for %s: %s (confidence=%.2f)",
+                        platform, domain, match.url, match.confidence,
+                    )
+            store.write_social_profiles_now(domain, social_profiles)
         except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
-            logger.warning("LinkedIn discovery failed for %s: %s", domain, exc)
+            logger.warning("Social/LinkedIn discovery failed for %s: %s", domain, exc)
+
+        # GitHub/YouTube enrichment — real public APIs (Step 3's ONLY
+        # platforms with a genuine ToS-compliant public API for this data;
+        # see github_enrichment.py / youtube_enrichment.py docstrings).
+        github_profile: Optional[Dict[str, Any]] = None
+        youtube_profile: Optional[Dict[str, Any]] = None
+        try:
+            if social_profiles.get("github"):
+                github_profile = await github_enrichment.enrich_github(
+                    session, social_profiles["github"],
+                )
+            if social_profiles.get("youtube"):
+                youtube_profile = await youtube_enrichment.enrich_youtube(
+                    session, social_profiles["youtube"],
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
+            logger.warning("GitHub/YouTube enrichment failed for %s: %s", domain, exc)
+
+        # Decision makers (Step 4) — merge sources #1/#2 (already staged
+        # during the crawl: website team/about/contact pages + schema.org)
+        # with source #4 (public search), used ONLY as a last resort when
+        # nothing named was found on-site, then annotate with likely
+        # business-problem ownership (Step 7) and build the org chart
+        # (Step 6) and consolidated summary (Step 8).
+        try:
+            people: List[Dict[str, Any]] = list(crawl.get("decision_makers") or [])
+            if not any(p.get("name") for p in people):
+                fallback_people = await public_search_decision_makers.discover_via_public_search(
+                    session, domain,
+                )
+                people.extend(fallback_people)
+
+            people = buying_committee.annotate_buying_committee(people)
+            store.write_decision_makers_now(domain, {"people": people})
+
+            org = organization.build_organization(people)
+            store.write_organization_now(domain, org)
+
+            bi_summary = business_intelligence.build_business_intelligence_summary(
+                domain, social_profiles, li_data, people, org,
+                github_profile, youtube_profile,
+            )
+            store.write_business_intelligence_now(domain, bi_summary)
+            logger.info(
+                "Business intelligence assembled for %s: %d decision-maker(s), "
+                "%d department(s), %d social platform(s).",
+                domain, org.get("total_people", 0),
+                len(org.get("department_counts") or {}),
+                bi_summary.get("social", {}).get("platform_count", 0),
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
+            logger.warning("Business intelligence assembly failed for %s: %s", domain, exc)
     else:
         store.discard_domain(domain)
         reason = (classification or {}).get("category") or qualification.get("reason")
