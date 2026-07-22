@@ -57,6 +57,15 @@ from LLM_planner import plan_query, classify_business, generate_query_variations
 # Route Planner and, in the future, RAG/lead-scoring/tech-stack reasoning.
 import page_intelligence
 
+# Social/LinkedIn business intelligence (see each module's docstring for
+# scope — none of these scrape linkedin.com or any other social platform
+# directly; all read data already legitimately crawled, or Serper's search
+# index, never a live fetch of a third-party social profile page).
+import social_discovery
+import linkedin_discovery
+import linkedin_enrichment
+import decision_maker_extractor
+
 # Modular storage layer: cleaned page text + link metadata + per-page index.
 # Local filesystem today; swap the backend in storage.get_store() for R2 later.
 from storage import get_store
@@ -1136,11 +1145,20 @@ def _extract_internal_link_pairs(
     return pairs
 
 
-def _count_external_links(soup: BeautifulSoup, base_url: str, root_domain: str) -> int:
-    """Count distinct off-domain http(s) links on the page — a lightweight
-    metric for page_intelligence's context JSON. Runs on the SAME raw soup
-    pass as `_extract_internal_link_pairs`, before cleaning strips `<a>` tags,
-    so it costs one extra `find_all` rather than a second HTML parse."""
+def _extract_external_link_pairs(
+    soup: BeautifulSoup, base_url: str, root_domain: str
+) -> List[Dict[str, str]]:
+    """Return off-domain http(s) links as [{'url', 'anchor'}] — mirrors
+    `_extract_internal_link_pairs` but for the complement (external) set.
+    Runs on the SAME raw soup pass, before cleaning strips `<a>` tags, so it
+    costs one extra `find_all` rather than a second HTML parse.
+
+    Two, unrelated consumers: page_intelligence's context JSON only needs
+    `len(...)` (external_links metric); social_discovery.py needs the actual
+    url+anchor pairs to recognize and normalize social-platform profile
+    links (mailto:/tel: contact links are handled separately by
+    extract_contacts, not here)."""
+    pairs: List[Dict[str, str]] = []
     seen: Set[str] = set()
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -1151,8 +1169,11 @@ def _count_external_links(soup: BeautifulSoup, base_url: str, root_domain: str) 
             continue
         if _domain_key(href) == root_domain:
             continue
+        if href in seen:
+            continue
         seen.add(href)
-    return len(seen)
+        pairs.append({"url": href, "anchor": a.get_text(" ", strip=True)[:120]})
+    return pairs
 
 
 def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[str]:
@@ -1399,6 +1420,12 @@ async def crawl_site(
     home_lines: Optional[Set[str]] = None  # homepage boilerplate for dedupe
     discovered_urls: Set[str] = set()    # every page/link URL seen (tech profile's
                                           # login/portal path-hint check, at the end)
+    external_links: List[Dict[str, str]] = []  # site-wide, for social_discovery.py:
+                                          # every off-domain link + its source page +
+                                          # anchor text (social profile URLs are
+                                          # never same-domain, so these never show
+                                          # up in link_pairs/links.json at all)
+    decision_makers: List[Dict[str, Any]] = []  # site-wide, for decision_maker_extractor.py
 
     async def _process_one(
         page_url: str, html: str, method: str, status_code: Optional[int] = None
@@ -1413,9 +1440,16 @@ async def crawl_site(
         # Hyperlinks FIRST, from the raw soup, so cleaning can't lose them.
         link_pairs = _extract_internal_link_pairs(soup, page_url, domain)
         link_urls = [p["url"] for p in link_pairs]
-        # Same raw-soup pass, before cleaning strips <a> tags — feeds
-        # page_intelligence's context JSON metrics.
-        external_link_count = _count_external_links(soup, page_url, domain)
+        # Same raw-soup pass, before cleaning strips <a> tags — feeds both
+        # page_intelligence's context JSON metric (len(...)) and
+        # social_discovery.py's site-wide social-link scan (the pairs
+        # themselves, tagged with their source page below).
+        external_pairs = _extract_external_link_pairs(soup, page_url, domain)
+        external_link_count = len(external_pairs)
+        external_links.extend(
+            {"page_url": page_url, "url": p["url"], "anchor": p["anchor"]}
+            for p in external_pairs
+        )
         # Tracked regardless of whether this page's content is kept — a login/
         # portal path is itself a signal for tech profiling, even off a thin or
         # duplicate-content page. Cheap: just strings, not page content.
@@ -1536,6 +1570,16 @@ async def crawl_site(
                 is_home=is_home_page,
             )
             store.stage_page_context(domain, stem, context)
+            # Decision-maker extraction (Step 4): only on pages already
+            # classified as team/about — see decision_maker_extractor.py's
+            # module docstring for why this is scoped to the business's OWN
+            # site rather than LinkedIn, and why it's precision-gated to
+            # these page types rather than scanned on every page.
+            if context.get("page_type") in ("team", "about"):
+                people = decision_maker_extractor.extract_decision_makers(
+                    page_url, text, company_name, external_pairs,
+                )
+                decision_makers.extend(people)
         except Exception as exc:  # noqa: BLE001 - best-effort, never breaks the crawl
             logger.warning("Page Intelligence context build failed for %s: %s", page_url, exc)
         pages_kept += 1
@@ -1765,6 +1809,25 @@ async def crawl_site(
         except Exception as exc:  # noqa: BLE001 - never break the crawl over this
             logger.warning("Failed to stage tech profile for %s: %s", domain, exc)
 
+    # Social profile discovery (Step 1) — free (no new network requests, just
+    # filtering links already collected above) and site-wide (a business's
+    # social links can appear on any page, not just the homepage), so this
+    # runs unconditionally, same as tech-stack profiling above. LinkedIn
+    # DISCOVERY (Step 2, costs real Serper API calls) is deliberately NOT
+    # run here — it's gated to qualified/committed businesses only, in
+    # process_single_lead, right after commit_domain.
+    try:
+        social_profiles = social_discovery.extract_social_links(external_links)
+        store.stage_social_profiles(domain, social_profiles)
+    except Exception as exc:  # noqa: BLE001 - never break the crawl over this
+        logger.warning("Failed to stage social profiles for %s: %s", domain, exc)
+
+    if decision_makers:
+        try:
+            store.stage_decision_makers(domain, decision_makers)
+        except Exception as exc:  # noqa: BLE001 - never break the crawl over this
+            logger.warning("Failed to stage decision makers for %s: %s", domain, exc)
+
     return {
         "domain": domain,
         "pages_kept": pages_kept,
@@ -1775,6 +1838,8 @@ async def crawl_site(
         "matched_exclude": sorted(matched_exclude),
         "matched_include": sorted(matched_include),
         "sample_text": " ".join(sample_parts),
+        "external_links": external_links,
+        "decision_makers": decision_makers,
     }
 
 
@@ -2578,6 +2643,31 @@ async def process_single_lead(
             page_intelligence.enrich_anchors(domain)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Anchor enrichment failed for %s: %s", domain, exc)
+
+        # LinkedIn discovery (Step 2) — gated to committed/qualified leads
+        # only, since (unlike social-link extraction above) this costs real
+        # Serper API calls; never worth spending on a business that just got
+        # discarded. Cached: only runs when social_profiles.json doesn't
+        # already have a linkedin URL (see storage.read_social_profiles) —
+        # a future run against the same committed domain skips straight past
+        # this, satisfying "reuse cached data, don't repeat discovery."
+        try:
+            social_profiles = store.read_social_profiles(domain) or {}
+            if not social_profiles.get("linkedin"):
+                match = await linkedin_discovery.discover_linkedin_company(
+                    session, name or "", domain,
+                )
+                if match:
+                    social_profiles["linkedin"] = match.url
+                    store.write_social_profiles_now(domain, social_profiles)
+                    li_data = await linkedin_enrichment.enrich_linkedin_company(match, domain)
+                    store.write_linkedin_company_now(domain, li_data)
+                    logger.info(
+                        "LinkedIn company page found for %s: %s (confidence=%.2f)",
+                        domain, match.url, match.confidence,
+                    )
+        except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
+            logger.warning("LinkedIn discovery failed for %s: %s", domain, exc)
     else:
         store.discard_domain(domain)
         reason = (classification or {}).get("category") or qualification.get("reason")

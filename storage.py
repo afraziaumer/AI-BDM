@@ -172,6 +172,19 @@ class PageStore(ABC):
         """Stage crawl_plan.json (see crawl_planner.py) alongside this domain's
         staged pages. Promoted/discarded together with them."""
 
+    @abstractmethod
+    def stage_social_profiles(self, domain: str, profiles: Dict) -> None:
+        """Stage social_profiles.json (see social_discovery.py)."""
+
+    @abstractmethod
+    def stage_linkedin_company(self, domain: str, data: Dict) -> None:
+        """Stage linkedin_company.json (see linkedin_discovery.py /
+        linkedin_enrichment.py)."""
+
+    @abstractmethod
+    def stage_decision_makers(self, domain: str, people: List[Dict]) -> None:
+        """Stage decision_makers.json (see decision_maker_extractor.py)."""
+
     # --- lifecycle ---------------------------------------------------------
     @abstractmethod
     def commit_domain(
@@ -254,6 +267,35 @@ class PageStore(ABC):
         domain, or None if it was never built (crawled before this feature
         existed). The master per-page manifest — future components should
         read this instead of scanning the filesystem."""
+
+    @abstractmethod
+    def read_social_profiles(self, domain: str) -> Optional[Dict]:
+        """Return the committed social_profiles.json for a domain, or None."""
+
+    @abstractmethod
+    def write_social_profiles_now(self, domain: str, profiles: Dict) -> None:
+        """Write social_profiles.json straight to FINAL storage for an
+        already-committed domain (query-time refresh — same pattern as
+        write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_linkedin_company(self, domain: str) -> Optional[Dict]:
+        """Return the committed linkedin_company.json for a domain, or None."""
+
+    @abstractmethod
+    def write_linkedin_company_now(self, domain: str, data: Dict) -> None:
+        """Write linkedin_company.json straight to FINAL storage (query-time
+        refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_decision_makers(self, domain: str) -> Optional[List[Dict]]:
+        """Return the committed decision_makers.json list for a domain, or
+        None if it was never built."""
+
+    @abstractmethod
+    def write_decision_makers_now(self, domain: str, people: List[Dict]) -> None:
+        """Write decision_makers.json straight to FINAL storage (query-time
+        refresh — same pattern as write_tech_profile_now)."""
 
 
 class LocalPageStore(PageStore):
@@ -361,6 +403,30 @@ class LocalPageStore(PageStore):
         d.mkdir(parents=True, exist_ok=True)
         (d / "crawl_plan.json").write_text(
             json.dumps(plan, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_social_profiles(self, domain: str, profiles: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "social_profiles.json").write_text(
+            json.dumps(profiles, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_linkedin_company(self, domain: str, data: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "linkedin_company.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_decision_makers(self, domain: str, people: List[Dict]) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "decision_makers.json").write_text(
+            json.dumps(people, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
 
@@ -519,6 +585,41 @@ class LocalPageStore(PageStore):
             return json.loads(f.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+
+    def read_social_profiles(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "social_profiles.json")
+
+    def write_social_profiles_now(self, domain: str, profiles: Dict) -> None:
+        self._write_final_json(domain, "social_profiles.json", profiles)
+
+    def read_linkedin_company(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "linkedin_company.json")
+
+    def write_linkedin_company_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "linkedin_company.json", data)
+
+    def read_decision_makers(self, domain: str) -> Optional[List[Dict]]:
+        return self._read_final_json(domain, "decision_makers.json")
+
+    def write_decision_makers_now(self, domain: str, people: List[Dict]) -> None:
+        self._write_final_json(domain, "decision_makers.json", people)
+
+    def _read_final_json(self, domain: str, filename: str):
+        f = self._final_dir(domain) / filename
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _write_final_json(self, domain: str, filename: str, data) -> None:
+        d = self._final_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / filename).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _write_tech_profile_files(
