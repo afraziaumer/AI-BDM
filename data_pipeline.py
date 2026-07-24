@@ -63,6 +63,16 @@ CLEAN_COLUMNS = [
     "pages_scraped",
     "high_intent_pages",   # Step 3 LLM-selected routes (JSON list of dicts)
     "tech_stack",          # optional Tech Stack Detection result (JSON object)
+    "qualification_status",  # qualified | excluded_by_keyword (see
+                              # phase1_pipeline._commit_status) — lets a
+                              # consumer of this export tell a true lead apart
+                              # from a real, right-industry/location business
+                              # that was still stored despite failing a
+                              # keyword requirement.
+    "excluded_keywords",      # comma-joined matched exclude keywords, if any
+    "relevance_score",        # 0-100 deterministic relevance score (see
+                              # relevance_scoring.py)
+    "relevance_verdict",      # very_relevant | relevant | possible_match | reject
 ]
 DESCRIPTION_WIDTH = 280   # chars kept for the readable one-line description
 MAX_PHONES_PER_BUSINESS = 8   # cap the phone list (a bigger list = directory page)
@@ -225,6 +235,10 @@ def clean_rows(
             "txt_path": r.get("txt_path", ""),
             "content_length": content_length,
             "_domain": domain,
+            "qualification_status": (r.get("qualification_status") or "").strip() or "qualified",
+            "excluded_keywords": (r.get("excluded_keywords") or "").strip(),
+            "relevance_score": (r.get("relevance_score") or "").strip(),
+            "relevance_verdict": (r.get("relevance_verdict") or "").strip(),
         })
 
     return clean, rejected
@@ -306,6 +320,12 @@ def to_business_level(pages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
             "page_title": home.get("page_title", ""),
             "description": description,
             "pages_scraped": pp.CONTACT_SEP.join(page_urls),
+            # Same for every page of this domain (commit_domain applies
+            # extra_fields uniformly) — read off the homepage row.
+            "qualification_status": home.get("qualification_status", "qualified"),
+            "excluded_keywords": home.get("excluded_keywords", ""),
+            "relevance_score": home.get("relevance_score", ""),
+            "relevance_verdict": home.get("relevance_verdict", ""),
         })
 
     businesses.sort(key=lambda b: b["company_name"].lower())
@@ -322,12 +342,14 @@ def explore(businesses: List[Dict[str, Any]]) -> Dict[str, Any]:
     with_phone = sum(1 for b in businesses if b["phone_number"] != "N/A")
     tlds = Counter(b["domain"].rsplit(".", 1)[-1] for b in businesses if "." in b["domain"])
     dates = sorted(b["date_added"] for b in businesses if b["date_added"])
+    excluded = sum(1 for b in businesses if b.get("qualification_status") == "excluded_by_keyword")
     return {
         "businesses": len(businesses),
         "email_coverage": (with_email, round(100 * with_email / n, 1)),
         "phone_coverage": (with_phone, round(100 * with_phone / n, 1)),
         "top_tlds": tlds.most_common(5),
         "date_range": (dates[0], dates[-1]) if dates else ("-", "-"),
+        "excluded_by_keyword": excluded,
     }
 
 
@@ -464,6 +486,8 @@ def write_report(prof: Dict[str, Any], stats: Dict[str, Any],
     lines.append(f"  phone coverage      : {stats['phone_coverage'][0]} ({stats['phone_coverage'][1]}%)")
     lines.append(f"  top TLDs            : {stats['top_tlds']}")
     lines.append(f"  date range          : {stats['date_range'][0]} .. {stats['date_range'][1]}")
+    lines.append(f"  excluded by keyword : {stats.get('excluded_by_keyword', 0)}  "
+                 "(real businesses, stored, that fail a keyword requirement)")
 
     lines.append("\n[6] GOVERNANCE")
     lines.append(f"  valid businesses    : {len(valid)}")
@@ -563,7 +587,8 @@ def run(path: str = RAW_STORE, dry_run: bool = False,
           f"| {prof['duplicate_page_rows']} dup pages")
     print(f"[clean]   kept {len(deduped)} pages | quarantined {len(rejected)} noisy rows")
     print(f"[rollup]  {len(businesses)} businesses | "
-          f"email {stats['email_coverage'][1]}% phone {stats['phone_coverage'][1]}%")
+          f"email {stats['email_coverage'][1]}% phone {stats['phone_coverage'][1]}% | "
+          f"excluded_by_keyword {stats.get('excluded_by_keyword', 0)}")
     print(f"[govern]  {len(valid)} valid | {len(invalid)} invalid")
 
     if dry_run:

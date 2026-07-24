@@ -5,8 +5,14 @@ One natural-language query runs the whole pipeline:
 
     Step 1  Intent planning        (LLM_planner via phase1_pipeline)
     Step 2  Discovery + scraping   (phase1_pipeline.run_pipeline -> stores raw HTML)
-    Step 3  High-intent routing    (route_planner, per committed business)
-    Step 4  Tech Stack Detection   (tech_stack, ONLY if the query's intent needs it)
+    Step 3  High-intent routing    (route_planner: search-first retrieval over page
+                                    context, per committed business — an LLM call
+                                    only when retrieval finds nothing usable)
+    Step 4  Final reasoning        (final_reasoning.answer_query, ONLY when the
+                                    query has a specific ask beyond plain discovery
+                                    — reads the top 3-5 retrieved pages' actual text
+                                    and answers the question, citing sources)
+    Step 5  Tech Stack Detection   (tech_stack, ONLY if the query's intent needs it)
 
 Usage:
     ./env/bin/python main.py --query "give me 10 marinas in dubai with no mobile apps"
@@ -37,6 +43,7 @@ import json
 import logging
 from typing import Dict
 
+import final_reasoning as fr
 import phase1_pipeline as p1
 import route_planner as rp
 
@@ -71,7 +78,7 @@ async def run(query: str, concurrency: int = 10) -> None:
     entries = list(businesses.items())  # [(website, name), ...], stable order
     domains = [p1._domain_key(website) for website, _ in entries]
     plans = await asyncio.gather(
-        *[asyncio.to_thread(rp.plan_routes, d) for d in domains]
+        *[asyncio.to_thread(rp.plan_routes, d, query) for d in domains]
     )
     for (website, name), domain, plan_result in zip(entries, domains, plans):
         pages = plan_result.get("selected_pages", [])
@@ -86,14 +93,41 @@ async def run(query: str, concurrency: int = 10) -> None:
 
     print(f"\nStep 3 complete: routed {routed}/{len(businesses)} business(es).")
 
-    # ---- Step 4: Tech Stack Detection — ONLY if this query's intent needs it.
+    # ---- Step 4: Final Reasoning — ONLY when the query has a specific ask
+    # beyond plain discovery (intent == "find_and_filter" means the user's
+    # own text stated a constraint/question, e.g. "...with no CRM" — a bare
+    # "find 20 marinas in Miami" is intent == "find", nothing to answer).
+    # Reads the top 3-5 already-retrieved pages' actual text (never the
+    # whole site) and synthesizes one grounded, source-cited answer per
+    # business — the "LLM Reasoning -> Final Result" stage of the
+    # search-first architecture. Best-effort per business: one failure
+    # never blocks the rest.
+    if plan.get("intent") == "find_and_filter" and routes:
+        print("\n" + "#" * 68)
+        print(f"STEP 4 — FINAL REASONING  ({len(routes)} business(es) with a route plan)")
+        print("#" * 68)
+        answered_domains = list(routes.keys())
+        answers = await asyncio.gather(*[
+            asyncio.to_thread(fr.answer_query, d, query) for d in answered_domains
+        ])
+        name_by_domain = {p1._domain_key(w): n for w, n in businesses.items()}
+        for domain, answer in zip(answered_domains, answers):
+            label = name_by_domain.get(domain, domain)
+            print(f"\n■ {label}  (confidence: {answer.get('confidence', '?')})")
+            if answer.get("answer"):
+                print(f"    {answer['answer']}")
+                print(f"    sources: {', '.join(answer.get('source_pages', []))}")
+            else:
+                print(f"    No answer found ({answer.get('reason', 'unknown')}).")
+
+    # ---- Step 5: Tech Stack Detection — ONLY if this query's intent needs it.
     # Runs after Phase 1 has already discovered/crawled every business above;
     # it never triggers a crawl itself, it only consumes Phase 1's output.
     tech_stacks: Dict[str, str] = {}
     if plan.get("needs_tech_stack") and businesses:
         import tech_stack as ts
         print("\n" + "#" * 68)
-        print(f"STEP 4 — TECH STACK DETECTION  ({len(businesses)} business(es))")
+        print(f"STEP 5 — TECH STACK DETECTION  ({len(businesses)} business(es))")
         print("#" * 68)
         # get_stored_profile() ALWAYS checks storage first (populated during
         # Phase 1's crawl above) — it only re-scans if a domain was somehow

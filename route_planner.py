@@ -48,6 +48,7 @@ Reuses existing infrastructure instead of duplicating it:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -59,6 +60,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 from LLM_planner import call_llm, get_client
+from model_router import TaskType
 from phase1_pipeline import _domain_key
 from route_filter import normalize_urls
 from storage import get_store
@@ -68,6 +70,10 @@ logger = logging.getLogger("ai_bdm.route_planner")
 MIN_SELECTED_PAGES = 3
 MAX_SELECTED_PAGES = 8
 MAX_LLM_CANDIDATES = 20     # only the top-N ranked pages are ever shown to the model
+
+# Bumped whenever this module's ranking/prompt logic changes meaningfully, so
+# a cached plan computed under an older version is never silently reused.
+PLANNER_VERSION = 1
                             # (also the cap on .txt files opened for previews — one
                             # read per shortlisted candidate, never every page on site)
 PREVIEW_HEAD_LINES = 2      # first N non-empty, non-heading lines
@@ -497,7 +503,10 @@ def call_planner_llm(messages: List[Dict[str, str]]) -> Optional[str]:
         logger.warning("LLM client unavailable, using rule-based plan: %s", exc)
         return None
     try:
-        return call_llm(client, messages, response_format={"type": "json_object"})
+        return call_llm(
+            client, messages, response_format={"type": "json_object"},
+            task=TaskType.ROUTE_PLANNING,
+        )
     except Exception as exc:  # noqa: BLE001 - degrade, never crash the planner
         logger.warning("Route planner LLM call failed: %s", exc)
         return None
@@ -649,18 +658,116 @@ def heuristic_plan(candidates: Sequence[ScoredCandidate]) -> Dict[str, Any]:
 # ===========================================================================
 # Public entry point
 # ===========================================================================
-def plan_routes(website: str) -> Dict[str, Any]:
+def _page_index_hash(domain: str) -> str:
+    """Fingerprint of the domain's committed page_index.json — changes
+    whenever the site's crawled page set or per-page intelligence changes,
+    so a route plan cached against an OLDER hash is correctly treated as
+    stale (a re-crawl added/removed pages, or page_intelligence enriched
+    them further)."""
+    page_index = get_store().read_page_index(domain)
+    if not page_index:
+        return ""
+    blob = json.dumps(page_index, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _query_hash(query: str) -> str:
+    q = (query or "").strip().lower()
+    if not q:
+        return ""
+    return hashlib.sha256(q.encode("utf-8")).hexdigest()[:16]
+
+
+def _retrieval_plan(
+    domain: str, query: str, kept: List[ScoredCandidate], pages: List[PageMeta],
+) -> Optional[Dict[str, Any]]:
+    """Search-first page selection (replaces the LLM call): hybrid retrieval
+    + reranking over this domain's page CONTEXT, restricted to the pages
+    `rule_based_prefilter` already kept (so retrieval never resurfaces
+    noise the rule-based pass already dropped — e.g. /login, /privacy).
+    Returns None on any failure or empty result so the caller falls back to
+    the pre-existing LLM/heuristic path unchanged — a retrieval bug must
+    only ever mean "less credit savings," never "no route plan at all."
+    """
+    import page_retrieval as pr
+
+    try:
+        kept_filenames = {c.filename for c in kept}
+        hits = pr.hybrid_retrieve(domain, query, top_k=pr.DEFAULT_HYBRID_TOP_K)
+        hits = [h for h in hits if h.filename in kept_filenames]
+        if not hits:
+            return None
+        reranked = pr.rerank(hits, query, top_n=MAX_SELECTED_PAGES)
+        if not reranked:
+            return None
+    except Exception as exc:  # noqa: BLE001 - retrieval is best-effort
+        logger.warning("Retrieval-based routing failed for %s, falling back "
+                       "to LLM/heuristic: %s", domain, exc)
+        return None
+
+    txt_path_by_filename = {Path(p.txt_path).name: p.txt_path for p in pages if p.txt_path}
+    selected = [
+        {
+            "filename": hit.filename,
+            "url": hit.context.get("url", ""),
+            "txt_path": txt_path_by_filename.get(hit.filename, ""),
+            "priority": i,
+            "reason": "; ".join(hit.reasons),
+        }
+        for i, hit in enumerate(reranked, 1)
+    ]
+    top_score = reranked[0].rerank_score
+    confidence = "high" if top_score >= 50 else "medium" if top_score >= 20 else "low"
+    logger.info(
+        "Route Planner selected %d page(s) for %s via search-first retrieval "
+        "(no LLM call).", len(selected), domain,
+    )
+    return {"selected_pages": selected, "confidence": confidence}
+
+
+def plan_routes(website: str, query: str = "") -> Dict[str, Any]:
     """Run all stages and return the selected high-value pages for one site.
 
     Args:
         website: the business's site (URL or bare domain) — must already be
                  committed to storage (see storage.PageStore.commit_domain).
+        query: the user's original request, e.g. "...does it have a CRM?".
+               Optional (defaults to "" for legacy callers) — when given and
+               there are more candidates than fit in one plan, page selection
+               is done by LOCAL hybrid retrieval (BM25 + embeddings over page
+               context, see page_retrieval.py) instead of an LLM call. With
+               no query (or when retrieval finds nothing usable), this falls
+               back to the pre-existing generic LLM/heuristic ranking.
 
     Returns {"selected_pages": [{url, txt_path, priority, reason}], "confidence"}.
     Returns an empty plan ({"selected_pages": [], "confidence": "low"}) if the
     domain has no committed pages.
+
+    Cached (see write_route_planner_request below): reused whenever the
+    domain's page_index_hash, this module's PLANNER_VERSION, AND the query's
+    hash all match what's stored, skipping the link graph, prefiltering, and
+    (most importantly) any LLM call entirely. This fixes route planning
+    previously having NO caching at all: every call re-ran the whole
+    pipeline, LLM call included, even for an unchanged site.
     """
     domain = _domain_key(website)
+    current_hash = _page_index_hash(domain)
+    q_hash = _query_hash(query)
+    if current_hash:
+        cached = get_store().read_route_planner_request(domain)
+        if (
+            cached
+            and cached.get("page_index_hash") == current_hash
+            and cached.get("planner_version") == PLANNER_VERSION
+            and cached.get("query_hash", "") == q_hash
+            and cached.get("plan")
+        ):
+            logger.info(
+                "Route Planner: reusing cached plan for %s (page_index + "
+                "query unchanged) — no re-ranking, no LLM call.", domain,
+            )
+            return cached["plan"]
+
     pages = load_page_metadata(domain)
     if not pages:
         logger.info("No crawled pages found for %s — nothing to route.", domain)
@@ -675,40 +782,58 @@ def plan_routes(website: str) -> Dict[str, Any]:
     if not kept:
         return {"selected_pages": [], "confidence": "low"}
 
-    # Trivial path: already within bounds -> skip the LLM call entirely.
+    # Trivial path: already within bounds -> skip retrieval AND the LLM call.
     if len(kept) <= MAX_SELECTED_PAGES:
         return heuristic_plan(kept)
 
-    # Shortlist by rule score, then read each shortlisted page ONCE to build a
-    # lightweight preview. The LLM sees only previews (filenames/headings/first
-    # + last lines) — never full text, and never every page on the site.
-    shortlist = kept[:MAX_LLM_CANDIDATES]
-    build_page_previews(shortlist, domain)
-    by_filename = {c.filename: c for c in shortlist}
+    # Search-first: try local hybrid retrieval before ever touching an LLM.
+    plan: Optional[Dict[str, Any]] = None
+    used_llm = False
+    messages: List[Dict[str, str]] = []
+    raw: Optional[str] = None
+    method = "llm"
+    if query:
+        plan = _retrieval_plan(domain, query, kept, pages)
+        if plan is not None:
+            method = "retrieval"
 
-    messages = build_prompt(shortlist)
-    raw = call_planner_llm(messages)
-    plan = parse_planner_response(raw, by_filename)
-    used_llm = plan is not None
-    if used_llm:
-        logger.info("Route Planner selected %d page(s) for %s via LLM.",
-                    len(plan["selected_pages"]), domain)
-    else:
-        logger.info("Falling back to deterministic route plan for %s.", domain)
-        plan = heuristic_plan(kept)
+    if plan is None:
+        # Shortlist by rule score, then read each shortlisted page ONCE to build
+        # a lightweight preview. The LLM sees only previews (filenames/headings/
+        # first + last lines) — never full text, and never every page on the site.
+        shortlist = kept[:MAX_LLM_CANDIDATES]
+        build_page_previews(shortlist, domain)
+        by_filename = {c.filename: c for c in shortlist}
 
-    # The exact LLM request/response, alongside the resulting plan — written
-    # into the domain's own storage folder for transparency/audit/reuse
+        messages = build_prompt(shortlist)
+        raw = call_planner_llm(messages)
+        plan = parse_planner_response(raw, by_filename)
+        used_llm = plan is not None
+        if used_llm:
+            logger.info("Route Planner selected %d page(s) for %s via LLM.",
+                        len(plan["selected_pages"]), domain)
+        else:
+            logger.info("Falling back to deterministic route plan for %s.", domain)
+            plan = heuristic_plan(kept)
+            method = "heuristic"
+
+    # The exact request/response, alongside the resulting plan — written into
+    # the domain's own storage folder for transparency/audit/reuse
     # (route_planner_request.json), same query-time-write pattern as
     # tech_stack's write_tech_profile_now. Best-effort: never breaks routing.
     try:
         get_store().write_route_planner_request(domain, {
             "domain": domain,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "query": query,
+            "method": method,
             "messages": messages,
             "raw_response": raw,
             "used_llm": used_llm,
             "plan": plan,
+            "page_index_hash": current_hash,
+            "planner_version": PLANNER_VERSION,
+            "query_hash": q_hash,
         })
     except Exception as exc:  # noqa: BLE001 - this artifact is best-effort
         logger.warning("Failed to persist route planner request for %s: %s", domain, exc)

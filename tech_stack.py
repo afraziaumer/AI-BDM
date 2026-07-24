@@ -285,7 +285,7 @@ def _dns_based_detections(domain: str) -> Dict[str, Dict[str, Any]]:
 
 def _robots_based_detections(url: str) -> Dict[str, Dict[str, Any]]:
     """robots.txt content fingerprint matching — one small extra native
-    fetch (not through Scrape.do; no proxy credits), the same class of
+    fetch (not through the premium scraper; no proxy credits), the same class of
     cheap reconnaissance request phase1_pipeline.py already makes for
     sitemap/contact discovery."""
     _ensure_corrected_tech_db()  # MUST run before the import below binds tech_db

@@ -38,6 +38,7 @@ from urllib.parse import (
 from bs4 import BeautifulSoup
 
 from LLM_planner import get_client, call_llm
+from model_router import TaskType
 from phase1_pipeline import _domain_key, _strip_tracking
 
 logger = logging.getLogger("ai_bdm.route_filter")
@@ -748,7 +749,10 @@ def select_routes(
 
     for attempt in (1, 2):  # initial + one retry (Part G)
         try:
-            raw = call_llm(client, messages, response_format={"type": "json_object"})
+            raw = call_llm(
+                client, messages, response_format={"type": "json_object"},
+                task=TaskType.JSON_EXTRACTION,
+            )
             routes = _parse_routes(raw, by_url)
             if routes:
                 logger.info("Routing model selected %d page(s) on attempt %d.",

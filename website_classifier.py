@@ -2,13 +2,13 @@
 Website Classifier — decide whether a homepage deserves a DEEP crawl.
 
 Runs once per newly-discovered site, right after the homepage is fetched (and
-right after Wappalyzer has fingerprinted it) — BEFORE the crawl planner is
-asked to plan a deep crawl and before any further page is fetched. Answers one
-question: is this the official website of ONE business, or a directory /
-aggregator / marketplace / travel-guide / review-site / listing-portal /
-unrelated informational page that merely LISTS or MENTIONS many businesses?
+right after Wappalyzer has fingerprinted it) — BEFORE the crawler queues any
+further page. Answers one question: is this the official website of ONE
+business, or a directory / aggregator / marketplace / travel-guide /
+review-site / listing-portal / unrelated informational page that merely
+LISTS or MENTIONS many businesses?
 
-    Official business website  -> deep_crawl          (crawl_planner runs as before)
+    Official business website  -> deep_crawl          (every homepage link is queued)
     Directory / aggregator /
     marketplace / travel guide /
     tourism / review / listing  -> extract_businesses  (mine its homepage links
@@ -42,7 +42,7 @@ Hybrid architecture (Step 2 of the redesign):
         -> LLM unavailable/bad?  fail OPEN to deep_crawl — a classifier bug or
                                   outage can only ever waste credits on an
                                   undetected directory, never drop a real
-                                  business (same invariant as crawl_planner)
+                                  business
 
 Caching: the decision is a fact about the SITE, not the query, so it's cached
 by domain alone (site_classifications.json, TTL-bounded) — independent of
@@ -67,6 +67,7 @@ from bs4 import BeautifulSoup
 import discovery_classifier as dc
 from discovery_classifier import LISTICLE_TITLE_RE, domain_key
 from LLM_planner import call_llm, get_client
+from model_router import TaskType
 
 logger = logging.getLogger("ai_bdm.website_classifier")
 
@@ -190,12 +191,12 @@ def extract_homepage_signals(
 ) -> HomepageSignals:
     """Cheap, deterministic signals from the homepage's ALREADY-fetched HTML.
 
-    Independently re-parses the same html string crawl_planner.py and
-    tech_stack.py already parse for their own purposes — consistent with this
-    codebase's existing pattern of each optional stage doing its own
-    lightweight, decoupled parse rather than sharing a mutable soup object.
+    Independently re-parses the same html string tech_stack.py already
+    parses for its own purposes — consistent with this codebase's existing
+    pattern of each optional stage doing its own lightweight, decoupled parse
+    rather than sharing a mutable soup object.
     """
-    from crawl_planner import detect_patterns, extract_homepage_candidates
+    from page_patterns import detect_patterns, extract_homepage_candidates
 
     soup = BeautifulSoup(html, "lxml")
     html_lang = (soup.html.get("lang", "") if soup.html else "").strip().lower()
@@ -384,7 +385,10 @@ def call_classifier_llm(messages: List[Dict[str, str]]) -> Optional[str]:
         logger.info("[Classifier] LLM unavailable (%s).", exc)
         return None
     try:
-        return call_llm(client, messages, response_format={"type": "json_object"})
+        return call_llm(
+            client, messages, response_format={"type": "json_object"},
+            task=TaskType.WEBSITE_CLASSIFICATION,
+        )
     except Exception as exc:  # noqa: BLE001 - degrade, never break the crawl
         logger.info("[Classifier] LLM call failed (%s).", exc)
         return None

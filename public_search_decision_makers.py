@@ -29,35 +29,15 @@ from decision_maker_extractor import (
     _build_person,
     _looks_like_person_name,
 )
+# Reuse linkedin_discovery's raw-Serper-call helper rather than keeping a
+# second, near-identical copy of it here.
+from linkedin_discovery import search_google_xray as _serper_search
 
 logger = logging.getLogger("ai_bdm.public_search_decision_makers")
 
 _SEARCH_TERMS = ("CEO", "Founder", "Leadership", "Team", "Management", "Executive")
 CONFIDENCE = 0.55  # below every on-site source's confidence — a search
                    # snippet has the least context of any source here.
-
-
-async def _serper_search(session: aiohttp.ClientSession, query: str) -> List[Dict[str, Any]]:
-    # Lazy import: see linkedin_discovery.py's identical note — avoids a
-    # circular import with phase1_pipeline, which imports this module.
-    from phase1_pipeline import SERPER_API_KEY, SERPER_SEARCH_URL, SERPER_TIMEOUT_S
-
-    if not SERPER_API_KEY:
-        return []
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-    try:
-        async with session.post(
-            SERPER_SEARCH_URL, json={"q": query, "num": 10}, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=SERPER_TIMEOUT_S),
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("organic", []) or []
-            logger.warning("Serper search failed (status=%s) for %r", resp.status, query)
-            return []
-    except Exception as exc:  # noqa: BLE001 - network layer, degrade quietly
-        logger.warning("Serper search error for %r: %s", query, exc)
-        return []
 
 
 # A real job title is never a run-on sentence. Verified via real testing: a

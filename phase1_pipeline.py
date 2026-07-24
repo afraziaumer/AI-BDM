@@ -9,15 +9,25 @@ Execution order:
      web search query, plus expanded exclude/include keywords for Step 5.
   2. Discovery via paginated Serper web search (returns business websites
      directly and scales to the requested count).
-  3. Two-tier scavenger scrape: fast native aiohttp request first, then
-     ZenRows residential proxy + JS render only for blocked URLs.
+  3. Two-tier scavenger scrape, decided independently PER PAGE (never "this
+     site needs premium, so every page on it does"): fast native aiohttp
+     request first; on a real block (Cloudflare/CAPTCHA/403/429/JS challenge/
+     empty protected response — see _classify_fetch_failure), escalate to
+     the single configured premium scraper (see PremiumScraper). Each page
+     starts back at Tier-1 by default — a per-domain scraper_cache.json (see
+     storage.py) is the only thing allowed to skip straight to the premium
+     tier, and only for a page whose OWN prior crawl already proved it needs
+     it.
   4. Extract email + phone, then thread-safe append to a local CSV archive.
 
 The number of results comes from the query itself ("give me 50 marinas...");
 there is no --limit flag. Env keys are read flexibly:
-  - Groq   : groq_llm_apikey1  | GROQ_API_KEY
-  - Serper : serper            | SERPER_API_KEY
-  - ZenRows: zenrows           | ZENROWS_API_KEY
+  - Groq    : groq_llm_apikey1  | GROQ_API_KEY
+  - Serper  : serper            | SERPER_API_KEY
+  - Premium scraper: zenrows    | ZENROWS_API_KEY  (kept as the variable name
+              for backward compatibility — see PremiumScraper's docstring:
+              exactly ONE premium provider is ever configured at a time, and
+              this key belongs to whichever one that is)
 
 Run:
   ./env/bin/python phase1_pipeline.py --query "give me 50 marinas in Dubai with no crm"
@@ -38,7 +48,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote, urljoin
 
 import aiohttp
@@ -50,7 +60,8 @@ from dotenv import load_dotenv
 from email_extractor import EmailExtractor
 
 # Reuse the already-tested Step-1 planner instead of duplicating LLM logic.
-from LLM_planner import plan_query, classify_business, generate_query_variations, moderate_query
+from LLM_planner import plan_query, generate_query_variations, moderate_query
+import relevance_scoring
 
 # Generic, reusable per-page semantic summary (page type, meta, structure,
 # content, anchors, metrics) — built once per crawled page, consumed by the
@@ -90,15 +101,6 @@ try:
     import tech_stack
 except ImportError:
     tech_stack = None  # type: ignore[assignment]
-
-# LLM Crawl Planner is likewise OPTIONAL: crawl_site falls back to queuing every
-# homepage link (its pre-existing behavior) if this module or the LLM it uses
-# is unavailable — a missing/failing planner can only mean less credit
-# savings, never less recall.
-try:
-    import crawl_planner
-except ImportError:
-    crawl_planner = None  # type: ignore[assignment]
 
 # Website Classifier is likewise OPTIONAL: crawl_site falls back to treating
 # every site as an official business (its pre-existing behavior) if this
@@ -161,13 +163,11 @@ def _make_connector() -> "aiohttp.TCPConnector":
 load_dotenv()
 
 SERPER_API_KEY = os.getenv("serper") or os.getenv("SERPER_API_KEY")
-# Tier-2 scraping provider: Scrape.do (replaces ZenRows). Token is read from the
-# existing env field so .env needs no renaming — prefers `scrapedo`, but falls
-# back to the old `zenrows` field if the token still lives there.
-SCRAPEDO_API_KEY = (
-    os.getenv("scrapedo") or os.getenv("SCRAPEDO_API_KEY")
-    or os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
-)
+# The ONE configured premium scraping provider (Tier-2) — see PremiumScraper.
+# The variable name stays ZENROWS_API_KEY for backward compatibility
+# regardless of which provider's key it actually holds; never introduce a
+# second premium-provider env var alongside it.
+ZENROWS_API_KEY = os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
 
 # Per-page crawl metadata index (NO page text / raw HTML — cleaned text lives in
 # storage/<domain>/*.txt behind the storage layer; see storage.py).
@@ -182,7 +182,8 @@ LAST_RUN_FILE = "last_run.json"
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 SERPER_PLACES_URL = "https://google.serper.dev/places"
-SCRAPEDO_URL = "https://api.scrape.do/"
+# Endpoint for the currently configured premium provider (see PremiumScraper).
+PREMIUM_SCRAPER_URL = "https://api.zenrows.com/v1/"
 
 # Tunable operational parameters (kept as named constants, not magic numbers).
 # Always sweep a FIXED number of Google pages (MAX_SEARCH_PAGES), fetching results
@@ -220,31 +221,28 @@ MAX_SOFT_FAIL_RETRIES = 2
 USE_PLACES_DISCOVERY = False
 SERPER_TIMEOUT_S = 15            # discovery requests
 NATIVE_FETCH_TIMEOUT_S = 10      # Tier-1 free request (fail fast, escalate/skip)
-SCRAPEDO_TIMEOUT_S = 18          # Tier-2 proxied fetch (give up sooner = faster)
 # NOTE: intra-site fetch batching was removed on purpose. The streaming crawl
 # processes strictly ONE page at a time (fetch → clean → stage → free) so at
 # most one page's raw HTML is ever in RAM per business being crawled.
-# Scrape.do plans cap how many requests you may run AT ONCE. Exceeding it returns
-# HTTP 429. This global limit keeps every proxied call under that cap (raise it
-# if your plan allows more). Native Tier-1 fetches are NOT throttled by this.
-SCRAPEDO_MAX_CONCURRENCY = 2
-SCRAPEDO_MAX_RETRIES = 2         # retry a transient failure (429/5xx/timeout/
-                                 # connection error) this many times before giving up
-SCRAPEDO_BACKOFF_S = 3           # base backoff between retries, doubled each attempt
 NATIVE_TRANSIENT_RETRIES = 1     # Tier-1: one quick retry on a connection-level
                                  # error only (a real HTTP response — WAF block,
-                                 # 4xx/5xx — escalates to Tier-2 immediately instead;
-                                 # retrying the same tier won't fix a block)
+                                 # 4xx/5xx — escalates to the premium tier
+                                 # immediately instead; retrying the same tier
+                                 # won't fix a block)
 NATIVE_RETRY_BACKOFF_S = 1.5
-# Cost optimization: by default Scrape.do fetches are CHEAP (raw HTML, no browser,
-# ~1 credit). If a cheap fetch fails, retry ONCE with JS rendering + premium proxy
-# — the expensive mode — only for sites that need it. Scrape.do bills only HTTP
-# 200s, so the cheap misses are free, making this cost-safe. On the render call,
-# images/CSS/fonts are blocked so the browser render stays fast.
-SCRAPEDO_RENDER_FALLBACK = True  # retry a failed cheap fetch with JS rendering
-SCRAPEDO_BLOCK_RESOURCES = True  # skip images/css/fonts on the render call (faster)
+
+# The single configured premium scraper (Tier-2) — see PremiumScraper. Cost
+# safety: cheap plain fetch first, JS render + premium proxy only on a failed
+# cheap attempt, since the provider bills only successful requests.
+PREMIUM_TIMEOUT_S = 25           # JS-render-capable fetches run slower than plain mode
+PREMIUM_MAX_CONCURRENCY = 2      # cap concurrent proxied calls (provider plans cap this too)
+PREMIUM_MAX_RETRIES = 2
+PREMIUM_BACKOFF_S = 3
+PREMIUM_RENDER_FALLBACK = True   # retry a failed cheap fetch with JS rendering
+PREMIUM_BLOCK_RESOURCES = True   # skip images/css/fonts on the render call (faster)
+
 HTTP_OK = (200, 201)
-HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to Tier-2
+HTTP_BLOCKED = (403, 429, 503)   # statuses that should escalate to the premium tier
 
 # Whole-site crawl: follow EVERY same-domain internal link so no page is missed.
 # The caps below are large SAFETY ceilings only — ordinary sites finish far below
@@ -303,8 +301,9 @@ _LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
 _ROBOTS_SITEMAP_RE = re.compile(r"(?im)^\s*sitemap:\s*(\S+)\s*$")
 
 # Post-scrape lead filtering = the negative-keyword "no X" rules (Step 5) plus
-# the LLM relevance classifier (Step 5.5, LLM_planner.classify_business). This
-# is the ONLY stage in the whole pipeline that validates a candidate's actual
+# the deterministic relevance scoring engine (Step 5.5, relevance_scoring.py —
+# LLM_planner.classify_business only runs as its narrow ambiguous-band safety
+# net). This is the ONLY stage in the whole pipeline that validates a candidate's actual
 # industry + location match — discovery_classifier.py (Step 2/3) only screens
 # noise/other-directories, and website_classifier.py (Layer 2) only screens
 # directory-vs-official; neither is query-aware. Turned back ON after briefly
@@ -319,20 +318,17 @@ LEAD_FILTERING_ENABLED = True
 # is ENABLED — this is the ONLY thing standing between "a directory/aggregator
 # site (expat.com, locallista.com, a brand's salon-finder page...) gets crawled
 # and stored as if it were itself the business" and a clean result set. It's
-# independent of the other two flags below: it decides deep_crawl vs discard,
-# NOT which pages to crawl (that's ENABLE_CRAWL_PLANNER) or whether a business
-# passes a relevance check (that's LEAD_FILTERING_ENABLED). Flip to False only
-# if you deliberately want directories treated as businesses.
+# independent of LEAD_FILTERING_ENABLED below: it decides deep_crawl vs
+# discard, not whether a business passes a relevance check. Flip to False
+# only if you deliberately want directories treated as businesses.
 ENABLE_WEBSITE_CLASSIFIER = True
 
-# LLM Crawl Planner (crawl_planner.py) is ENABLED — trades some knowledge-base
-# completeness (only the LLM-judged query-relevant pages get crawled, not
-# every internal page) for a large reduction in per-business scrape time and
-# Scrape.do credit usage: fewer pages fetched per site means fewer paid Tier-2
-# calls, the slowest operation in the pipeline. Flip back to False to return
-# to crawling every page that passes MAX_PAGES_PER_SITE/MAX_CRAWL_DEPTH/noise
-# filtering, unchanged, for a more durable long-term knowledge base instead.
-ENABLE_CRAWL_PLANNER = True
+# NOTE: the LLM Crawl Planner (crawl_planner.py) was removed as part of the
+# token-usage refactor — the crawler now always queues every noise-filtered
+# homepage link, bounded by MAX_PAGES_PER_SITE/MAX_CRAWL_DEPTH below, instead
+# of having an LLM pick a query-relevant subset. This trades some premium-
+# scraper credit savings for a complete, durable per-business knowledge base
+# and one fewer LLM call per site.
 
 # When True, each chosen email's domain is MX-validated (DNS only, no mail sent)
 # before it is accepted. Undeliverable/dead domains are dropped, so stored emails
@@ -416,14 +412,15 @@ BROWSER_HEADERS = {
     # the crawler's own network location implies. Sites that ignore
     # Accept-Language entirely (URL-path or GeoIP-based language selection,
     # or simply no English content at all) aren't affected by this header —
-    # see FORCE_ENGLISH_GEO_CODE below for the GeoIP case, handled via
-    # Scrape.do's proxy exit-country instead.
+    # see FORCE_ENGLISH_GEO_CODE below for the GeoIP case, handled via the
+    # premium scraper's proxy exit-country instead.
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Alternate User-Agents tried on successive Scrape.do retries — a block can be
-# fingerprint-based (a WAF flagging one specific UA string), so varying it on
-# retry sometimes gets through where the original request was blocked outright.
+# Alternate User-Agents tried on successive premium-scraper retries — a block
+# can be fingerprint-based (a WAF flagging one specific UA string), so
+# varying it on retry sometimes gets through where the original request was
+# blocked outright.
 _RETRY_USER_AGENTS = (
     BROWSER_HEADERS["User-Agent"],
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -434,30 +431,64 @@ _RETRY_USER_AGENTS = (
 
 # HTTP statuses worth retrying (rate-limited or a server-side hiccup) rather
 # than treating as a permanent failure (a real 4xx like 404/403 is not retried
-# — the same request will just fail the same way again).
-_SCRAPEDO_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+# — the same request will just fail the same way again). Used by
+# PremiumScraper.fetch.
+_PROXY_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
 
-# Scrape.do (Tier-2) exit-node country. Many sites pick their served language
-# from the VISITOR'S apparent country (GeoIP), not the Accept-Language header
-# — Accept-Language alone can't override that since it's a different signal.
-# Forcing the proxy's exit IP to a native-English country makes those sites
-# serve English the same way a real visitor browsing from the US would see.
-# Sites with no English content at all are still unaffected either way.
+# Premium scraper (Tier-2) exit-node country. Many sites pick their served
+# language from the VISITOR'S apparent country (GeoIP), not the
+# Accept-Language header — Accept-Language alone can't override that since
+# it's a different signal. Forcing the proxy's exit IP to a native-English
+# country makes those sites serve English the same way a real visitor
+# browsing from the US would see. Sites with no English content at all are
+# still unaffected either way.
 FORCE_ENGLISH_GEO_CODE = "us"
 
-ANTI_BOT_SIGNATURES = [
-    "just a moment...",
-    "checking your browser",
-    "captcha",
-    "ddos protection",
-    "cf-browser-verification",
-    "attention required",
-]
+# Body-text signature -> labeled failure reason. A dict (not a list) so the
+# SAME signature that tells us "this page is blocked" also tells us WHY —
+# used by _classify_fetch_failure() below. Every existing consumption site
+# (`any(sig in body.lower() for sig in ANTI_BOT_SIGNATURES)`) keeps working
+# unchanged: iterating a dict yields its keys, exactly like the old list did.
+ANTI_BOT_SIGNATURES = {
+    "just a moment...": "cloudflare_challenge",
+    "checking your browser": "js_challenge",
+    "cf-browser-verification": "cloudflare_challenge",
+    "attention required": "cloudflare_challenge",
+    "captcha": "captcha",
+    "ddos protection": "bot_protection",
+}
+
+
+def _classify_fetch_failure(status_code: Optional[int], body: str) -> str:
+    """Label WHY a page fetch failed — used for logging/diagnostics (and
+    persisted in the per-page scraper cache as a diagnostic field), never as
+    part of the tier-escalation decision itself (that's governed purely by
+    "did this tier return usable HTML," regardless of the labeled reason).
+
+    Checked in order: a genuine block signature in the body is the most
+    specific signal (a Cloudflare/JS/CAPTCHA page can arrive with ANY status
+    code, including a faked 200), then the status code itself, then "empty
+    protected response" (a 200 with nothing in it — some WAFs return a blank
+    body instead of a visible challenge page), else "unknown_block".
+    """
+    body_low = (body or "").lower()
+    for signature, reason in ANTI_BOT_SIGNATURES.items():
+        if signature in body_low:
+            return reason
+    if status_code == 403:
+        return "forbidden_403"
+    if status_code == 429:
+        return "rate_limited_429"
+    if status_code in HTTP_OK and not body_low.strip():
+        return "empty_protected_response"
+    if status_code and status_code >= 500:
+        return "server_error"
+    return "unknown_block"
 
 # === Step 0: Query moderation ===============================================
 async def moderate_user_query(user_prompt: str) -> Dict[str, Any]:
-    """Block a policy-violating query BEFORE any resources (Serper, Scrape.do,
-    the intent/route-planner LLM calls, storage) are spent on it.
+    """Block a policy-violating query BEFORE any resources (Serper, the
+    premium scraper, the intent/route-planner LLM calls, storage) are spent on it.
 
     Delegates to LLM_planner.moderate_query (sync, with its own primary/
     fallback model failover, and fails OPEN on any error — see its
@@ -553,9 +584,9 @@ def _is_internal_crawl_noise(host: str, path: str) -> bool:
         "/privacy", "/terms", "/cookies", "/cookie-policy", "/sitemap",
         "/robots.txt", "/feed", "/rss", "/tag/", "/author/", "/search",
         # pure auth-ACTION endpoints — no content, no business/portal signal
-        # beyond what /login itself already gives (kept crawlable: see
-        # crawl_planner.py, which scores /login and /register as candidates —
-        # a CRM/portal-detection query may specifically want them crawled).
+        # beyond what /login itself already gives (kept crawlable: /login and
+        # /register are NOT filtered here — a CRM/portal-detection query may
+        # specifically want them crawled).
         "/logout", "/log-out", "/forgot-password", "/reset-password",
         # blog / news / article sections — not contact-bearing, big noise + slow
         "/blog", "/blogs", "/news", "/article", "/articles", "/press",
@@ -591,7 +622,7 @@ async def _read_html(resp: aiohttp.ClientResponse) -> str:
 
 
 async def _native_get(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Cheap, best-effort native GET (no ZenRows). Returns HTML or None."""
+    """Cheap, best-effort native GET (no premium scraper). Returns HTML or None."""
     try:
         async with session.get(
             url, headers=BROWSER_HEADERS,
@@ -864,7 +895,8 @@ async def discover_targets(
                 timeout=aiohttp.ClientTimeout(total=SERPER_TIMEOUT_S),
             ) as resp:
                 if resp.status != 200:
-                    logger.error("Serper search failed (status=%s).", resp.status)
+                    body = await resp.text()
+                    logger.error("Serper search failed (status=%s): %s", resp.status, body[:300])
                     break
                 data = await resp.json()
         except Exception as exc:  # noqa: BLE001 - network layer, log and degrade
@@ -933,111 +965,120 @@ async def discover_targets(
 
 
 # === Step 3: Two-tier scavenger scrape =====================================
-# Global throttle: never run more than SCRAPEDO_MAX_CONCURRENCY proxied requests
-# at once, so we stay under the Scrape.do plan's concurrent-request cap (429s).
-_scrapedo_semaphore = asyncio.Semaphore(SCRAPEDO_MAX_CONCURRENCY)
+class PremiumScraper:
+    """The ONE configured premium scraping provider (Tier-2) — tried only
+    after Tier-1 native has genuinely failed for a page. The rest of the
+    crawler calls PremiumScraper.fetch(...) and never knows or detects which
+    provider is behind it; there is never a second premium provider tried as
+    a fallback.
 
-
-async def _scrapedo_fetch(
-    session: aiohttp.ClientSession, target_url: str, render: bool
-) -> Tuple[str, Dict[str, str], List[str]]:
-    """One Scrape.do proxy fetch. Returns (html, headers); html is "" on failure.
-
-    render=False → cheap: raw HTML through the proxy, no browser (~1 credit).
-    render=True  → expensive: runs a headless browser (JS) via a premium proxy
-                   for hard/SPA sites, with images/CSS/fonts blocked so it's fast.
-    Concurrency-throttled and retried with exponential backoff on ANY transient
-    failure — rate-limited (429), a server-side hiccup (5xx), or a network-level
-    timeout/connection error — not just 429. Each retry also rotates the
-    forwarded User-Agent (see _RETRY_USER_AGENTS), in case the block is
-    fingerprint-based rather than rate/volume-based. A genuine non-transient
-    HTTP status (403/404/...) is NOT retried — the same request would just fail
-    the same way again. Scrape.do bills only HTTP 200s, so failed cheap
-    attempts cost nothing. Headers are Scrape.do's own response headers
-    (best-effort passthrough), not guaranteed identical to the origin's — still
-    useful bonus signal for tech detection when present.
-
-    Forces English content two ways: `geoCode` pins the proxy's exit IP to
-    FORCE_ENGLISH_GEO_CODE (defeats GeoIP-based language selection — the site
-    sees a US visitor, same as it would for a real one), and `customHeaders`
-    forwards our own Accept-Language header instead of Scrape.do's default
-    (defeats content-negotiation-based language selection). Sites with no
-    English content at all are unaffected by either — there's nothing to
-    switch to.
+    Wired today to ZenRows' API contract, keyed by ZENROWS_API_KEY (kept as
+    the variable/env name for backward compatibility regardless of which
+    provider's key it actually holds — see that constant's docstring). To
+    switch providers in the future, update THIS class's request shape (URL,
+    param names) to the new provider's contract; no other file needs to
+    change and no dual-provider detection is ever introduced.
     """
-    params: Dict[str, str] = {
-        "token": SCRAPEDO_API_KEY, "url": target_url,
-        "geoCode": FORCE_ENGLISH_GEO_CODE,
-        "customHeaders": "true",
-    }
-    if render:
-        params["render"] = "true"       # execute JavaScript (headless browser)
-        params["super"] = "true"        # premium residential proxies
-        if SCRAPEDO_BLOCK_RESOURCES:
-            params["blockResources"] = "true"   # skip images/css/fonts → faster
-    mode = "render" if render else "plain"
 
-    for attempt in range(SCRAPEDO_MAX_RETRIES + 1):
-        forwarded_headers = {
-            "Accept-Language": BROWSER_HEADERS["Accept-Language"],
-            "User-Agent": _RETRY_USER_AGENTS[attempt % len(_RETRY_USER_AGENTS)],
+    # Global throttle: never run more than PREMIUM_MAX_CONCURRENCY proxied
+    # requests at once, so we stay under the provider plan's concurrent-
+    # request cap (429s).
+    _semaphore = asyncio.Semaphore(PREMIUM_MAX_CONCURRENCY)
+
+    @staticmethod
+    async def fetch(
+        session: aiohttp.ClientSession, target_url: str, render: bool
+    ) -> Tuple[str, Dict[str, str], List[str]]:
+        """One premium-scraper proxy fetch. Returns (html, headers, cookies);
+        html is "" on failure.
+
+        render=False → cheap: raw HTML, no browser.
+        render=True  → expensive: premium proxy + headless JS rendering, for
+                       hard/SPA sites, with images/CSS/fonts blocked so it's
+                       fast.
+        Concurrency-throttled and retried with exponential backoff on ANY
+        transient failure — rate-limited (429), a server-side hiccup (5xx),
+        or a network-level timeout/connection error — not just 429. Each
+        retry also rotates the forwarded User-Agent (see _RETRY_USER_AGENTS),
+        in case the block is fingerprint-based rather than rate/volume-based.
+        A genuine non-transient HTTP status (403/404/...) is NOT retried —
+        the same request would just fail the same way again.
+
+        Forces English content two ways: `proxy_country` pins the proxy's
+        exit IP to FORCE_ENGLISH_GEO_CODE (defeats GeoIP-based language
+        selection — the site sees a US visitor, same as it would for a real
+        one), and `custom_headers` forwards our own Accept-Language header
+        instead of the provider's default (defeats content-negotiation-based
+        language selection). Sites with no English content at all are
+        unaffected by either — there's nothing to switch to.
+        """
+        params: Dict[str, str] = {
+            "apikey": ZENROWS_API_KEY, "url": target_url,
+            "custom_headers": "true",
         }
-        retry_reason: Optional[str] = None
-        try:
-            async with _scrapedo_semaphore:       # cap concurrent proxied calls
-                async with session.get(
-                    SCRAPEDO_URL, params=params, headers=forwarded_headers,
-                    timeout=aiohttp.ClientTimeout(total=SCRAPEDO_TIMEOUT_S),
-                ) as resp:
-                    if resp.status == 200:
-                        return (await _read_html(resp), dict(resp.headers),
-                                resp.headers.getall("Set-Cookie", []))
-                    if resp.status in _SCRAPEDO_TRANSIENT_STATUS:
-                        retry_reason = f"status={resp.status}"
-                    else:
-                        logger.error("Scrape.do %s failed (status=%s): %s",
-                                     mode, resp.status, target_url)
-                        return "", {}, []
-        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-            retry_reason = f"{type(exc).__name__}: {exc}"
-        except Exception as exc:  # noqa: BLE001 - unexpected, not worth retrying
-            logger.error("Scrape.do %s unexpected error for %s: %s", mode, target_url, repr(exc))
-            return "", {}, []
+        if render:
+            params["js_render"] = "true"
+            params["premium_proxy"] = "true"
+            params["proxy_country"] = FORCE_ENGLISH_GEO_CODE
+            if PREMIUM_BLOCK_RESOURCES:
+                params["block_resources"] = "image,media,font"
+        mode = "render" if render else "plain"
 
-        if attempt >= SCRAPEDO_MAX_RETRIES:
-            logger.error("Scrape.do %s exhausted %d attempt(s) for %s (%s)",
-                         mode, attempt + 1, target_url, retry_reason)
-            return "", {}, []
-        wait = SCRAPEDO_BACKOFF_S * (2 ** attempt)
-        logger.warning(
-            "Scrape.do %s transient failure (%s) — retrying in %ss with a "
-            "different User-Agent (attempt %d/%d): %s",
-            mode, retry_reason, wait, attempt + 2, SCRAPEDO_MAX_RETRIES + 1, target_url,
-        )
-        await asyncio.sleep(wait)
-    return "", {}, []
+        for attempt in range(PREMIUM_MAX_RETRIES + 1):
+            forwarded_headers = {
+                "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+                "User-Agent": _RETRY_USER_AGENTS[attempt % len(_RETRY_USER_AGENTS)],
+            }
+            retry_reason: Optional[str] = None
+            try:
+                async with PremiumScraper._semaphore:  # cap concurrent proxied calls
+                    async with session.get(
+                        PREMIUM_SCRAPER_URL, params=params, headers=forwarded_headers,
+                        timeout=aiohttp.ClientTimeout(total=PREMIUM_TIMEOUT_S),
+                    ) as resp:
+                        if resp.status == 200:
+                            return (await _read_html(resp), dict(resp.headers),
+                                    resp.headers.getall("Set-Cookie", []))
+                        if resp.status in _PROXY_TRANSIENT_STATUS:
+                            retry_reason = f"status={resp.status}"
+                        else:
+                            logger.error("Premium scraper %s failed (status=%s): %s",
+                                         mode, resp.status, target_url)
+                            return "", {}, []
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                retry_reason = f"{type(exc).__name__}: {exc}"
+            except Exception as exc:  # noqa: BLE001 - unexpected, not worth retrying
+                logger.error("Premium scraper %s unexpected error for %s: %s",
+                             mode, target_url, repr(exc))
+                return "", {}, []
+
+            if attempt >= PREMIUM_MAX_RETRIES:
+                logger.error("Premium scraper %s exhausted %d attempt(s) for %s (%s)",
+                             mode, attempt + 1, target_url, retry_reason)
+                return "", {}, []
+            wait = PREMIUM_BACKOFF_S * (2 ** attempt)
+            logger.warning(
+                "Premium scraper %s transient failure (%s) — retrying in %ss with "
+                "a different User-Agent (attempt %d/%d): %s",
+                mode, retry_reason, wait, attempt + 2, PREMIUM_MAX_RETRIES + 1, target_url,
+            )
+            await asyncio.sleep(wait)
+        return "", {}, []
 
 
-async def execute_scavenger_scrape(
+async def _tier1_native_fetch(
     session: aiohttp.ClientSession, target_url: str
-) -> Dict[str, Any]:
-    """Tier-1 native fetch; on block/error fail over to Tier-2 Scrape.do.
+) -> Optional[Dict[str, Any]]:
+    """Low-cost native request (one quick retry on connection error only).
 
-    Returns {"html", "method", "headers", "status_code", "cookies"}. Headers
-    AND raw Set-Cookie header strings are captured from the SAME response
-    already being fetched (no extra request) so downstream tech-stack
-    detection (Wappalyzer) can use them without a second call to the site —
-    `cookies` uses `.getall("Set-Cookie", [])` specifically because a plain
-    `dict(resp.headers)` collapses multiple same-named headers to just the
-    last one, silently dropping every cookie but one.
-
-    A connection-level error (DNS blip, reset, timeout) gets one quick retry on
-    Tier-1 itself before escalating — cheap insurance against a purely
-    transient network hiccup. A real HTTP response (WAF block, 4xx/5xx)
-    escalates to Tier-2 immediately instead — retrying the identical Tier-1
+    Returns a result dict on success OR on a definitive 404 (nothing to
+    escalate to — a 404 is a 404 on every tier, no point spending a proxy
+    credit to confirm it again). Returns None to mean "blocked, escalate to
+    the premium tier" — a connection-level error (DNS blip, reset, timeout)
+    gets one quick retry on Tier-1 itself first; a real HTTP response (WAF
+    block, 4xx/5xx) escalates immediately since retrying the identical
     request wouldn't change the outcome.
     """
-    # --- Tier 1: low-cost native request (one quick retry on connection error) ---
     for attempt in range(NATIVE_TRANSIENT_RETRIES + 1):
         try:
             logger.info("Tier-1 native fetch: %s", target_url)
@@ -1053,17 +1094,18 @@ async def execute_scavenger_scrape(
                     return {"html": body, "method": "NATIVE", "headers": dict(resp.headers),
                             "status_code": resp.status,
                             "cookies": resp.headers.getall("Set-Cookie", [])}
+                reason = _classify_fetch_failure(resp.status, body)
                 logger.warning(
-                    "Tier-1 blocked (status=%s, waf=%s): %s",
-                    resp.status, waf_detected, target_url,
+                    "Tier-1 blocked (status=%s, reason=%s): %s",
+                    resp.status, reason, target_url,
                 )
-                # A genuine 404 means the page simply doesn't exist — Scrape.do would
-                # 404 too, so don't waste a proxy credit/30s escalating it. (If the
-                # 404 came WITH an anti-bot signature it may be a faked block, so we
-                # still escalate that case.)
+                # A genuine 404 means the page simply doesn't exist — the premium
+                # scraper would 404 too, so don't waste a proxy credit/30s
+                # escalating it. (If the 404 came WITH an anti-bot signature it
+                # may be a faked block, so we still escalate that case.)
                 if resp.status == 404 and not waf_detected:
                     return {"html": "", "method": "FAILED", "headers": {},
-                            "status_code": 404, "cookies": []}
+                            "status_code": 404, "cookies": [], "failure_reason": "not_found_404"}
                 break  # a real (blocked/waf'd) response -> escalate now, don't retry Tier-1
         except Exception as exc:  # noqa: BLE001 - connection-level; worth one quick retry
             if attempt >= NATIVE_TRANSIENT_RETRIES:
@@ -1073,32 +1115,119 @@ async def execute_scavenger_scrape(
             logger.warning("Tier-1 connection failed for %s — retrying in %ss: %s",
                            target_url, NATIVE_RETRY_BACKOFF_S, exc)
             await asyncio.sleep(NATIVE_RETRY_BACKOFF_S)
+    return None  # blocked -> escalate to the premium tier
 
-    # --- Tier 2: Scrape.do — cheap proxy first, JS-render fallback on failure ---
-    if not SCRAPEDO_API_KEY:
-        logger.error("Scrape.do token missing; cannot escalate %s", target_url)
-        return {"html": "", "method": "FAILED", "headers": {}, "status_code": None, "cookies": []}
 
-    logger.info("Tier-2 Scrape.do escalation: %s", target_url)
-    # 2a — cheap: raw HTML through the proxy, no browser (cheapest, ~1 credit).
-    html, headers, cookies = await _scrapedo_fetch(session, target_url, render=False)
+async def _tier2_premium_fetch(
+    session: aiohttp.ClientSession, target_url: str
+) -> Optional[Dict[str, Any]]:
+    """The configured premium scraper — cheap fetch first, JS-render fallback
+    on failure. Returns None (no more tiers left) on any failure, including a
+    missing/not-yet-configured API key."""
+    if not ZENROWS_API_KEY:
+        logger.info("Premium scraper not configured (no API key) — skipping Tier-2 for %s",
+                    target_url)
+        return None
+
+    logger.info("Tier-2 premium-scraper escalation: %s", target_url)
+    html, headers, cookies = await PremiumScraper.fetch(session, target_url, render=False)
     if html:
         logger.info("Tier-2 success (plain): %s", target_url)
-        # Scrape.do bills (and therefore returns HTML) only for HTTP 200s.
-        return {"html": html, "method": "SCRAPEDO", "headers": headers,
+        return {"html": html, "method": "PREMIUM", "headers": headers,
                 "status_code": 200, "cookies": cookies}
 
-    # 2b — fallback: only sites that failed cheap get the expensive JS render +
-    # premium proxy (images/css/fonts blocked for speed). Cost-safe: the cheap
-    # miss above was free, and Scrape.do bills only successful (200) requests.
-    if SCRAPEDO_RENDER_FALLBACK:
-        html, headers, cookies = await _scrapedo_fetch(session, target_url, render=True)
+    # Fallback: only pages that failed cheap get the expensive JS render +
+    # premium proxy (images/css/fonts blocked for speed). Cost-safe: the
+    # cheap miss above was free, and the provider bills only successful
+    # (200) requests.
+    if PREMIUM_RENDER_FALLBACK:
+        html, headers, cookies = await PremiumScraper.fetch(session, target_url, render=True)
         if html:
             logger.info("Tier-2 success (render): %s", target_url)
-            return {"html": html, "method": "SCRAPEDO_RENDER", "headers": headers,
+            return {"html": html, "method": "PREMIUM_RENDER", "headers": headers,
                     "status_code": 200, "cookies": cookies}
+    return None
 
-    return {"html": "", "method": "FAILED", "headers": {}, "status_code": None, "cookies": []}
+
+# Ordered cheapest-first. Each entry's name is exactly what gets written into
+# a page's scraper_cache.json entry on success (see storage.py).
+_TIER_SEQUENCE: Tuple[Tuple[str, Any], ...] = (
+    ("normal", _tier1_native_fetch),
+    ("premium", _tier2_premium_fetch),
+)
+_METHOD_TO_TIER: Dict[str, str] = {
+    "NATIVE": "normal",
+    "PREMIUM": "premium", "PREMIUM_RENDER": "premium",
+}
+
+
+async def execute_scavenger_scrape(
+    session: aiohttp.ClientSession, target_url: str, *,
+    domain: str = "", scraper_cache: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Fetch one page, deciding the cheapest scraper tier for THIS page
+    independently — never "the homepage needed the premium scraper, so every
+    page on this site does." Priority order: Tier-1 native (default) ->
+    Tier-2 the configured PremiumScraper -> FAILED. The premium tier is
+    tried only after Tier-1 has genuinely failed for this exact page.
+
+    `scraper_cache` (path -> tier name: "normal"/"premium"), when given, is
+    the ONLY thing allowed to skip the cheaper tier — and only for a page
+    whose OWN prior crawl already proved it needs the pricier one. Every
+    page NOT already in the cache (new page, or no cache at all)
+    still starts at Tier-1, exactly like today — premium usage never
+    becomes "the default for this website." The cache dict is mutated in
+    place (the caller owns persisting it); `domain` is accepted for
+    call-site symmetry/future use but the cache key is path-only (the dict
+    itself is already scoped to one domain by convention).
+
+    Returns {"html", "method", "headers", "status_code", "cookies"} plus
+    "failure_reason" when "method" == "FAILED". Headers AND raw Set-Cookie
+    header strings are captured from the SAME response already being
+    fetched (no extra request) so downstream tech-stack detection
+    (Wappalyzer) can use them without a second call to the site —
+    `cookies` uses `.getall("Set-Cookie", [])` specifically because a plain
+    `dict(resp.headers)` collapses multiple same-named headers to just the
+    last one, silently dropping every cookie but one.
+    """
+    cache = scraper_cache if scraper_cache is not None else {}
+    path_key = urlparse(target_url).path or "/"
+    cached_tier = cache.get(path_key)
+
+    start_index = 0
+    if cached_tier:
+        for i, (name, _fn) in enumerate(_TIER_SEQUENCE):
+            if name == cached_tier:
+                start_index = i
+                break
+        if start_index:
+            logger.info("Scraper cache: %s previously needed '%s' — starting there.",
+                        target_url, cached_tier)
+
+    for name, tier_fn in _TIER_SEQUENCE[start_index:]:
+        result = await tier_fn(session, target_url)
+        if result is not None:
+            if result.get("html"):
+                cache[path_key] = _METHOD_TO_TIER.get(result["method"], name)
+            return result
+
+    if start_index:
+        # The cached shortcut no longer works (the site changed since we last
+        # crawled it) — retry only the CHEAPER tiers the shortcut skipped,
+        # never the ones already just tried and failed above. A stale cache
+        # entry must only ever cost one extra attempt, never a permanent miss.
+        logger.info("Cached tier '%s' no longer works for %s — trying cheaper "
+                    "tiers from scratch.", cached_tier, target_url)
+        cache.pop(path_key, None)
+        for name, tier_fn in _TIER_SEQUENCE[:start_index]:
+            result = await tier_fn(session, target_url)
+            if result is not None:
+                if result.get("html"):
+                    cache[path_key] = _METHOD_TO_TIER.get(result["method"], name)
+                return result
+
+    return {"html": "", "method": "FAILED", "headers": {}, "status_code": None,
+            "cookies": [], "failure_reason": "all_tiers_exhausted"}
 
 
 # === Step 3.5: Whole-site crawl ============================================
@@ -1280,6 +1409,74 @@ def _contact_priority(url: str) -> int:
     return 2       # normal pages
 
 
+# --- Hybrid Relevance Gate (see crawl_site) --------------------------------
+LIMITED_CRAWL_MAX_PAGES = 10  # upper bound on the exploratory "is this even
+                              # the right industry" pass before committing to
+                              # a full site crawl
+MIN_LIMITED_CRAWL_PAGES = 5   # floor: if URL-keyword matching finds fewer
+                              # candidates than this (e.g. non-descriptive
+                              # URL slugs), top up with the next
+                              # highest-priority pages regardless of keyword
+                              # match — a real business must not get
+                              # rejected just because its URLs are generic
+
+# Common service/hospitality/rental vocabulary that route_planner.py's
+# generic HIGH/MEDIUM_PRIORITY_HINTS don't cover (those are aimed at
+# general B2B "what does this company do" pages, not amenity/booking
+# pages specifically) — supplements, does not replace, those hints.
+_SUPPLEMENTARY_HIGH_VALUE_HINTS = frozenset({
+    "facilities", "facility", "fleet", "rentals", "rental",
+    "booking", "bookings", "reservations", "reservation", "amenities",
+})
+
+
+def _filter_high_value_urls(
+    urls: Sequence[str], industry: str, include_keywords: Sequence[str],
+) -> List[str]:
+    """Restrict a homepage's internal links to the ones worth fetching for
+    the Hybrid Relevance Gate's LIMITED crawl (MEDIUM-confidence case) —
+    reuses route_planner.py's existing rule-based page-priority hints
+    (lazy import: route_planner.py imports phase1_pipeline, so the reverse
+    import must not happen at module load time — same pattern already used
+    in page_retrieval.py's rerank()) rather than a new hardcoded table, plus
+    the CURRENT query's own industry/include_keywords (so "marina"-specific
+    terms are derived from the query, never hardcoded), plus a small
+    supplementary hint set for common amenity/booking vocabulary.
+
+    Never returns fewer than MIN_LIMITED_CRAWL_PAGES results (when `urls`
+    has that many to offer) — tops up with the next-priority URLs
+    regardless of keyword match, so a real business with non-descriptive
+    URL slugs doesn't get starved down to zero candidates and wrongly
+    rejected after the limited crawl.
+    """
+    from route_planner import HIGH_PRIORITY_HINTS, MEDIUM_PRIORITY_HINTS, IGNORE_HINTS
+
+    extra_terms = {t.strip().lower() for t in [industry, *include_keywords] if t}
+    extra_tokens: Set[str] = set()
+    for term in extra_terms:
+        extra_tokens.update(tok for tok in re.split(r"[\s\-_/]+", term) if tok)
+
+    high_value: List[str] = []
+    for u in urls:
+        segments = {s for s in re.split(r"[/\-_]+", urlparse(u).path.lower()) if s}
+        if segments & IGNORE_HINTS:
+            continue
+        if (segments & HIGH_PRIORITY_HINTS or segments & MEDIUM_PRIORITY_HINTS
+                or segments & _SUPPLEMENTARY_HIGH_VALUE_HINTS or segments & extra_tokens):
+            high_value.append(u)
+
+    if len(high_value) < MIN_LIMITED_CRAWL_PAGES:
+        already = set(high_value)
+        for u in sorted(urls, key=_contact_priority):
+            if len(high_value) >= MIN_LIMITED_CRAWL_PAGES:
+                break
+            if u not in already:
+                high_value.append(u)
+                already.add(u)
+
+    return high_value
+
+
 def _path_is_contactish(url: str) -> bool:
     """True if a URL's path looks like a contact/about/legal page (any language)."""
     path = urlparse(url).path.lower()
@@ -1385,12 +1582,14 @@ async def crawl_site(
     include_keywords: Optional[List[str]] = None,
     user_query: str = "",
     industry: str = "",
+    geo: str = "",
+    scraper_cache: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """STREAMING contact-first crawl of one business site.
 
     Discovery order is unchanged (sitemap/robots contact probes first, then
-    internal links, contact-ish first; two-tier native→Scrape.do fetch; depth
-    and fetch-budget bounds). What changed is the data flow: pages are processed
+    internal links, contact-ish first; two-tier native→premium-scraper fetch;
+    depth and fetch-budget bounds). What changed is the data flow: pages are processed
     strictly ONE AT A TIME —
 
         fetch → extract hyperlinks (raw soup) → clean for LLM →
@@ -1413,6 +1612,12 @@ async def crawl_site(
     domain = _domain_key(root_url)
     exclude_keywords = exclude_keywords or []
     include_keywords = include_keywords or []
+    # Per-page scraper-tier decisions (see execute_scavenger_scrape) — one
+    # dict for the whole domain, accumulating entries from every page this
+    # crawl fetches, staged once at the end. Defaults to a fresh dict for any
+    # standalone/test caller that doesn't pass one in.
+    if scraper_cache is None:
+        scraper_cache = {}
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     pages_kept = 0
@@ -1548,7 +1753,7 @@ async def crawl_site(
             "physical_address": contacts["address"] or "N/A",
             "txt_path": txt_path,
             "crawl_status": "ok",
-            "http_status": method,          # scrape tier (NATIVE/SCRAPEDO)
+            "http_status": method,          # scrape tier (NATIVE/PREMIUM)
             "content_length": str(len(text)),
             "word_count": str(cleaned["word_count"]),
             "timestamp": now_iso,
@@ -1626,7 +1831,9 @@ async def crawl_site(
         if english_url and _normalize_page_url(english_url) != _normalize_page_url(root_url):
             logger.info("%s declares an English variant (%s) — switching to it.",
                         domain, english_url)
-            fetched = await execute_scavenger_scrape(session, english_url)
+            fetched = await execute_scavenger_scrape(
+                session, english_url, domain=domain, scraper_cache=scraper_cache,
+            )
             if fetched.get("html"):
                 root_url = english_url
                 root_html = fetched["html"]
@@ -1728,87 +1935,170 @@ async def crawl_site(
             "discovered_businesses": discovered_businesses,
         }
 
-    # LLM Crawl Planner: decide which of the homepage's own links are worth
-    # fetching for THIS query, within a small budget — instead of queuing every
-    # link (the old behavior, which is exactly what wasted Scrape.do credits on
-    # hundreds of blog/product pages). Runs on the SAME raw HTML above, still in
-    # memory. Falls back to the full, unfiltered link set on ANY failure
-    # (module missing, LLM down, bad response) so a planner outage can only
-    # ever mean less credit savings for this site, never less recall.
-    planned_urls = home_link_urls
-    if ENABLE_CRAWL_PLANNER and crawl_planner is not None:
-        try:
-            planned = await asyncio.to_thread(
-                crawl_planner.plan_site_crawl,
-                domain, root_url, root_html, user_query, industry,
-                exclude_keywords, include_keywords,
-            )
-            if planned:
-                planned_urls = planned
-        except Exception as exc:  # noqa: BLE001 - planning is best-effort
-            logger.warning("Crawl planning failed for %s, falling back to full "
-                           "link set: %s", domain, exc)
-
     del root_html  # the raw homepage HTML is not needed past this point
 
+    # --- Hybrid Relevance Gate ------------------------------------------------
+    # Cheap homepage-only pre-check (zero extra fetches, no premium scraper,
+    # no LLM call) using the SAME relevance_scoring engine the full-crawl
+    # check uses later — _process_one already ran once for the homepage, so
+    # sample_parts/address/schema_organization already reflect it.
+    homepage_relevance = relevance_scoring.score_relevance(
+        industry, geo, company_name, domain,
+        " ".join(sample_parts), address or "", schema_organization,
+        skip_safety_net=True,
+    )
+    gate_verdict = homepage_relevance["verdict"]
+    limited_mode = gate_verdict == "possible_match"
+
+    if gate_verdict == "reject":
+        # LOW confidence (score <40): clearly the wrong industry on the
+        # homepage alone (government/school/news/tourism-portal territory) —
+        # discard now. Never touches internal pages, the search index, tech
+        # stack profiling, or any further LLM/premium-scraper call.
+        logger.info(
+            "[RelevanceGate] %s rejected on homepage alone (score=%d, %s) — "
+            "skipping the full crawl entirely.",
+            domain, homepage_relevance["score"], homepage_relevance["reason"],
+        )
+        return {
+            "domain": domain, "pages_kept": pages_kept, "attempts": 0,
+            "emails": emails, "phones": phones, "address": address,
+            "matched_exclude": sorted(matched_exclude), "matched_include": sorted(matched_include),
+            "sample_text": " ".join(sample_parts),
+            "external_links": external_links, "decision_makers": decision_makers,
+            "schema_organization": schema_organization,
+            "rejected_by_gate": True, "gate_reason": homepage_relevance["reason"],
+        }
+
     visited: Set[str] = {_normalize_page_url(root_url)}
-    # High-value contact pages first (sitemap/robots/probe), then the crawl
-    # planner's selected homepage links (or all of them, if planning fell back).
-    # Both are filtered against the site's OWN other-language path prefixes (if
-    # any were declared) so the crawl never wanders into another locale.
+    # High-value contact pages first (sitemap/robots/probe), then every other
+    # noise-filtered homepage link — the crawler intentionally crawls the
+    # complete site (no LLM picking a query-relevant subset), bounded by
+    # MAX_PAGES_PER_SITE/MAX_CRAWL_DEPTH/MAX_FETCH_ATTEMPTS below. Both are
+    # filtered against the site's OWN other-language path prefixes (if any
+    # were declared) so the crawl never wanders into another locale.
     priority_urls = _drop_other_language_links(
         await _discover_contact_urls(session, root_url, domain), other_lang_prefixes,
     )
-    queue: List[tuple[str, int]] = (
-        [(u, 1) for u in priority_urls]
-        + [(u, 1) for u in sorted(
-            _drop_other_language_links(planned_urls, other_lang_prefixes),
-            key=_contact_priority,
-        )]
+    all_internal_urls = sorted(
+        _drop_other_language_links(home_link_urls, other_lang_prefixes),
+        key=_contact_priority,
     )
 
-    head = 0
-    attempts = 0
-    while (
-        head < len(queue)
-        and pages_kept < MAX_PAGES_PER_SITE
-        and attempts < MAX_FETCH_ATTEMPTS
-    ):
-        # STRICTLY one page at a time (mandatory streaming): fetch, process,
-        # free, then move on. No intra-site fetch batching — the single-HTML-
-        # in-RAM guarantee outranks the concurrency speedup here.
-        page_url, depth = queue[head]
-        head += 1
-        norm = _normalize_page_url(page_url)
-        if norm in visited or depth > MAX_CRAWL_DEPTH:
-            continue
-        visited.add(norm)
-
-        attempts += 1
-        fetched = await execute_scavenger_scrape(session, page_url)
-        html = fetched.get("html") or ""
-        method = fetched.get("method", "FAILED")
-        status_code = fetched.get("status_code")
-        del fetched
-        if not html:
-            continue
-        inner_links = _drop_other_language_links(
-            await _process_one(page_url, html, method, status_code), other_lang_prefixes,
+    if limited_mode:
+        # MEDIUM confidence (40-64): not conclusive from the homepage alone
+        # — explore only a small set of high-value pages first, instead of
+        # committing to the full site.
+        logger.info(
+            "[RelevanceGate] %s uncertain on homepage alone (score=%d) — "
+            "limited crawl of high-value pages first.",
+            domain, homepage_relevance["score"],
         )
-        del html  # raw HTML freed immediately after processing
+        first_pass_urls = _filter_high_value_urls(all_internal_urls, industry, include_keywords)
+        first_pass_urls = first_pass_urls[:LIMITED_CRAWL_MAX_PAGES]
+        remaining_urls = [u for u in all_internal_urls if u not in set(first_pass_urls)]
+        page_cap = min(MAX_PAGES_PER_SITE, pages_kept + LIMITED_CRAWL_MAX_PAGES)
+    else:
+        # HIGH confidence (>=65): proceed exactly as before — full crawl,
+        # no restriction.
+        first_pass_urls = all_internal_urls
+        remaining_urls = []
+        page_cap = MAX_PAGES_PER_SITE
 
-        if depth < MAX_CRAWL_DEPTH:
-            for link in sorted(inner_links, key=_contact_priority):
-                if _normalize_page_url(link) not in visited:
-                    queue.append((link, depth + 1))
+    attempts = 0
 
-        # Once we have a reachable contact (email AND phone) and covered the
-        # priority pages, stop — the rest is noise.
-        if (STOP_WHEN_CONTACT_COMPLETE and emails and phones
-                and pages_kept >= MIN_PAGES_BEFORE_STOP):
-            logger.info("Contact found for %s after %d page(s) — stopping crawl early.",
-                        domain, pages_kept)
-            break
+    async def _run_queue(work_queue: List[tuple[str, int]], cap: int) -> List[tuple[str, int]]:
+        """Fetch+process every URL in work_queue (appending newly-discovered
+        links back onto it, exactly as before) until it's exhausted or a
+        bound is hit. Returns whatever's left unconsumed — either because
+        `cap` was reached (limited-crawl case) or new links arrived after
+        it — so a second call can pick up exactly where this one stopped.
+        Callable twice (limited pass, then the rest of the site if the gate
+        upgrades to a full crawl) — identical body to the single-pass loop
+        this replaces, just wrapped so `attempts` persists across both calls.
+        """
+        nonlocal attempts
+        head = 0
+        while (
+            head < len(work_queue)
+            and pages_kept < cap
+            and attempts < MAX_FETCH_ATTEMPTS
+        ):
+            # STRICTLY one page at a time (mandatory streaming): fetch,
+            # process, free, then move on. No intra-site fetch batching —
+            # the single-HTML-in-RAM guarantee outranks the concurrency
+            # speedup here.
+            page_url, depth = work_queue[head]
+            head += 1
+            norm = _normalize_page_url(page_url)
+            if norm in visited or depth > MAX_CRAWL_DEPTH:
+                continue
+            visited.add(norm)
+
+            attempts += 1
+            fetched = await execute_scavenger_scrape(
+                session, page_url, domain=domain, scraper_cache=scraper_cache,
+            )
+            html = fetched.get("html") or ""
+            method = fetched.get("method", "FAILED")
+            status_code = fetched.get("status_code")
+            del fetched
+            if not html:
+                continue
+            inner_links = _drop_other_language_links(
+                await _process_one(page_url, html, method, status_code), other_lang_prefixes,
+            )
+            del html  # raw HTML freed immediately after processing
+
+            if depth < MAX_CRAWL_DEPTH:
+                for link in sorted(inner_links, key=_contact_priority):
+                    if _normalize_page_url(link) not in visited:
+                        work_queue.append((link, depth + 1))
+
+            # Once we have a reachable contact (email AND phone) and covered
+            # the priority pages, stop — the rest is noise.
+            if (STOP_WHEN_CONTACT_COMPLETE and emails and phones
+                    and pages_kept >= MIN_PAGES_BEFORE_STOP):
+                logger.info("Contact found for %s after %d page(s) — stopping crawl early.",
+                            domain, pages_kept)
+                break
+        return work_queue[head:]
+
+    leftover = await _run_queue(
+        [(u, 1) for u in priority_urls] + [(u, 1) for u in first_pass_urls], page_cap,
+    )
+
+    if limited_mode:
+        # Re-score with whatever the limited crawl added — this is the last
+        # cheap chance before committing to (or discarding) the full site,
+        # so genuine ambiguity here IS allowed to fall through to the LLM
+        # safety net (skip_safety_net=False) to minimize false negatives.
+        limited_relevance = relevance_scoring.score_relevance(
+            industry, geo, company_name, domain,
+            " ".join(sample_parts), address or "", schema_organization,
+            skip_safety_net=False,
+        )
+        if limited_relevance["category"] != "match":
+            logger.info(
+                "[RelevanceGate] %s still not relevant after limited crawl "
+                "(score=%d, %s) — discarding, no full crawl.",
+                domain, limited_relevance["score"], limited_relevance["reason"],
+            )
+            return {
+                "domain": domain, "pages_kept": pages_kept, "attempts": attempts,
+                "emails": emails, "phones": phones, "address": address,
+                "matched_exclude": sorted(matched_exclude), "matched_include": sorted(matched_include),
+                "sample_text": " ".join(sample_parts),
+                "external_links": external_links, "decision_makers": decision_makers,
+                "schema_organization": schema_organization,
+                "rejected_by_gate": True, "gate_reason": limited_relevance["reason"],
+            }
+        logger.info(
+            "[RelevanceGate] %s confirmed relevant after limited crawl "
+            "(score=%d) — continuing with the full site.",
+            domain, limited_relevance["score"],
+        )
+        await _run_queue(leftover + [(u, 1) for u in remaining_urls], MAX_PAGES_PER_SITE)
 
     logger.info(
         "Crawled %d page(s) of %s (%d fetches, %d priority candidates) — streamed to staging",
@@ -1854,6 +2144,16 @@ async def crawl_site(
             store.stage_decision_makers(domain, {"people": decision_makers})
         except Exception as exc:  # noqa: BLE001 - never break the crawl over this
             logger.warning("Failed to stage decision makers for %s: %s", domain, exc)
+
+    # Per-page scraper-tier decisions accumulated across this whole crawl
+    # (homepage + every internal page) — staged once here so a LATER re-crawl
+    # of this same domain can skip straight to the tier each specific page
+    # already proved it needs (see execute_scavenger_scrape).
+    if scraper_cache:
+        try:
+            store.stage_scraper_cache(domain, scraper_cache)
+        except Exception as exc:  # noqa: BLE001 - never break the crawl over this
+            logger.warning("Failed to stage scraper cache for %s: %s", domain, exc)
 
     return {
         "domain": domain,
@@ -2457,35 +2757,114 @@ def qualify_lead(
 
 
 async def classify_relevance(
-    industry: str, geo: str, name: str, page_text: str
+    industry: str, geo: str, name: str, page_text: str,
+    domain: str = "", address: str = "",
+    schema_organization: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
-    """Step 5.5 — LLM relevance check (industry/location match, single business
-    vs shop/aggregator).
+    """Step 5.5 — deterministic relevance check (industry/location match,
+    single business vs shop/aggregator), with a narrow LLM safety net for
+    genuinely ambiguous cases — see relevance_scoring.py's module docstring
+    for the full design (this replaced a full LLM call per business as part
+    of the token-usage refactor).
 
-    Runs off the event loop. This is the ONLY stage that validates industry and
-    location, so it must fail CLOSED: on any failure (both models in call_llm
-    exhausted their retries, malformed response, etc.) it returns "unknown" —
-    NOT "match". "unknown" is treated by _is_lead() as not-a-lead, same as any
-    other non-"match" category. A classifier outage must never silently turn
-    into "this is a valid lead"; it must simply mean fewer qualified leads
-    (an honest shortfall), never a wrong one in the output.
+    Runs off the event loop (the rare safety-net path makes a real network
+    call). This is the ONLY stage that validates industry and location, so it
+    must fail CLOSED: on any internal failure it returns "unknown" — NOT
+    "match". "unknown" is treated by _is_lead() as not-a-lead, same as any
+    other non-"match" category. A scoring bug must never silently turn into
+    "this is a valid lead"; it must simply mean fewer qualified leads (an
+    honest shortfall), never a wrong one in the output.
     """
     try:
         return await asyncio.to_thread(
-            classify_business, industry or "", geo or "", name or "", page_text
+            relevance_scoring.score_relevance,
+            industry or "", geo or "", name or "", domain or "",
+            page_text, address or "", schema_organization,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Relevance classification unavailable for %s (both models failed: "
-            "%s) — treating as not-a-lead, not as a match.", name, exc,
+            "Relevance classification unavailable for %s (%s) — treating as "
+            "not-a-lead, not as a match.", name, exc,
         )
         return {"category": "unknown", "reason": "classifier_unavailable"}
+
+
+def _commit_status(
+    qualification: Dict[str, Any], classification: Optional[Dict[str, str]],
+) -> str:
+    """Three-way outcome for a crawled business — replaces the old binary
+    is_lead check so a real, right-industry/right-location business that
+    merely fails a KEYWORD requirement (e.g. "no CRM" asked, this one has a
+    CRM) can be told apart from one that isn't a match at all:
+
+      "qualified"           — a real match AND passes every keyword
+                               requirement. A true lead.
+      "excluded_by_keyword" — a real match (right industry/location,
+                               confirmed by classify_relevance), but fails
+                               an exclude/include keyword requirement.
+                               Still a genuine, correctly-identified
+                               business — committed to storage as valuable
+                               data, just not what THIS query asked for.
+      "rejected"             — not a real match at all (wrong industry,
+                               wrong location, aggregator, listicle, no
+                               content...). NEVER committed, regardless of
+                               keywords — this is the anti-garbage-data
+                               gate from the fail-open bug fixed earlier
+                               this session; storing a wrong-industry
+                               business under a "marina" query is exactly
+                               that bug, and keyword status must never
+                               override it.
+
+    `classification is None` covers two cases that both defer entirely to
+    qualify_lead's own verdict: LEAD_FILTERING_ENABLED=False (filtering
+    disabled outright) and has_text=False (nothing to classify at all) —
+    matches this pipeline's existing behavior in both cases.
+    """
+    if classification is None:
+        return "qualified" if qualification.get("qualified") else "rejected"
+    if classification.get("category") != "match":
+        return "rejected"
+    return "qualified" if qualification.get("qualified") else "excluded_by_keyword"
+
+
+def _reuse_cached_relevance(
+    rows: List[Dict[str, str]], industry: str, geo: str,
+) -> Optional[Dict[str, str]]:
+    """Reuse a previously-computed relevance verdict instead of recomputing
+    it on every cache hit — this was the one thing in the whole pipeline that
+    got recomputed EVERY time a domain was re-touched by a query, even when
+    nothing about the business or the query's industry/geo had changed (see
+    the token-usage diagnosis this refactor is part of). Only valid when the
+    stored verdict was computed under the SAME scoring engine version (see
+    relevance_scoring.SCORING_VERSION) for the SAME industry/geo this query
+    is asking about — a differing query, a missing verdict, or an older
+    scoring version always falls through to a fresh classification."""
+    if not rows:
+        return None
+    row = rows[0]  # extra_fields are applied uniformly to every row of a domain
+    if row.get("scoring_version", "") != str(relevance_scoring.SCORING_VERSION):
+        return None
+    if (row.get("validated_industry") or "").strip().lower() != (industry or "").strip().lower():
+        return None
+    if (row.get("validated_geo") or "").strip().lower() != (geo or "").strip().lower():
+        return None
+    category = row.get("relevance_category", "")
+    if not category:
+        return None
+    return {
+        "category": category,
+        "reason": row.get("relevance_reason", ""),
+        "score": row.get("relevance_score", ""),
+        "verdict": row.get("relevance_verdict", ""),
+    }
 
 
 async def _evaluate_lead(
     industry: str, geo: str, name: str,
     matched_exclude: List[str], matched_include: List[str],
     include_keywords: List[str], sample_text: str, has_text: bool = True,
+    domain: str = "", address: str = "",
+    schema_organization: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, Any], Optional[Dict[str, str]]]:
     """Return (qualification, classification) for a business.
 
@@ -2496,6 +2875,16 @@ async def _evaluate_lead(
     When LEAD_FILTERING_ENABLED is False, filtering is skipped entirely: the
     business passes as qualified and NO relevance LLM call is made, so discovery
     alone decides relevance. Flip the flag to re-enable filtering.
+
+    Relevance is classified whenever there's readable text to classify —
+    NOT only when the keyword gate passed. A business that IS a real,
+    right-location marina but merely mentions a CRM (an excluded keyword)
+    must still be told apart from a business that isn't a marina at all —
+    both used to look identical ("not qualified") the moment ANY exclude
+    keyword matched, because classification was skipped entirely in that
+    case. See _commit_status()'s docstring for how the caller uses this
+    distinction (store the former as valuable-but-excluded data, discard
+    the latter as genuinely irrelevant).
     """
     if not LEAD_FILTERING_ENABLED:
         passthrough = {"qualified": True, "reason": "filtering_disabled",
@@ -2505,8 +2894,10 @@ async def _evaluate_lead(
     qualification = qualify_lead(matched_exclude, matched_include,
                                  include_keywords, has_text)
     classification = None
-    if qualification.get("qualified"):
-        classification = await classify_relevance(industry, geo, name, sample_text)
+    if has_text:
+        classification = await classify_relevance(
+            industry, geo, name, sample_text, domain, address, schema_organization,
+        )
     return qualification, classification
 
 
@@ -2552,19 +2943,42 @@ async def process_single_lead(
         scan = _scan_stored_pages(cached_rows, exclude_keywords, include_keywords)
         email = CONTACT_SEP.join(_union_contacts(cached_rows, "email")) or "N/A"
         phone = CONTACT_SEP.join(_union_contacts(cached_rows, "phone_number")) or "N/A"
-        qualification, classification = await _evaluate_lead(
-            industry, geo, name,
-            scan["matched_exclude"], scan["matched_include"],
-            include_keywords, scan["sample_text"], scan["has_text"],
+
+        # Relevance cache: reuse a previously-computed verdict when this
+        # domain was already classified under the SAME industry/geo and
+        # scoring version — the fix for the finding that relevance used to
+        # be the one thing recomputed on EVERY cache hit, even unchanged.
+        cached_classification = (
+            _reuse_cached_relevance(cached_rows, industry, geo)
+            if LEAD_FILTERING_ENABLED else None
         )
-        if LEAD_FILTERING_ENABLED and not (
-            qualification.get("qualified")
-            and (classification or {}).get("category", "match") == "match"
-        ):
-            # A previously-committed domain that no longer qualifies under
-            # this query's industry/geo/keywords (or was wrongly committed
-            # before this fix existed) must not linger in final storage where
-            # a later query could resurface it as a "clean" cached lead.
+        if cached_classification is not None:
+            qualification = qualify_lead(
+                scan["matched_exclude"], scan["matched_include"],
+                include_keywords, scan["has_text"],
+            )
+            classification = cached_classification
+            logger.info(
+                "Reusing cached relevance verdict for %s (score=%s) — "
+                "skipping re-classification.", domain, cached_classification.get("score"),
+            )
+        else:
+            qualification, classification = await _evaluate_lead(
+                industry, geo, name,
+                scan["matched_exclude"], scan["matched_include"],
+                include_keywords, scan["sample_text"], scan["has_text"],
+                domain=domain,
+                address=cached_rows[0].get("physical_address", "") if cached_rows else "",
+            )
+        cache_status = _commit_status(qualification, classification)
+        if LEAD_FILTERING_ENABLED and cache_status == "rejected":
+            # A previously-committed domain that's no longer even a real
+            # match under this query's industry/geo (or was wrongly
+            # committed before this fix existed) must not linger in final
+            # storage where a later query could resurface it as a "clean"
+            # cached lead. A merely keyword-excluded business (real match,
+            # just e.g. has a CRM) is NOT retired here — see
+            # _commit_status's docstring, that's still valuable data.
             store.retire_domain(domain)
             cache.pop(url, None)
             logger.info(
@@ -2583,12 +2997,18 @@ async def process_single_lead(
             url, len(cached_rows),
         )
 
-    # Scrape the homepage with the full two-tier scrape, then stream-crawl the
-    # rest of the site from it. Every page is cleaned and staged to storage
-    # immediately; nothing heavy survives the crawl.
+    # Scrape the homepage with the full two-tier scrape, then stream-crawl
+    # the rest of the site from it. Every page is cleaned and staged to
+    # storage immediately; nothing heavy survives the crawl. One scraper_cache
+    # dict for the whole domain — pre-loaded from a PRIOR committed crawl (if
+    # any) so a page whose OWN prior crawl already proved it needs a pricier
+    # tier can skip straight there; every other page still starts at Tier-1.
+    scraper_cache = dict(store.read_scraper_cache(domain) or {})
     try:
         async with semaphore:
-            root = await execute_scavenger_scrape(session, url)
+            root = await execute_scavenger_scrape(
+                session, url, domain=domain, scraper_cache=scraper_cache,
+            )
             if root["method"] == "FAILED" or not root["html"]:
                 logger.warning("No content resolved for %s", url)
                 return {"company_name": name, "website_url": url,
@@ -2606,7 +3026,8 @@ async def process_single_lead(
                 country_code=country_code, phone_regex=phone_regex,
                 exclude_keywords=exclude_keywords,
                 include_keywords=include_keywords,
-                user_query=user_query, industry=industry,
+                user_query=user_query, industry=industry, geo=geo,
+                scraper_cache=scraper_cache,
             )
     except Exception:
         # A crawl abandoned mid-flight must not leave staged files behind.
@@ -2630,6 +3051,19 @@ async def process_single_lead(
                 "method": root_method, "classification": crawl["classification"],
                 "discovered_businesses": crawl.get("discovered_businesses", [])}
 
+    if crawl.get("rejected_by_gate"):
+        # Hybrid Relevance Gate rejected this business before (or after only
+        # a limited crawl of) the full site — its staged pages (homepage,
+        # plus any limited-crawl pages) are discarded, never committed,
+        # exactly like the is_directory case above.
+        store.discard_domain(domain)
+        logger.info(
+            "Not stored: %s — rejected by the relevance gate (%s).",
+            name, crawl.get("gate_reason", ""),
+        )
+        return {"company_name": name, "website_url": url, "status": "rejected_low_relevance",
+                "method": root_method}
+
     if not crawl["pages_kept"]:
         logger.warning("No readable content on any page of %s", url)
         store.discard_domain(domain)
@@ -2646,23 +3080,34 @@ async def process_single_lead(
         industry, geo, name,
         crawl["matched_exclude"], crawl["matched_include"],
         include_keywords, crawl["sample_text"],
+        domain=domain, address=crawl.get("address", ""),
+        schema_organization=crawl.get("schema_organization"),
     )
-    is_lead = bool(
-        qualification.get("qualified")
-        and (classification or {}).get("category", "match") == "match"
-    )
+    status = _commit_status(qualification, classification)
 
-    if is_lead:
+    if status != "rejected":
         store.commit_domain(domain, extra_fields={
             "relevance_category": (classification or {}).get("category", ""),
             "relevance_reason": (classification or {}).get("reason", ""),
+            "relevance_score": str((classification or {}).get("score", "")),
+            "relevance_verdict": (classification or {}).get("verdict", ""),
+            # Only tag a scoring_version when a classification actually ran
+            # (classification is None when LEAD_FILTERING_ENABLED=False) —
+            # this is what _reuse_cached_relevance checks before trusting a
+            # cached verdict, so it must not claim a version was used when
+            # scoring never happened.
+            "scoring_version": (
+                str(relevance_scoring.SCORING_VERSION) if classification is not None else ""
+            ),
             "validated_industry": industry or "",
             "validated_geo": geo or "",
+            "qualification_status": status,
+            "excluded_keywords": ",".join(qualification.get("matched_exclude") or []),
         })
         cache[url] = [r for r in store.read_index() if r.get("domain") == domain]
         logger.info(
-            "Committed %d page(s) for %s -> storage/%s/",
-            crawl["pages_kept"], name, domain,
+            "Committed %d page(s) for %s -> storage/%s/ (%s)",
+            crawl["pages_kept"], name, domain, status,
         )
         # Back-fill each page's incoming-anchor evidence now that the whole
         # site's link graph is final (links.json only exists post-commit) —
@@ -2681,11 +3126,12 @@ async def process_single_lead(
         # this, satisfying "reuse cached data, don't repeat discovery."
         social_profiles: Dict[str, Any] = {}
         li_data: Optional[Dict[str, Any]] = None
+        city, country = linkedin_discovery.city_country_from_geo(geo or "")
         try:
             social_profiles = store.read_social_profiles(domain) or {}
             if not social_profiles.get("linkedin"):
-                match = await linkedin_discovery.discover_linkedin_company(
-                    session, name or "", domain,
+                match = await linkedin_discovery.discover_company_linkedin(
+                    session, name or "", domain, city, country, industry or "",
                 )
                 if match:
                     social_profiles["linkedin"] = match.url
@@ -2758,6 +3204,29 @@ async def process_single_lead(
                 )
                 people.extend(fallback_people)
 
+                # LinkedIn X-Ray decision-maker discovery — Step 8: still
+                # strictly lower priority than website sources (only reached
+                # when nothing named was found on-site, same gate as the
+                # public-search fallback above), and Step 10-cached: a fresh
+                # linkedin_candidates.json is reused as-is rather than
+                # re-searching Google for a company already discovered
+                # within LINKEDIN_CANDIDATES_TTL_DAYS.
+                cached_candidates = store.read_linkedin_candidates(domain)
+                if linkedin_discovery.is_cache_fresh(cached_candidates):
+                    xray_people = cached_candidates.get("profiles") or []
+                    logger.info(
+                        "LinkedIn candidates cache HIT for %s (%d profile(s)).",
+                        domain, len(xray_people),
+                    )
+                else:
+                    xray_people = await linkedin_discovery.discover_decision_makers(
+                        session, name or "", domain, city, country, industry or "",
+                    )
+                    linkedin_discovery.save_linkedin_candidates(
+                        store, domain, social_profiles.get("linkedin"), xray_people,
+                    )
+                people.extend(xray_people)
+
             people = buying_committee.annotate_buying_committee(people)
             store.write_decision_makers_now(domain, {"people": people})
 
@@ -2785,7 +3254,8 @@ async def process_single_lead(
 
     return {"company_name": name, "website_url": url, "status": "scraped",
             "method": root_method, "pages": crawl["pages_kept"],
-            "stored": is_lead, "text_len": len(crawl["sample_text"]),
+            "stored": status != "rejected", "qualification_status": status,
+            "text_len": len(crawl["sample_text"]),
             "email": email, "phone": phone,
             "qualification": qualification,
             "classification": classification}
@@ -2847,9 +3317,9 @@ async def run_pipeline(
         "block_reason": "",
     }
 
-    # Step 0: moderation gate — runs before ANY other resource (Serper,
-    # Scrape.do, the intent/route-planner LLM calls, storage) is touched, so
-    # a policy-violating query costs at most this one small check, not a
+    # Step 0: moderation gate — runs before ANY other resource (Serper, the
+    # premium scraper, the intent/route-planner LLM calls, storage) is touched,
+    # so a policy-violating query costs at most this one small check, not a
     # full discovery+scrape+classify run.
     moderation = await moderate_user_query(user_query)
     if not moderation["safe"]:
@@ -2917,11 +3387,26 @@ async def run_pipeline(
                 scan = _scan_stored_pages(rows, exclude_keywords, include_keywords)
                 email = CONTACT_SEP.join(_union_contacts(rows, "email")) or "N/A"
                 phone = CONTACT_SEP.join(_union_contacts(rows, "phone_number")) or "N/A"
-                qualification, classification = await _evaluate_lead(
-                    industry, geo, rows[0].get("company_name") or target_domain,
-                    scan["matched_exclude"], scan["matched_include"],
-                    include_keywords, scan["sample_text"], scan["has_text"],
+                # Same relevance-cache reuse as the streaming cache-hit path
+                # in process_single_lead — see _reuse_cached_relevance.
+                cached_classification = (
+                    _reuse_cached_relevance(rows, industry, geo)
+                    if LEAD_FILTERING_ENABLED else None
                 )
+                if cached_classification is not None:
+                    qualification = qualify_lead(
+                        scan["matched_exclude"], scan["matched_include"],
+                        include_keywords, scan["has_text"],
+                    )
+                    classification = cached_classification
+                else:
+                    qualification, classification = await _evaluate_lead(
+                        industry, geo, rows[0].get("company_name") or target_domain,
+                        scan["matched_exclude"], scan["matched_include"],
+                        include_keywords, scan["sample_text"], scan["has_text"],
+                        domain=target_domain,
+                        address=rows[0].get("physical_address", "") if rows else "",
+                    )
                 results = [{
                     "company_name": rows[0].get("company_name") or target_domain,
                     "website_url": key, "status": "existing", "method": "CACHE",
@@ -3080,12 +3565,18 @@ async def run_pipeline(
                 # Top up the queue only if it can't already cover this round.
                 if len(pending) < effective_limit:
                     page_before_call = current_page
+                    # per_page must stay a fixed page size, NOT effective_limit:
+                    # Serper computes start=(page-1)*num, so a small num (e.g. 5
+                    # for "5 marinas") makes each "page" only reach a shallow
+                    # offset — page 8 lands at result 35 instead of 70 — which
+                    # keeps re-surfacing the same already-known cluster instead
+                    # of paging meaningfully deeper into Google's real results.
                     batch_targets, last_page = await discover_targets(
                         session, query,
                         limit=effective_limit,
                         exclude_domains=exclude_set | attempted | queue.domains(),
                         start_page=current_page,
-                        per_page=effective_limit,
+                        per_page=SEARCH_RESULTS_PER_PAGE,
                         max_pages=MAX_SEARCH_PAGES if aggressive_discovery else 1,
                         country_code=country_code, location=geo,
                     )
@@ -3249,6 +3740,24 @@ async def run_pipeline(
         for r in results
         if r.get("qualification", {}).get("qualified") and not _is_lead(r)
     ]
+    # Real, right-industry/right-location businesses that were still stored
+    # (see _commit_status) but fail an include/exclude keyword requirement —
+    # e.g. a genuine marina that DOES use a CRM when "no CRM" was asked for.
+    # Valuable data, just not what this specific query asked for, so surfaced
+    # as its own bucket rather than being silently dropped or lumped in with
+    # qualified leads or true rejects.
+    summary["excluded_by_keyword"] = [
+        {
+            "company_name": r.get("company_name"),
+            "website_url": r.get("website_url"),
+            "email": r.get("email") or "N/A",
+            "phone": r.get("phone") or "N/A",
+            "matched_exclude": r.get("qualification", {}).get("matched_exclude", []),
+        }
+        for r in results
+        if r.get("qualification_status") == "excluded_by_keyword"
+    ]
+    summary["excluded_by_keyword_count"] = len(summary["excluded_by_keyword"])
 
     logger.info(
         "Phase 1 complete. %d qualified leads (of %d processed). Index: %s",
@@ -3272,6 +3781,16 @@ def print_summary(summary: Dict[str, Any]) -> None:
         # (avoids handing back a roadmap for rephrasing around the filter).
         print(f"Query      : {summary['query']}")
         print("Status     : This request violates our usage policy and was not processed.")
+        print("=" * 64)
+        return
+    if summary.get("error") and not summary.get("plan"):
+        # Intent deconstruction failed outright (LLM/network down, or — most
+        # commonly — the Groq org's daily token quota is exhausted, so every
+        # model attempt 429s). Without this branch the run below silently
+        # printed a blank "0 discovered" result with no hint why nothing was
+        # found, which is exactly the confusing behavior this fixes.
+        print(f"Query      : {summary['query']}")
+        print(f"Status     : FAILED — {summary['error']}")
         print("=" * 64)
         return
     print(f"Query      : {summary['query']}")
@@ -3314,6 +3833,19 @@ def print_summary(summary: Dict[str, Any]) -> None:
         for f in filtered:
             print(f"  ~ [{f.get('category')}] {f.get('company_name')} — {f.get('reason')}")
         print("-" * 64)
+    excluded = summary.get("excluded_by_keyword", [])
+    if excluded:
+        print(
+            f"EXCLUDED BY KEYWORD ({len(excluded)}) — real, right-industry/location "
+            "businesses, stored, but don't meet a keyword requirement of this query:"
+        )
+        for e in excluded:
+            hit = e.get("matched_exclude") or []
+            hit_tag = f" ({hit[0]})" if hit else ""
+            print(f"  • {e['company_name']}{hit_tag}")
+            print(f"      site : {e['website_url']}")
+            print(f"      email: {e['email']}  |  phone: {e['phone']}")
+        print("-" * 64)
     target = summary.get("limit")
     got = summary.get("qualified_count", 0)
     print(f"QUALIFIED LEADS ({got}"
@@ -3332,6 +3864,24 @@ def print_summary(summary: Dict[str, Any]) -> None:
         print("   the count with directories/aggregators (they aren't real leads).")
         print("   Try: a broader area, different phrasing, or re-run later to sweep")
         print("   further pages.")
+    if got == 0:
+        # _save_last_run() deliberately does NOT touch last_run.json when a run
+        # finds zero qualified leads (so a failed/empty run never wipes a
+        # still-valid previous scope) — but that means any tool reading
+        # last_run.json right after THIS run (e.g. rag/ingest_and_answer.py's
+        # "Domains discovered during scraping" summary) is showing whatever a
+        # PRIOR successful run of a similar query left behind, not this one.
+        # Surfacing that plainly here is what stops that from looking like a
+        # contradiction (0 discovered here vs. N domains in a downstream tool).
+        last = load_last_run()
+        if last.get("domains"):
+            print("-" * 64)
+            print(f"ℹ  last_run.json was NOT updated by this run (0 qualified leads "
+                  f"found) — it still holds the scope from a PREVIOUS run:")
+            print(f"   query: {last.get('query')!r}  (saved {last.get('timestamp', '?')})")
+            print(f"   {len(last['domains'])} domain(s): {', '.join(last['domains'])}")
+            print("   Any RAG/data-quality output printed after this is reading THAT "
+                  "scope, not this run's (empty) result.")
     print("=" * 64)
     print(f"Crawl index: {CRAWL_INDEX_FILE}  |  Cleaned pages: storage/<domain>/*.txt\n")
 
@@ -3352,16 +3902,19 @@ async def _run_tech_stack_batch(ts_module, domains: Set[str]) -> Dict[str, Any]:
     return dict(zip(domains, profiles))
 
 
-async def _run_route_planner_batch(rp_module, domains: Set[str]) -> Dict[str, Any]:
+async def _run_route_planner_batch(
+    rp_module, domains: Set[str], query: str = "",
+) -> Dict[str, Any]:
     """Run route_planner.plan_routes() for each domain concurrently.
 
-    plan_routes() reads the committed crawl index + a few cleaned .txt previews
-    and makes one Groq call per site, all synchronous — so each is offloaded
-    via asyncio.to_thread so N sites plan in parallel rather than serially.
+    plan_routes() reads the committed crawl index + page context, and (when
+    `query` is given) does local search-first retrieval instead of an LLM
+    call for the common case — all synchronous, so each is offloaded via
+    asyncio.to_thread so N sites plan in parallel rather than serially.
     """
     domains = list(domains)
     plans = await asyncio.gather(
-        *[asyncio.to_thread(rp_module.plan_routes, d) for d in domains]
+        *[asyncio.to_thread(rp_module.plan_routes, d, query) for d in domains]
     )
     return dict(zip(domains, plans))
 
@@ -3459,7 +4012,7 @@ def main() -> None:
         print("\n" + "#" * 64)
         print(f"STEP 5 — LLM ROUTE PLANNER  ({len(rp_domains)} business(es))")
         print("#" * 64)
-        plans = asyncio.run(_run_route_planner_batch(rp, rp_domains))
+        plans = asyncio.run(_run_route_planner_batch(rp, rp_domains, args.query))
         for domain, plan_result in plans.items():
             pages = plan_result.get("selected_pages", [])
             routes[domain] = _json.dumps(pages, ensure_ascii=False, default=str)

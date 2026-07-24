@@ -116,7 +116,7 @@ def health() -> Dict[str, str]:
     return {
         "status": "ok",
         "serper_key": "set" if pipeline.SERPER_API_KEY else "missing",
-        "scrapedo_key": "set" if pipeline.SCRAPEDO_API_KEY else "missing",
+        "premium_scraper_key": "set" if pipeline.ZENROWS_API_KEY else "missing",
     }
 
 

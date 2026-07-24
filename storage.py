@@ -23,12 +23,25 @@ Local layout:
             links.json           per-page extracted internal links (for Step 3)
             tech_stack.json      normalized tech capabilities (see tech_stack.py)
             website_profile.json full tech-intelligence profile (see tech_stack.py)
-            crawl_plan.json      cached LLM crawl plan (see crawl_planner.py;
-                                  currently unused — ENABLE_CRAWL_PLANNER is off)
             route_planner_request.json  the exact LLM request (messages),
                                   raw response, and resulting plan from the
                                   LLM Route Planner (see route_planner.py) —
                                   written at query time, after commit
+            search_index/        local BM25 + embedding search index over
+                                  this domain's page CONTEXT (not full text)
+                                  — see page_retrieval.py:
+                bm25_corpus.json    tokenized per-page corpus + filenames
+                embeddings.npy      per-page embedding vectors (numpy)
+                index_meta.json     page_index_hash + RETRIEVAL_VERSION used
+                                     to invalidate the index when the site
+                                     changes or the retrieval logic does
+            scraper_cache.json   {page_path: "normal"|"premium"} —
+                                  which scraper tier each SPECIFIC page
+                                  needed last time (see
+                                  phase1_pipeline.execute_scavenger_scrape) —
+                                  lets a re-crawl skip straight to the tier a
+                                  page already proved it needs, without ever
+                                  assuming one page's needs apply site-wide
     crawl_index.csv           per-page metadata index (NO page text, NO raw HTML)
 
 Staging & commit
@@ -60,6 +73,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlsplit
 
+import numpy as np
+
 # Per-page metadata columns for the crawl index. Deliberately excludes page TEXT
 # and raw HTML — the cleaned text lives only in the .txt files. Contacts and
 # title/meta ARE metadata (and the footer text they come from is stripped from
@@ -81,10 +96,28 @@ INDEX_COLUMNS: List[str] = [
     "word_count",
     "timestamp",        # ISO-8601 UTC
     "page_type",        # home | contact | about | services | products | blog | legal | other
-    "relevance_category",  # classify_business() verdict: match | unrelated | ...
-    "relevance_reason",     # short LLM reason for that verdict
+    "relevance_category",  # relevance_scoring.score_relevance() verdict:
+                            # match | unrelated (an LLM safety-net call only
+                            # runs for its ambiguous "possible_match" band —
+                            # see relevance_scoring.py)
+    "relevance_reason",     # short reason string for that verdict
+    "relevance_score",      # 0-100 deterministic relevance score
+    "relevance_verdict",    # very_relevant | relevant | possible_match | reject
+    "scoring_version",      # relevance_scoring.SCORING_VERSION at commit time —
+                             # phase1_pipeline._reuse_cached_relevance only
+                             # trusts a cached verdict computed under the
+                             # CURRENT version; empty when no scoring ran
+                             # (LEAD_FILTERING_ENABLED=False)
     "validated_industry",   # the industry this business was validated against
     "validated_geo",        # the location this business was validated against
+    "qualification_status", # qualified | excluded_by_keyword — see
+                             # phase1_pipeline._commit_status. A real match
+                             # that fails a keyword requirement (e.g. "no
+                             # CRM" asked, this one has one) is still
+                             # committed, just tagged distinctly from a
+                             # true qualified lead.
+    "excluded_keywords",     # comma-joined matched exclude keywords, if any
+                             # (empty for "qualified" rows)
 ]
 
 
@@ -168,9 +201,11 @@ class PageStore(ABC):
         them by commit_domain/discard_domain — no separate lifecycle needed."""
 
     @abstractmethod
-    def stage_crawl_plan(self, domain: str, plan: Dict) -> None:
-        """Stage crawl_plan.json (see crawl_planner.py) alongside this domain's
-        staged pages. Promoted/discarded together with them."""
+    def stage_scraper_cache(self, domain: str, cache: Dict[str, str]) -> None:
+        """Stage scraper_cache.json — {page_path: tier_name} ("normal" |
+        "premium") — alongside this domain's staged pages (see
+        phase1_pipeline.execute_scavenger_scrape). Promoted/discarded
+        together with them — no separate lifecycle needed."""
 
     @abstractmethod
     def stage_social_profiles(self, domain: str, profiles: Dict) -> None:
@@ -246,6 +281,30 @@ class PageStore(ABC):
         """Return committed {page_url: [links]} for a domain (for Step 3)."""
 
     @abstractmethod
+    def read_search_index(self, domain: str) -> Optional[Dict]:
+        """Return the committed search index for a domain as
+        {"bm25_corpus": {...}, "embeddings": np.ndarray, "index_meta": {...}},
+        or None if never built (or its committed run predates this feature)."""
+
+    @abstractmethod
+    def write_search_index_now(
+        self, domain: str, bm25_corpus: Dict, embeddings: np.ndarray, index_meta: Dict,
+    ) -> None:
+        """Write search_index/{bm25_corpus.json, embeddings.npy,
+        index_meta.json} straight to FINAL storage for an already-committed
+        domain (query-time build — see page_retrieval.py: the index is built
+        lazily on first retrieval, well after the crawl committed, same
+        pattern as write_tech_profile_now — not part of an in-progress
+        crawl's staging/commit decision)."""
+
+    @abstractmethod
+    def read_scraper_cache(self, domain: str) -> Optional[Dict[str, str]]:
+        """Return the committed scraper_cache.json ({page_path: tier_name})
+        for a domain, or None if it was never built (or predates this
+        feature) — lets a re-crawl of an already-committed domain skip
+        straight to the tier a specific page already proved it needs."""
+
+    @abstractmethod
     def read_tech_profile(self, domain: str) -> Optional[Dict]:
         """Return the committed website_profile.json for a domain, or None."""
 
@@ -266,9 +325,11 @@ class PageStore(ABC):
         raw response, and resulting plan for transparency/audit/reuse."""
 
     @abstractmethod
-    def read_crawl_plan(self, domain: str) -> Optional[Dict]:
-        """Return the committed crawl_plan.json for a domain, or None if this
-        domain was never planned (or its committed run predates this feature)."""
+    def read_route_planner_request(self, domain: str) -> Optional[Dict]:
+        """Return the committed route_planner_request.json for a domain, or
+        None if it was never planned. The read half of
+        write_route_planner_request — lets plan_routes() check for and reuse
+        a cached plan instead of recomputing/re-calling the LLM every time."""
 
     @abstractmethod
     def read_page_index(self, domain: str) -> Optional[Dict]:
@@ -295,6 +356,19 @@ class PageStore(ABC):
     def write_linkedin_company_now(self, domain: str, data: Dict) -> None:
         """Write linkedin_company.json straight to FINAL storage (query-time
         refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_linkedin_candidates(self, domain: str) -> Optional[Dict]:
+        """Return the committed linkedin_candidates.json (Step 9 of
+        linkedin_discovery.py's X-Ray pipeline: {"company_page", "profiles":
+        [...]}) for a domain, or None if it was never discovered. Query-time-
+        only artifact (like route_planner_request.json) — no stage_ variant,
+        since discovery only ever runs post-commit."""
+
+    @abstractmethod
+    def write_linkedin_candidates_now(self, domain: str, data: Dict) -> None:
+        """Write linkedin_candidates.json straight to FINAL storage (query-
+        time write/refresh — same pattern as write_tech_profile_now)."""
 
     @abstractmethod
     def read_decision_makers(self, domain: str) -> Optional[Dict]:
@@ -426,11 +500,11 @@ class LocalPageStore(PageStore):
         d.mkdir(parents=True, exist_ok=True)
         self._write_tech_profile_files(d, capabilities, full_profile)
 
-    def stage_crawl_plan(self, domain: str, plan: Dict) -> None:
+    def stage_scraper_cache(self, domain: str, cache: Dict[str, str]) -> None:
         d = self._staging_dir(domain)
         d.mkdir(parents=True, exist_ok=True)
-        (d / "crawl_plan.json").write_text(
-            json.dumps(plan, ensure_ascii=False, indent=2, default=str),
+        (d / "scraper_cache.json").write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
 
@@ -588,6 +662,21 @@ class LocalPageStore(PageStore):
         except (OSError, json.JSONDecodeError):
             return {}
 
+    def read_search_index(self, domain: str) -> Optional[Dict]:
+        d = self._final_dir(domain) / "search_index"
+        if not d.exists():
+            return None
+        try:
+            bm25_corpus = json.loads((d / "bm25_corpus.json").read_text(encoding="utf-8"))
+            embeddings = np.load(d / "embeddings.npy")
+            index_meta = json.loads((d / "index_meta.json").read_text(encoding="utf-8"))
+            return {"bm25_corpus": bm25_corpus, "embeddings": embeddings, "index_meta": index_meta}
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def read_scraper_cache(self, domain: str) -> Optional[Dict[str, str]]:
+        return self._read_final_json(domain, "scraper_cache.json")
+
     def read_tech_profile(self, domain: str) -> Optional[Dict]:
         f = self._final_dir(domain) / "website_profile.json"
         if not f.exists():
@@ -604,6 +693,21 @@ class LocalPageStore(PageStore):
         d.mkdir(parents=True, exist_ok=True)
         self._write_tech_profile_files(d, capabilities, full_profile)
 
+    def write_search_index_now(
+        self, domain: str, bm25_corpus: Dict, embeddings: np.ndarray, index_meta: Dict,
+    ) -> None:
+        d = self._final_dir(domain) / "search_index"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "bm25_corpus.json").write_text(
+            json.dumps(bm25_corpus, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        np.save(d / "embeddings.npy", embeddings)
+        (d / "index_meta.json").write_text(
+            json.dumps(index_meta, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
     def write_route_planner_request(self, domain: str, record: Dict) -> None:
         d = self._final_dir(domain)
         d.mkdir(parents=True, exist_ok=True)
@@ -612,14 +716,8 @@ class LocalPageStore(PageStore):
             encoding="utf-8",
         )
 
-    def read_crawl_plan(self, domain: str) -> Optional[Dict]:
-        f = self._final_dir(domain) / "crawl_plan.json"
-        if not f.exists():
-            return None
-        try:
-            return json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
+    def read_route_planner_request(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "route_planner_request.json")
 
     def read_page_index(self, domain: str) -> Optional[Dict]:
         f = self._final_dir(domain) / "page_index.json"
@@ -641,6 +739,12 @@ class LocalPageStore(PageStore):
 
     def write_linkedin_company_now(self, domain: str, data: Dict) -> None:
         self._write_final_json(domain, "linkedin_company.json", data)
+
+    def read_linkedin_candidates(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "linkedin_candidates.json")
+
+    def write_linkedin_candidates_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "linkedin_candidates.json", data)
 
     def read_decision_makers(self, domain: str) -> Optional[Dict]:
         return self._read_final_json(domain, "decision_makers.json")

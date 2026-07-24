@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import time
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from groq import APIStatusError, Groq
+
+import prompt_cache
+from model_router import TaskType, estimate_cost, select_model
+
+logger = logging.getLogger("ai_bdm.llm_planner")
 
 
 def get_client() -> Groq:
@@ -26,12 +32,14 @@ def get_client() -> Groq:
 
 _CALL_LLM_RETRIES = 2          # attempts per model (1 initial + 1 retry)
 _CALL_LLM_BACKOFF_S = 1.5      # base backoff between retries of the SAME model
-_CALL_LLM_MAX_TOKENS = 4000    # generous cap: the planner's verbose reasoning
-                                # + expanded keyword lists can run long; a too-
-                                # low default cuts the response off mid-JSON,
-                                # which surfaces as a "json_validate_failed" /
-                                # "max completion tokens reached" 400 — not a
-                                # transient error, so retrying it is pointless.
+_CALL_LLM_MAX_WAIT_S = 60      # cap on how long a single 429 backoff waits --
+                                # Groq's `retry-after` can be minutes when the
+                                # org's daily token quota is nearly exhausted;
+                                # waiting that long blocks the whole request,
+                                # so beyond this cap we stop waiting and let
+                                # the caller surface a clear "rate limited"
+                                # error instead of hanging.
+
 # Status codes worth retrying the SAME model for: rate limits and server-side
 # errors are transient. 4xx client errors (bad request, invalid JSON schema,
 # auth, not-found) are deterministic — retrying them wastes time and just
@@ -45,15 +53,76 @@ def _is_retryable(exc: Exception) -> bool:
     return True  # connection errors, timeouts, etc. — no status_code at all
 
 
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Groq returns a `retry-after` header (seconds) on 429s, computed from
+    the ACTUAL token-bucket refill — far more reliable than guessing with a
+    fixed backoff, which is close to certain to fail again instantly when the
+    org is this close to its daily quota ceiling."""
+    response = getattr(exc, "response", None)
+    header = getattr(response, "headers", None)
+    value = header.get("retry-after") if header else None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _log_call(
+    task: str, model: str, reasoning_effort: str, cache_status: str,
+    elapsed_s: float, usage: Any, fallback_triggered: bool,
+    failure_reason: str = "",
+) -> None:
+    """Centralized per-call token/latency/cost logging (one place, not
+    repeated at every call site) — lets token usage AND unreliable
+    models/expensive tasks be monitored over time instead of only
+    discovered after the fact via a 429."""
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+    reasoning_tokens = (
+        getattr(usage.completion_tokens_details, "reasoning_tokens", None)
+        if usage and usage.completion_tokens_details else None
+    )
+    cost = estimate_cost(model, prompt_tokens, completion_tokens)
+    logger.info(
+        "[llm_call] task=%s model=%s reasoning_effort=%s cache=%s "
+        "prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s time=%.2fs "
+        "cost_estimate=$%.6f fallback_triggered=%s%s",
+        task, model, reasoning_effort, cache_status,
+        prompt_tokens or "?", completion_tokens or "?",
+        reasoning_tokens if reasoning_tokens is not None else "?",
+        elapsed_s, cost, fallback_triggered,
+        f" failure_reason={failure_reason!r}" if failure_reason else "",
+    )
+
+
 def call_llm(
     client: Groq,
     messages: List[Dict[str, str]],
     response_format: Dict[str, str] | None = None,
+    *,
+    task: TaskType,
+    cache_status: str = "n/a",
 ) -> str:
-    """Call LLM with a primary/fallback model. Returns raw assistant text.
+    """Call LLM through the centralized ModelRouter. Returns raw assistant
+    text. Never hardcode a model/reasoning-effort/token-budget at a call
+    site — `task` resolves ALL of that via `model_router.select_model(task)`,
+    which is the one place those decisions live (see model_router.py).
 
-    `response_format={"type": "json_object"}` forces strict JSON output (used
-    by the planner). Temperature is pinned to 0 for deterministic plans.
+    `response_format={"type": "json_object"}` forces strict JSON output.
+
+    The router resolves a two-model chain for `task`: the task's own primary
+    model (gpt-oss-20b for lightweight tasks, gpt-oss-120b for tasks that
+    genuinely need deeper reasoning — see model_router.TASK_CONFIG) first,
+    then `qwen/qwen3.6-27b` as a universal emergency fallback — NEVER an
+    intermediate upgrade to a bigger primary model on failure (that would
+    silently multiply cost exactly where this router exists to prevent it).
+    Each model in the chain gets its OWN reasoning-effort string — Qwen does
+    not accept the gpt-oss family's "low"/"medium"/"high" vocabulary, only
+    "none"/"default" (verified live against the Groq API), so blindly
+    reusing the primary task's reasoning_effort for the fallback model would
+    make every Qwen fallback call fail outright.
 
     Each model gets up to `_CALL_LLM_RETRIES` attempts with a short backoff
     before falling through to the next model — but only for TRANSIENT
@@ -64,34 +133,75 @@ def call_llm(
     (e.g. the lead relevance classifier) rely on this to make that failure
     mode rare, not routine.
     """
-    primary_model = "openai/gpt-oss-20b"
-    fallback_model = "openai/gpt-oss-120b"
+    cfg = select_model(task)
+    chain = (
+        (cfg.primary_model, cfg.reasoning_effort),
+        (cfg.fallback_model, cfg.fallback_reasoning_effort),
+    )
+
+    # Prompt cache: keyed on task + the task's PRIMARY model + the exact
+    # messages, checked BEFORE any API call — an identical prompt never
+    # needs to be recomputed. Keyed on the primary model specifically (not
+    # whichever model happens to answer) so the cache is stable to check
+    # even before we know if this call will need to fall back.
+    cached = prompt_cache.get(task.value, cfg.primary_model, messages)
+    if cached is not None:
+        logger.info("[llm_call] task=%s model=%s cache=hit (no API call made)",
+                     task.value, cfg.primary_model)
+        return cached
 
     kwargs: Dict[str, Any] = {
-        "temperature": 0,
-        "max_completion_tokens": _CALL_LLM_MAX_TOKENS,
+        "temperature": cfg.temperature,
+        "max_completion_tokens": cfg.max_completion_tokens,
+        "timeout": cfg.timeout_s,
     }
     if response_format is not None:
         kwargs["response_format"] = response_format
 
     last_exc: Exception | None = None
-    for model in (primary_model, fallback_model):
-        for attempt in range(_CALL_LLM_RETRIES):
+    for chain_idx, (model, reasoning_effort) in enumerate(chain):
+        is_fallback = chain_idx > 0
+        for attempt in range(cfg.max_retries):
             try:
+                t0 = time.monotonic()
                 response = client.chat.completions.create(
-                    model=model, messages=messages, **kwargs
+                    model=model, messages=messages,
+                    reasoning_effort=reasoning_effort, **kwargs,
                 )
-                return response.choices[0].message.content
+                _log_call(
+                    task.value, model, reasoning_effort, cache_status,
+                    time.monotonic() - t0, response.usage, is_fallback,
+                )
+                content = response.choices[0].message.content
+                if not is_fallback:
+                    # Only cache a PRIMARY-model success — never a fallback
+                    # answer, which would otherwise entrench a degraded-path
+                    # response under the primary model's cache key forever,
+                    # even after the primary recovers.
+                    prompt_cache.set(task.value, model, messages, content)
+                return content
             except Exception as e:  # noqa: BLE001
                 last_exc = e
                 print(f"Model {model} failed (attempt {attempt + 1}/"
-                      f"{_CALL_LLM_RETRIES}): {e}")
+                      f"{cfg.max_retries}): {e}")
                 if not _is_retryable(e):
                     break  # deterministic failure — don't retry, try next model
-                if attempt < _CALL_LLM_RETRIES - 1:
-                    time.sleep(_CALL_LLM_BACKOFF_S * (attempt + 1))
+                if attempt < cfg.max_retries - 1:
+                    wait = _CALL_LLM_BACKOFF_S * (attempt + 1)
+                    if isinstance(e, APIStatusError) and e.status_code == 429:
+                        retry_after = _retry_after_seconds(e)
+                        if retry_after is not None:
+                            # Honor Groq's own estimate (capped) instead of a
+                            # fixed backoff that's almost guaranteed to hit
+                            # the same 429 again a beat later.
+                            wait = min(retry_after, _CALL_LLM_MAX_WAIT_S)
+                    time.sleep(wait)
 
-    raise last_exc  # both models exhausted their retries
+    _log_call(
+        task.value, chain[-1][0], chain[-1][1], cache_status, 0.0, None,
+        True, failure_reason=str(last_exc),
+    )
+    raise last_exc  # both the primary and the Qwen fail-safe exhausted their retries
 
 
 # --- Query moderation -------------------------------------------------------
@@ -99,7 +209,7 @@ def call_llm(
 # resources are touched -- a query violating any of a standard trust & safety
 # taxonomy (child sexual abuse material, sexual exploitation, hate speech,
 # harassment, self-harm, suicide, violence, other illegal activity) should
-# never reach Serper/Scrape.do/the LLM route planner, all of which cost real
+# never reach Serper/the premium scraper/the LLM route planner, all of which cost real
 # money per query. One small classification call here is negligible next to
 # what it prevents spending on a blocked query. Deliberately CONSERVATIVE on
 # ordinary business categories: only flags a clear, unambiguous violation,
@@ -173,6 +283,7 @@ def moderate_query(user_query: str) -> Dict[str, Any]:
                 {"role": "user", "content": f"REQUEST: {user_query}"},
             ],
             response_format={"type": "json_object"},
+            task=TaskType.JSON_EXTRACTION,
         )
         result = json.loads(text)
         return {
@@ -360,6 +471,7 @@ def plan_query(user_query: str) -> Dict[str, Any]:
             {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},
+        task=TaskType.INTENT_PLANNING,
     )
 
     # Be robust: if the model returns accidental text, attempt JSON extraction.
@@ -446,6 +558,7 @@ def classify_business(
             {"role": "user", "content": user},
         ],
         response_format={"type": "json_object"},
+        task=TaskType.JSON_EXTRACTION,
     )
     try:
         data = json.loads(text)
@@ -512,6 +625,7 @@ def generate_query_variations(
             {"role": "user", "content": user},
         ],
         response_format={"type": "json_object"},
+        task=TaskType.QUERY_REWRITE,
     )
     try:
         data = json.loads(text)
@@ -555,7 +669,7 @@ def main() -> None:
 
     if args.test_api:
         messages = [{"role": "user", "content": "Say 'API is working' in one line."}]
-        out = call_llm(client, messages)
+        out = call_llm(client, messages, task=TaskType.JSON_EXTRACTION)
         print(out)
         return
 
