@@ -5,19 +5,24 @@ Reads last_run.json (written by phase1_pipeline.py after every scrape run):
     {"query": "...", "domains": [...]}
 
 and:
-    1. Ingests ONLY each business's HIGH-INTENT pages — read from
+    1. Ingests each business's HIGH-INTENT WEBSITE pages — read from
        leads_clean.json's `high_intent_pages` field (Step 3's LLM route
        planner selection), NOT every page in storage/. A business with a
        40-page crawl contributes only its 2-6 high-intent pages to the RAG
-       store, not all 40. Safe to re-run (Chroma upsert never duplicates).
-       Domains with no high-intent pages (never committed, or Step 3 found
-       nothing) are silently skipped — they have nothing to show for.
-    2. Ranks ALL of those businesses' chunks together, in ONE combined list,
-       against the SAME query and prints the TOP 10 overall — score + full
-       text — directly to the terminal. No LLM call (pure retrieval only, for
-       now) — see rag/top_matches.py. This is a single ranked list, not one
-       section per business — a business with only 1-2 high-intent chunks can
-       still outrank a business with 30+ chunks if its match is stronger.
+       store, not all 40.
+    2. ALSO ingests each business's harvested REVIEW platforms (Phase 3's
+       storage/<domain>/reviews/<platform>.json — see rag/ingest_reviews.py).
+       Kept as a separate chunk category (`source_type="review"` vs the
+       website default `source_type="website"`) so a business's own marketing
+       copy never gets mixed into what its reviewers actually said, or vice
+       versa. Safe to re-run either ingestion (Chroma upsert never duplicates).
+    3. Ranks each category's chunks together, in ONE combined list per
+       category, against the SAME query and prints the TOP 15 (configurable
+       via --k) of EACH category — score + full text — directly to the
+       terminal. No LLM call (pure retrieval only, for now) — see
+       rag/top_matches.py. Within a category this is a single ranked list,
+       not one section per business — a business with only 1-2 chunks can
+       still outrank a business with 30+ if its match is stronger.
 
 This is the one command you need after a scrape — it never asks for input.
 
@@ -76,73 +81,16 @@ def _load_last_run(path: str) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def main() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
-    parser = argparse.ArgumentParser(
-        description="Answer the last scrape's own query for every business it "
-                    "actually scraped — no question re-entry needed."
-    )
-    parser.add_argument("--last-run", default="last_run.json",
-                        help="Path to the last_run.json written by the scraper.")
-    parser.add_argument("--leads-json", default=DEFAULT_LEADS_JSON,
-                        help="Path to leads_clean.json (source of high_intent_pages).")
-    parser.add_argument("--k", type=int, default=15,
-                        help="How many top-matching chunks to show per business (default 15).")
-    args = parser.parse_args()
-
-    last_run = _load_last_run(args.last_run)
-    query = (last_run.get("query") or "").strip()
-    discovered_domains: List[str] = last_run.get("domains") or []
-    if not query or not discovered_domains:
-        raise SystemExit(f"{args.last_run} has no query/domains to work from.")
-
-    from .pipeline import RagPipeline
-    pipe = RagPipeline()
-
-    # Ingest only domains with HIGH-INTENT pages (leads_clean.json) — not every
-    # committed page. Domains with nothing high-intent (discovered-but-rejected,
-    # or Step 3 found nothing) yield zero docs here and are naturally skipped.
-    committed_domains: List[str] = []
-    ingested_pages = 0
-    for domain in discovered_domains:
-        docs = list(iter_source_docs_from_high_intent(
-            leads_json_path=args.leads_json, domain=domain
-        ))
-        if not docs:
-            continue
-        for doc in docs:
-            pipe.ingest(doc)
-        ingested_pages += len(docs)
-        committed_domains.append(domain)
-
-    print("\n" + "=" * 70)
-    print("Query (reused from the scrape):", query)
-    print(f"Domains discovered during scraping:      {len(discovered_domains)}")
-    print(f"Domains with high-intent pages to embed: {len(committed_domains)}")
-    print(f"High-intent pages ingested into RAG:     {ingested_pages}")
-    print("=" * 70)
-
-    if not committed_domains:
-        print("\nNo committed businesses to answer for — nothing was actually "
-              "scraped/stored for this query.")
+def _print_ranked_chunks(label: str, source_type: str, query: str, k: int,
+                          domains: List[str], embedder: Any) -> None:
+    """Print the top-k chunks (one category only, via source_type) for `domains`."""
+    if not domains:
+        print(f"\n{label}: nothing ingested for this run — skipped.")
         return
-
-    # ONE combined ranking across all committed businesses together — not a
-    # separate top-10 per business. Otherwise a business with 30+ chunks
-    # (e.g. one the route planner selected many high-intent pages for) fills
-    # its own section with 10 rows and visually looks like "everything came
-    # from one site," while a business with just 1-2 chunks gets its own tiny
-    # section that's easy to miss even if its match is the single best one.
-    matches = top_matches(query, k=args.k, business=committed_domains,
-                         embedder=pipe.embedder)
-    print(f"\nTop {len(matches)} chunk(s) overall, hybrid score "
-          f"(semantic + keyword bonus)")
-    print("=" * 70)
+    matches = top_matches(query, k=k, business=domains,
+                         embedder=embedder, source_type=source_type)
+    print(f"\n{'=' * 70}\n{label} — top {len(matches)} chunk(s), hybrid score "
+          f"(semantic + keyword bonus)\n{'=' * 70}")
     for rank, m in enumerate(matches, 1):
         print(f"\n[{rank}] score={m['score']:.4f}  "
               f"(semantic={m['semantic_score']:.4f} + keyword={m['keyword_bonus']:.4f} "
@@ -158,7 +106,77 @@ def main() -> None:
         print(m["text"])
         print("-" * 70)
 
-    # Per-business evidence summary. Scans EVERY chunk for each committed
+
+def run(query: str, discovered_domains: List[str],
+        leads_json_path: str = DEFAULT_LEADS_JSON, k: int = 15) -> None:
+    """Ingest each domain's high-intent WEBSITE pages AND harvested REVIEW
+    pages (two separate RAG categories), then print the top-k ranked chunks
+    of EACH category plus a combined per-business evidence summary for `query`.
+
+    This is the callable core of `python -m rag.ingest_and_answer` — pulled
+    out of main() so main.py's end-to-end flow can call it directly with the
+    query/domains it already has in memory, instead of shelling out to this
+    module and round-tripping through last_run.json.
+    """
+    from .ingest_reviews import iter_source_docs_from_reviews
+    from .pipeline import RagPipeline
+    pipe = RagPipeline()
+
+    # Website category: only domains with HIGH-INTENT pages (leads_clean.json)
+    # — not every committed page. Domains with nothing high-intent
+    # (discovered-but-rejected, or Step 3 found nothing) yield zero docs here
+    # and are naturally skipped.
+    website_domains: List[str] = []
+    ingested_website_pages = 0
+    for domain in discovered_domains:
+        docs = list(iter_source_docs_from_high_intent(
+            leads_json_path=leads_json_path, domain=domain
+        ))
+        if not docs:
+            continue
+        for doc in docs:
+            pipe.ingest(doc)
+        ingested_website_pages += len(docs)
+        website_domains.append(domain)
+
+    # Review category: every domain with at least one platform that actually
+    # yielded review text (phase3.review_harvester's cached output). A domain
+    # can appear here even if it had no high-intent website pages, and vice
+    # versa — the two categories are independent.
+    review_domains: List[str] = []
+    ingested_review_docs = 0
+    for doc in iter_source_docs_from_reviews(discovered_domains):
+        pipe.ingest(doc)
+        ingested_review_docs += 1
+        if doc.domain not in review_domains:
+            review_domains.append(doc.domain)
+
+    committed_domains = sorted(set(website_domains) | set(review_domains))
+
+    print("\n" + "=" * 70)
+    print("Query (reused from the scrape):", query)
+    print(f"Domains discovered during scraping:      {len(discovered_domains)}")
+    print(f"Domains with high-intent WEBSITE pages:  {len(website_domains)}")
+    print(f"High-intent website pages ingested:      {ingested_website_pages}")
+    print(f"Domains with harvested REVIEW platforms: {len(review_domains)}")
+    print(f"Review documents ingested:               {ingested_review_docs}")
+    print("=" * 70)
+
+    if not committed_domains:
+        print("\nNo committed businesses to answer for — nothing was actually "
+              "scraped/stored for this query.")
+        return
+
+    # Two independent top-k rankings, not one merged list — a business's own
+    # marketing copy and what its reviewers actually say are different kinds
+    # of evidence, and merging them would let a large website (many chunks)
+    # drown out a business's review signal or vice versa.
+    _print_ranked_chunks("WEBSITE CHUNKS", "website", query, k, website_domains, pipe.embedder)
+    _print_ranked_chunks("REVIEW CHUNKS", "review", query, k, review_domains, pipe.embedder)
+
+    # Per-business evidence summary — combined across BOTH categories (any
+    # chunk, from the site itself or its reviews, can confirm/deny the
+    # query's focus concept). Scans EVERY chunk for each committed
     # business (not just the printed top-k above) -- a disclosure buried
     # outside the top-k chunks is still a real, useful answer to a BDM.
     # Distinguishes an explicit statement (present/absent) from silence,
@@ -243,6 +261,35 @@ def main() -> None:
         print("=" * 70)
 
     print("\n" + "=" * 70)
+
+
+def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    parser = argparse.ArgumentParser(
+        description="Answer the last scrape's own query for every business it "
+                    "actually scraped — no question re-entry needed."
+    )
+    parser.add_argument("--last-run", default="last_run.json",
+                        help="Path to the last_run.json written by the scraper.")
+    parser.add_argument("--leads-json", default=DEFAULT_LEADS_JSON,
+                        help="Path to leads_clean.json (source of high_intent_pages).")
+    parser.add_argument("--k", type=int, default=15,
+                        help="How many top-matching chunks to show per category "
+                             "(website, review — default 15 each).")
+    args = parser.parse_args()
+
+    last_run = _load_last_run(args.last_run)
+    query = (last_run.get("query") or "").strip()
+    discovered_domains: List[str] = last_run.get("domains") or []
+    if not query or not discovered_domains:
+        raise SystemExit(f"{args.last_run} has no query/domains to work from.")
+
+    run(query, discovered_domains, leads_json_path=args.leads_json, k=args.k)
 
 
 if __name__ == "__main__":

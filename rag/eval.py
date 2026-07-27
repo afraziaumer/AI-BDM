@@ -160,6 +160,66 @@ EVAL_DOCS: List[SourceDoc] = [
         content="Platform Marina is a full-service marina for boaters; it has no online booking platform.",
         domain="platform-marina.example",
     ),
+
+    # === CRM probes — same shape as the "app" probes above, but for the
+    # "crm" focus concept (see the live query "give me N dental clinics in
+    # X with no crm" this project actually runs, and the real-world evidence
+    # summary that came back "NO EVIDENCE FOUND" for every real business,
+    # since none of them happened to mention CRM at all — these synthetic
+    # docs prove the negation/fuzzy/semantic MECHANISM works correctly, using
+    # controlled cases where the right answer is known, independent of
+    # whatever real scraped content does or doesn't say). ===
+
+    # Probe: negation awareness. Literally contains "CRM" but NEGATED --
+    # explicitly confirms absence, what a "no crm" query wants.
+    SourceDoc(
+        url="https://nocrm-clinic.example/",
+        title="Nocrm Clinic",
+        content="Nocrm Clinic is a full-service dental clinic, but it does not use a CRM system at this time.",
+        domain="nocrm-clinic.example",
+    ),
+    # Paired with nocrm-clinic above, same sentence fluency level. Literally
+    # contains "CRM" but AFFIRMED -- the opposite of what a "no crm" query
+    # wants, even though both chunks share the literal word.
+    SourceDoc(
+        url="https://hascrm-clinic.example/",
+        title="Hascrm Clinic",
+        content="Hascrm Clinic just adopted a new CRM system to manage patient relationships.",
+        domain="hascrm-clinic.example",
+    ),
+    SourceDoc(
+        url="https://plainclinic.example/",
+        title="Plain Clinic",
+        content="Plain Clinic is a full-service dental clinic offering checkups and cleanings.",
+        domain="plainclinic.example",
+    ),
+    # Probe: embedding-based fuzzy word matching. Says "customer relationship
+    # management system", never the literal acronym "CRM" -- realistic, since
+    # a real site is just as likely to spell it out as abbreviate it.
+    SourceDoc(
+        url="https://fuzzycrm-clinic.example/",
+        title="Fuzzycrm Clinic",
+        content="Fuzzycrm Clinic does not have a customer relationship management system yet.",
+        domain="fuzzycrm-clinic.example",
+    ),
+    # Probe: SOFT negation ("planned for next year", not an explicit no/not)
+    # must be recognized as absence, not an affirmed match.
+    SourceDoc(
+        url="https://softnegcrm-clinic.example/",
+        title="Softnegcrm Clinic",
+        content="Softnegcrm Clinic for patients. CRM integration is planned for next year.",
+        domain="softnegcrm-clinic.example",
+    ),
+    # Probe: CONTEXT understanding beyond word matching. Says "patient
+    # management software", never "CRM" or its expansion -- only
+    # focus-semantic (comparing the chunk's MEANING to the "crm" concept) can
+    # recognize this as answering a "no crm" query.
+    SourceDoc(
+        url="https://platformcrm-clinic.example/",
+        title="Platformcrm Clinic",
+        content="Platformcrm Clinic is a full-service dental clinic; it has no digital patient management software.",
+        domain="platformcrm-clinic.example",
+    ),
 ]
 
 EVAL_CASES: List[Dict[str, Any]] = [
@@ -249,6 +309,52 @@ EVAL_CASES: List[Dict[str, Any]] = [
                        "literal or fuzzy word overlap.",
         "expect_top_domain": "platform-marina.example",
         "business": ["platform-marina.example", "plaindocks-marina.example"],
+    },
+
+    # === CRM probes (paired with the CRM SourceDocs above) ===
+    {
+        "query": "dental clinic with no crm",
+        "description": 'A chunk that literally contains "CRM" but AFFIRMED '
+                       '("just adopted a new CRM system") must NOT outrank a '
+                       "business that actually confirms it has no CRM — negation "
+                       "awareness must catch that the two mean opposite things "
+                       "despite sharing the same word.",
+        "expect_top_domain": "nocrm-clinic.example",
+        "business": ["nocrm-clinic.example", "hascrm-clinic.example", "plainclinic.example"],
+    },
+    {
+        "query": "dental clinic with no crm",
+        "description": 'A chunk that only ever says "customer relationship '
+                       'management system" (never the literal acronym "CRM") must '
+                       "still be recognized as answering a \"crm\" query via "
+                       "embedding-based fuzzy word matching, and must outrank a "
+                       "business with no CRM-related content at all.",
+        "expect_top_domain": "fuzzycrm-clinic.example",
+        "business": ["fuzzycrm-clinic.example", "plainclinic.example"],
+    },
+    {
+        "query": "dental clinic with no crm",
+        "description": 'A chunk saying "CRM integration is planned for next year" '
+                       "(soft negation -- implies it doesn't exist yet) must be "
+                       "classified as NOT mismatched (agreeing with \"no crm\"), "
+                       'while "just adopted a new CRM system" (a genuinely '
+                       "affirmed match) must be classified as mismatched.",
+        "expect_negation_correct": [
+            ("softnegcrm-clinic.example", False),
+            ("hascrm-clinic.example", True),
+        ],
+        "business": ["softnegcrm-clinic.example", "hascrm-clinic.example", "plainclinic.example"],
+    },
+    {
+        "query": "dental clinic with no crm",
+        "description": 'A chunk saying "no digital patient management software" '
+                       '(never "CRM" or its expansion, below the fuzzy word-match '
+                       'threshold for "crm") must still outrank a business with no '
+                       "CRM-related content at all -- proving the system "
+                       "understands the concept by CONTEXT/meaning "
+                       "(focus-semantic), not just literal or fuzzy word overlap.",
+        "expect_top_domain": "platformcrm-clinic.example",
+        "business": ["platformcrm-clinic.example", "plainclinic.example"],
     },
 ]
 

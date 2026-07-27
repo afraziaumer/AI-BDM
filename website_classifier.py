@@ -198,7 +198,7 @@ def extract_homepage_signals(
     """
     from page_patterns import detect_patterns, extract_homepage_candidates
 
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     html_lang = (soup.html.get("lang", "") if soup.html else "").strip().lower()
     title = soup.title.get_text(strip=True) if soup.title else ""
     meta = (

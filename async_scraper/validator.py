@@ -41,7 +41,7 @@ def check_sufficiency(html: str, config: ScraperConfig) -> SufficiencyResult:
         return SufficiencyResult(False, "", "", reason="empty_response")
 
     try:
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
     except Exception as exc:  # noqa: BLE001
         return SufficiencyResult(False, "", "", reason=f"parse_error:{exc}")
 

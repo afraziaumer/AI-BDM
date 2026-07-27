@@ -235,6 +235,7 @@ _NEGATION_RE = re.compile(
 _TIME_REF = r"(?:soon|later|next \w+|this \w+|in \d{4}|spring|summer|fall|autumn|winter)"
 _SOFT_NEGATION_RE = re.compile(
     rf"in progress|(?:coming|launching) {_TIME_REF}|"
+    rf"(?:planned|scheduled) for {_TIME_REF}|"
     r"under (?:development|construction)|"
     r"not yet available|not available yet|to be announced|in development"
 )
@@ -686,6 +687,7 @@ def top_matches(query: str, k: int = 10,
                 chroma_dir: Optional[str] = None,
                 collection_name: Optional[str] = None,
                 embedder: Optional[Any] = None,
+                source_type: Optional[str] = None,
                 ) -> List[Dict[str, Any]]:
     """Return the top-k chunks closest to `query`, ranked together in ONE
     combined list — never split into per-business sections, so a strong match
@@ -696,6 +698,10 @@ def top_matches(query: str, k: int = 10,
     business only), a list of domains (rank only across those businesses
     combined — e.g. "just this run's committed businesses"), or None (every
     chunk currently in the store).
+
+    `source_type` restricts the candidate pool to chunks embedded from that
+    source ("website" or "review" — see rag/ingest_reviews.py); None (default)
+    ranks across both pools combined.
 
     `chroma_dir`/`collection_name` default to the production store
     (config.CHROMA_DIR/CHROMA_COLLECTION). Overriding them points this
@@ -749,12 +755,22 @@ def top_matches(query: str, k: int = 10,
     if total == 0:
         return []
 
-    where = None
+    where_clauses: List[Dict[str, Any]] = []
     if isinstance(business, str):
-        where = {"domain": business.lower().removeprefix("www.")}
+        where_clauses.append({"domain": business.lower().removeprefix("www.")})
     elif business:  # non-empty list/sequence of domains
         domains = [d.lower().removeprefix("www.") for d in business]
-        where = {"domain": {"$in": domains}} if len(domains) > 1 else {"domain": domains[0]}
+        where_clauses.append(
+            {"domain": {"$in": domains}} if len(domains) > 1 else {"domain": domains[0]}
+        )
+    if source_type:
+        where_clauses.append({"source_type": source_type})
+    if not where_clauses:
+        where = None
+    elif len(where_clauses) == 1:
+        where = where_clauses[0]
+    else:
+        where = {"$and": where_clauses}
     # Fetch EVERY matching chunk (not just top-k) so a chunk with a weak
     # semantic score but a strong literal keyword match can still be found and
     # boosted — restricting to top-k here would exclude it before it ever gets

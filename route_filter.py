@@ -39,7 +39,7 @@ from bs4 import BeautifulSoup
 
 from LLM_planner import get_client, call_llm
 from model_router import TaskType
-from phase1_pipeline import _domain_key, _strip_tracking
+from domain_utils import domain_key as _domain_key, strip_tracking as _strip_tracking
 
 logger = logging.getLogger("ai_bdm.route_filter")
 
@@ -229,13 +229,13 @@ def _clean_href(raw: str) -> str:
 def extract_links(homepage_html: str) -> List[str]:
     """Parse the homepage and return anchor hrefs plus the canonical URL.
 
-    Resilient to malformed markup (lxml recovers), missing hrefs, and empty/
-    fragment-only links. Returns raw (unnormalized) href strings — normalization
-    is a separate, testable step.
+    Resilient to malformed markup (html.parser recovers), missing hrefs, and
+    empty/fragment-only links. Returns raw (unnormalized) href strings —
+    normalization is a separate, testable step.
     """
     if not homepage_html:
         return []
-    soup = BeautifulSoup(homepage_html, "lxml")
+    soup = BeautifulSoup(homepage_html, "html.parser")
 
     hrefs: List[str] = []
     for a in soup.find_all("a", href=True):
@@ -255,7 +255,7 @@ def _base_href(homepage_html: str) -> Optional[str]:
     """Return the <base href> if the page declares one (affects relative URLs)."""
     if not homepage_html:
         return None
-    soup = BeautifulSoup(homepage_html, "lxml")
+    soup = BeautifulSoup(homepage_html, "html.parser")
     base = soup.find("base", href=True)
     return _clean_href(base["href"]) if base else None
 
@@ -470,7 +470,7 @@ def _extract_candidates(
     heading, and section). One parse keeps this cheap at scale."""
     if not homepage_html:
         return [], []
-    soup = BeautifulSoup(homepage_html, "lxml")
+    soup = BeautifulSoup(homepage_html, "html.parser")
 
     base_tag = soup.find("base", href=True)
     declared_base = _clean_href(base_tag["href"]) if base_tag else None

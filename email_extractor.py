@@ -437,7 +437,7 @@ class EmailExtractor:
         self._site = site_domain
         # Entity-decoded version — used for text-level searches so &#64; is seen as @.
         self._decoded = _decode_entity_email(self._raw)
-        self._soup = BeautifulSoup(self._raw, "lxml")
+        self._soup = BeautifulSoup(self._raw, "html.parser")
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -664,7 +664,7 @@ class EmailExtractor:
         """
         results = []
         # Build visible text from the decoded source (entities already resolved).
-        soup2 = BeautifulSoup(self._decoded, "lxml")
+        soup2 = BeautifulSoup(self._decoded, "html.parser")
         for tag in soup2(("script", "style", "noscript", "template")):
             tag.decompose()
         text = soup2.get_text(separator=" ")

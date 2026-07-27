@@ -32,7 +32,7 @@ _WS_RE = re.compile(r"\s+")
 
 def _lean_extract(html: str) -> tuple[str, str]:
     """Standalone fallback: title + visible text, no structure preservation."""
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(strip=True) if soup.title else ""
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
@@ -41,7 +41,7 @@ def _lean_extract(html: str) -> tuple[str, str]:
 
 
 def _extract_links(html: str, base_url: str) -> List[str]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     domain = urlparse(base_url).netloc.lower().removeprefix("www.")
     seen: set = set()
     links: List[str] = []
@@ -68,7 +68,7 @@ def parse(result: FetchResult) -> ParsedPage:
         )
     try:
         if _clean_page_for_llm is not None:
-            soup = BeautifulSoup(result.html, "lxml")
+            soup = BeautifulSoup(result.html, "html.parser")
             cleaned = _clean_page_for_llm(soup, result.job.url)
             title, text = cleaned["page_title"], cleaned["text"]
             word_count = cleaned["word_count"]

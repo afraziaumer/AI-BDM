@@ -96,7 +96,7 @@ def extract_schema_org(html_or_soup, page_url: str) -> Dict[str, Any]:
     try:
         soup = (
             html_or_soup if isinstance(html_or_soup, BeautifulSoup)
-            else BeautifulSoup(html_or_soup, "lxml")
+            else BeautifulSoup(html_or_soup, "html.parser")
         )
         for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
             raw = script.string or script.get_text()

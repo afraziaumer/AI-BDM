@@ -72,7 +72,7 @@ def compute_content_hash(html: str) -> str:
     the optional crawl-stage modules, so it stays a leaf with zero cycle risk.
     """
     try:
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
     except Exception:  # noqa: BLE001 - a hash is never worth breaking a caller over
         return hashlib.sha256((html or "")[:5000].encode("utf-8", "ignore")).hexdigest()[:16]
     title = soup.title.get_text(strip=True) if soup.title else ""
@@ -402,7 +402,7 @@ def extract_businesses_from_html(
     skipped_utility = 0
     skipped_duplicate = 0
 
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if not href.lower().startswith("http"):

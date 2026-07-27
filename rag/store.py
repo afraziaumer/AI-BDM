@@ -80,6 +80,7 @@ class ChromaStore(VectorStore):
                 title=meta.get("title", ""),
                 chunk_no=int(meta.get("chunk_no", 0) or 0),
                 domain=meta.get("domain", ""),
+                source_type=meta.get("source_type", "") or "website",
                 chunk_id=meta.get("chunk_id", ""),
             ))
         return out

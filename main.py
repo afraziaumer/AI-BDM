@@ -13,6 +13,14 @@ One natural-language query runs the whole pipeline:
                                     — reads the top 3-5 retrieved pages' actual text
                                     and answers the question, citing sources)
     Step 5  Tech Stack Detection   (tech_stack, ONLY if the query's intent needs it)
+    Step 6  RAG chunk retrieval    (rag.ingest_and_answer.run: embeds each business's
+                                    high-intent pages into the chunk store and prints
+                                    one combined ranked-chunk answer + evidence summary)
+    Step 7  Google Maps enrichment (phase3.google_maps.enrich: rating/review-count/
+                                    category, address-matched against the business's
+                                    own scraped address; writes leads_with_maps.csv)
+
+Skip Step 6/7 with --no-rag / --no-maps.
 
 Usage:
     ./env/bin/python main.py --query "give me 10 marinas in dubai with no mobile apps"
@@ -50,7 +58,8 @@ import route_planner as rp
 logger = logging.getLogger("ai_bdm.main")
 
 
-async def run(query: str, concurrency: int = 10) -> None:
+async def run(query: str, concurrency: int = 10,
+              no_rag: bool = False, no_maps: bool = False) -> None:
     # ---- Step 1 (plan) + Step 2 (discover + scrape + store homepage HTML) ----
     summary = await p1.run_pipeline(query, concurrency=concurrency)
     p1.print_summary(summary)
@@ -157,15 +166,44 @@ async def run(query: str, concurrency: int = 10) -> None:
     print("\n[clean] Building leads_clean.csv...")
     data_pipeline.run(routes=routes, tech_stacks=tech_stacks)
 
+    # ---- Step 6: RAG chunk ingestion + retrieval — embed each business's
+    # high-intent pages (just written to leads_clean.json above) into the
+    # chunk store and print one combined ranked-chunk answer + per-business
+    # evidence summary for this query. Same logic as
+    # `python -m rag.ingest_and_answer`, called in-process since the
+    # query/domains are already in hand here (no last_run.json round-trip).
+    if not no_rag and businesses:
+        print("\n" + "#" * 68)
+        print(f"STEP 6 — RAG CHUNK INGESTION + RETRIEVAL")
+        print("#" * 68)
+        import rag.ingest_and_answer as raa
+        await asyncio.to_thread(raa.run, query, list(businesses.keys()))
+
+    # ---- Step 7: Google Maps enrichment — rating/review-count/category via
+    # Serper Places, address-matched against each business's own scraped
+    # address (never guessed). Batch mode over the leads_clean.csv just
+    # written -> leads_with_maps.csv. Runs after Step 6 so both read the
+    # exact same committed leads_clean.csv.
+    if not no_maps and businesses:
+        print("\n" + "#" * 68)
+        print(f"STEP 7 — GOOGLE MAPS ENRICHMENT")
+        print("#" * 68)
+        from phase3 import google_maps as gm
+        await gm.enrich("leads_clean.csv", "leads_with_maps.csv", plan.get("geo_location", "") or "")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="AI-BDM: run a query through Step 1 -> Step 2 -> Step 3.")
+        description="AI-BDM: run a query end-to-end, Step 1 through Step 7.")
     parser.add_argument("--query", required=True, help="Natural-language lead query.")
     parser.add_argument("--concurrency", type=int, default=10,
                         help="Concurrent scrape workers for Step 2.")
+    parser.add_argument("--no-rag", action="store_true",
+                        help="Skip Step 6 (RAG chunk ingestion + retrieval).")
+    parser.add_argument("--no-maps", action="store_true",
+                        help="Skip Step 7 (Google Maps rating/address enrichment).")
     args = parser.parse_args()
-    asyncio.run(run(args.query, args.concurrency))
+    asyncio.run(run(args.query, args.concurrency, args.no_rag, args.no_maps))
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ def extract_homepage_candidates(
     from phase1_pipeline import _extract_internal_link_pairs  # local: avoid a
     # module-level circular import (phase1_pipeline imports this module too).
 
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     pairs = _extract_internal_link_pairs(soup, base_url, root_domain)
     accepted = {p["url"] for p in pairs}
 

@@ -36,12 +36,25 @@ Run:
 
 from __future__ import annotations
 
+# MUST be set before ANY other import in this file. On Windows, this module
+# pulls in wappalyzer (via tech_stack, below) and — later in the SAME process,
+# once route_planner/page_retrieval loads rag.embedder for retrieval — torch.
+# Both bundle their own OpenMP runtime (Intel MKL vs libiomp5md), and loading
+# both in one process segfaults immediately with zero Python traceback the
+# instant torch initializes (confirmed live: reproduced by importing this
+# module then calling route_planner.plan_routes() in the same process — pure
+# SIGSEGV, no exception). KMP_DUPLICATE_LIB_OK=TRUE is the standard, widely-
+# used workaround for exactly this conflict; it must be set before either
+# library's C extension loads, so it happens here, first, before even
+# `import os` would normally appear.
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 import socket
 import sys
@@ -83,6 +96,8 @@ import buying_committee
 import business_intelligence
 import github_enrichment
 import youtube_enrichment
+from phase3 import review_harvester
+from phase3.config import REVIEW_ENRICHMENT_ENABLED
 
 # Modular storage layer: cleaned page text + link metadata + per-page index.
 # Local filesystem today; swap the backend in storage.get_store() for R2 later.
@@ -183,7 +198,7 @@ LAST_RUN_FILE = "last_run.json"
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 SERPER_PLACES_URL = "https://google.serper.dev/places"
 # Endpoint for the currently configured premium provider (see PremiumScraper).
-PREMIUM_SCRAPER_URL = "https://api.zenrows.com/v1/"
+PREMIUM_SCRAPER_URL = "https://app.scrapingbee.com/api/v1/"
 
 # Tunable operational parameters (kept as named constants, not magic numbers).
 # Always sweep a FIXED number of Google pages (MAX_SEARCH_PAGES), fetching results
@@ -345,14 +360,15 @@ EMAIL_MIN_SCORE = 40
 # "info@x.com | sales@x.com". Chosen so it never collides with an email/phone.
 CONTACT_SEP = " | "
 
-# Volatile URL query params that change between runs (Google's srsltid, ad-click
-# ids, UTM campaign tags). Stripped before a URL is used as a cache key so the
-# same site isn't re-scraped just because its tracking tag changed.
-TRACKING_PARAMS = frozenset({
-    "srsltid", "gclid", "gclsrc", "dclid", "fbclid", "msclkid", "yclid",
-    "mc_eid", "igshid", "_ga", "ref", "ref_src",
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-})
+# Volatile URL query params + domain-key/tracking-strip helpers live in
+# domain_utils.py (not here) so route_planner.py/final_reasoning.py/
+# route_filter.py can use them without transitively importing this whole
+# module (and the wappalyzer dependency that comes with it) — see that
+# module's docstring. Re-exported under the exact same names so nothing
+# else in THIS file needs to change.
+from domain_utils import (
+    TRACKING_PARAMS, _TLD, domain_key as _domain_key, strip_tracking as _strip_tracking,
+)
 # File extensions that are assets, not readable pages — never crawled.
 SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp",
@@ -394,12 +410,6 @@ JUNK_EMAIL_HINTS = (
 # lives entirely in discovery_classifier.py — a module deliberately independent
 # of the crawler, so new discovery-source types can be added there without
 # touching this file. See discover_targets / discover_places below.
-
-# Offline domain extractor (bundled public-suffix snapshot; no network fetch).
-_TLD = tldextract.TLDExtract(
-    suffix_list_urls=(),
-    cache_dir=os.getenv("TLDEXTRACT_CACHE", ".tldextract-cache"),
-)
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -517,20 +527,8 @@ async def deconstruct_intent(user_prompt: str) -> Dict[str, Any]:
 
 
 # === Step 2: Target footprint discovery ====================================
-def _domain_key(url_or_host: str) -> str:
-    """Registered domain (e.g. 'help.predictwind.com' -> 'predictwind.com').
-
-    Used to de-duplicate so a company's many subdomains count as one business.
-    """
-    ext = _TLD.extract_str(url_or_host)
-    # top_domain_under_public_suffix is the non-deprecated equivalent of registered_domain
-    domain = (
-        getattr(ext, "top_domain_under_public_suffix", None)
-        or getattr(ext, "registered_domain", None)
-        or ext.domain
-    )
-    return (domain or "").lower()
-
+# _domain_key / _strip_tracking / TRACKING_PARAMS / _TLD are imported from
+# domain_utils.py (see the import near the top of this file).
 
 _DOMAIN_IN_QUERY_RE = re.compile(r"\b((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})\b")
 
@@ -547,24 +545,6 @@ def _detect_domain(text: str) -> str:
         if _TLD.extract_str(candidate).suffix:  # has a real TLD
             return _domain_key(candidate)
     return ""
-
-
-def _strip_tracking(url: str) -> str:
-    """Drop volatile tracking query params (srsltid, utm_*, gclid...) and the
-    fragment, giving one stable URL for the same page across runs. Without this
-    the cache misses whenever Google re-stamps a result with a new srsltid tag.
-    """
-    if not url:
-        return url
-    try:
-        p = urlparse(url)
-    except ValueError:
-        return url
-    kept = [
-        (k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-        if k.lower() not in TRACKING_PARAMS
-    ]
-    return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(kept), ""))
 
 
 def _is_internal_crawl_noise(host: str, path: str) -> bool:
@@ -972,12 +952,14 @@ class PremiumScraper:
     provider is behind it; there is never a second premium provider tried as
     a fallback.
 
-    Wired today to ZenRows' API contract, keyed by ZENROWS_API_KEY (kept as
-    the variable/env name for backward compatibility regardless of which
-    provider's key it actually holds — see that constant's docstring). To
-    switch providers in the future, update THIS class's request shape (URL,
-    param names) to the new provider's contract; no other file needs to
-    change and no dual-provider detection is ever introduced.
+    Wired today to ScrapingBee's API contract, keyed by ZENROWS_API_KEY (kept
+    as the variable/env name for backward compatibility regardless of which
+    provider's key it actually holds — see that constant's docstring; the
+    .env value is a genuine ScrapingBee key, verified live against
+    app.scrapingbee.com). To switch providers again in the future, update
+    THIS class's request shape (URL, param names) to the new provider's
+    contract; no other file needs to change and no dual-provider detection
+    is ever introduced.
     """
 
     # Global throttle: never run more than PREMIUM_MAX_CONCURRENCY proxied
@@ -1004,24 +986,30 @@ class PremiumScraper:
         A genuine non-transient HTTP status (403/404/...) is NOT retried —
         the same request would just fail the same way again.
 
-        Forces English content two ways: `proxy_country` pins the proxy's
+        Forces English content two ways: `country_code` pins the proxy's
         exit IP to FORCE_ENGLISH_GEO_CODE (defeats GeoIP-based language
         selection — the site sees a US visitor, same as it would for a real
-        one), and `custom_headers` forwards our own Accept-Language header
+        one), and `forward_headers` forwards our own Accept-Language header
         instead of the provider's default (defeats content-negotiation-based
         language selection). Sites with no English content at all are
         unaffected by either — there's nothing to switch to.
+
+        `render_js` is explicitly set to "false" on the cheap tier — ScrapingBee
+        defaults this to true if omitted, which would silently turn every
+        "cheap" fetch into a billed JS-render request and break the whole
+        two-tier cost model (cheap-first, render only after a failed cheap
+        attempt).
         """
         params: Dict[str, str] = {
-            "apikey": ZENROWS_API_KEY, "url": target_url,
-            "custom_headers": "true",
+            "api_key": ZENROWS_API_KEY, "url": target_url,
+            "forward_headers": "true", "render_js": "false",
         }
         if render:
-            params["js_render"] = "true"
+            params["render_js"] = "true"
             params["premium_proxy"] = "true"
-            params["proxy_country"] = FORCE_ENGLISH_GEO_CODE
+            params["country_code"] = FORCE_ENGLISH_GEO_CODE
             if PREMIUM_BLOCK_RESOURCES:
-                params["block_resources"] = "image,media,font"
+                params["block_resources"] = "true"
         mode = "render" if render else "plain"
 
         for attempt in range(PREMIUM_MAX_RETRIES + 1):
@@ -1039,11 +1027,18 @@ class PremiumScraper:
                         if resp.status == 200:
                             return (await _read_html(resp), dict(resp.headers),
                                     resp.headers.getall("Set-Cookie", []))
+                        # ScrapingBee's error bodies are genuinely useful — they
+                        # name the exact fix ("try premium_proxy=True", "try
+                        # stealth_proxy=True", cost per request) rather than
+                        # just a bare status code. Always logged, not just on
+                        # the final exhausted attempt, so a live run shows
+                        # WHY each attempt failed, not just that it did.
+                        body_preview = (await resp.text())[:300]
                         if resp.status in _PROXY_TRANSIENT_STATUS:
-                            retry_reason = f"status={resp.status}"
+                            retry_reason = f"status={resp.status}: {body_preview}"
                         else:
-                            logger.error("Premium scraper %s failed (status=%s): %s",
-                                         mode, resp.status, target_url)
+                            logger.error("Premium scraper %s failed (status=%s) for %s: %s",
+                                         mode, resp.status, target_url, body_preview)
                             return "", {}, []
             except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
                 retry_reason = f"{type(exc).__name__}: {exc}"
@@ -1118,21 +1113,48 @@ async def _tier1_native_fetch(
     return None  # blocked -> escalate to the premium tier
 
 
+# Per-domain circuit breaker: after this many consecutive full failures
+# (both the plain and JS-render sub-tiers exhausted) for the SAME domain,
+# stop escalating to the premium tier for the rest of that domain's crawl.
+# Confirmed live: a systematically failing domain (the provider returning
+# the identical error for every URL on it, not a one-off blip) burned 13+
+# minutes retrying 10 different contact-path guesses, each one independently
+# repeating the full 3-retry backoff on both sub-tiers — 6 full attempts per
+# URL, discovering the SAME "this domain doesn't work right now" conclusion
+# every single time instead of learning it once. Module-level (not threaded
+# through execute_scavenger_scrape's call signature) so _tier2_premium_fetch
+# keeps the exact (session, target_url) signature the generic _TIER_SEQUENCE
+# loop calls it with; domain is derived from target_url itself. Naturally
+# resets on each new process run.
+PREMIUM_CIRCUIT_BREAKER_THRESHOLD = 2
+_premium_circuit_failures: Dict[str, int] = {}
+_premium_circuit_open: Set[str] = set()
+
+
 async def _tier2_premium_fetch(
     session: aiohttp.ClientSession, target_url: str
 ) -> Optional[Dict[str, Any]]:
     """The configured premium scraper — cheap fetch first, JS-render fallback
     on failure. Returns None (no more tiers left) on any failure, including a
-    missing/not-yet-configured API key."""
+    missing/not-yet-configured API key or an open circuit breaker for this
+    URL's domain (see PREMIUM_CIRCUIT_BREAKER_THRESHOLD)."""
     if not ZENROWS_API_KEY:
         logger.info("Premium scraper not configured (no API key) — skipping Tier-2 for %s",
                     target_url)
+        return None
+
+    domain = _domain_key(urlparse(target_url).netloc)
+    if domain in _premium_circuit_open:
+        logger.info("Premium scraper circuit open for %s (too many consecutive "
+                    "failures already) — skipping %s without retrying.",
+                    domain, target_url)
         return None
 
     logger.info("Tier-2 premium-scraper escalation: %s", target_url)
     html, headers, cookies = await PremiumScraper.fetch(session, target_url, render=False)
     if html:
         logger.info("Tier-2 success (plain): %s", target_url)
+        _premium_circuit_failures.pop(domain, None)
         return {"html": html, "method": "PREMIUM", "headers": headers,
                 "status_code": 200, "cookies": cookies}
 
@@ -1144,8 +1166,20 @@ async def _tier2_premium_fetch(
         html, headers, cookies = await PremiumScraper.fetch(session, target_url, render=True)
         if html:
             logger.info("Tier-2 success (render): %s", target_url)
+            _premium_circuit_failures.pop(domain, None)
             return {"html": html, "method": "PREMIUM_RENDER", "headers": headers,
                     "status_code": 200, "cookies": cookies}
+
+    failures = _premium_circuit_failures.get(domain, 0) + 1
+    _premium_circuit_failures[domain] = failures
+    if failures >= PREMIUM_CIRCUIT_BREAKER_THRESHOLD:
+        _premium_circuit_open.add(domain)
+        logger.warning(
+            "Premium scraper failed %d consecutive time(s) for %s — opening "
+            "circuit breaker: no further premium-tier attempts for this "
+            "domain's crawl (native-fetch-only for its remaining pages).",
+            failures, domain,
+        )
     return None
 
 
@@ -1314,7 +1348,7 @@ def _extract_external_link_pairs(
 
 def _extract_internal_links(html: str, base_url: str, root_domain: str) -> List[str]:
     """Return same-domain, crawlable page links found in `html`."""
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser")
     return [p["url"] for p in _extract_internal_link_pairs(soup, base_url, root_domain)]
 
 
@@ -1330,7 +1364,7 @@ def _parse_language_alternates(html: str, base_url: str) -> Dict[str, str]:
     tags in <head>. "x-default" is skipped (it's a fallback marker, not a
     language). Best-effort: never raises, empty dict on any parse failure."""
     try:
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
     except Exception:  # noqa: BLE001 - a bad parse just means no alternates found
         return {}
     alternates: Dict[str, str] = {}
@@ -1653,7 +1687,7 @@ async def crawl_site(
         return; only the enclosing lightweight accumulators are updated.
         """
         nonlocal pages_kept, address, sample_chars, home_lines, schema_organization
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         # Hyperlinks FIRST, from the raw soup, so cleaning can't lose them.
         link_pairs = _extract_internal_link_pairs(soup, page_url, domain)
         link_urls = [p["url"] for p in link_pairs]
@@ -2418,7 +2452,7 @@ def extract_contacts(
     Sync (BeautifulSoup + optional DNS) — call off the event loop via
     asyncio.to_thread from async code.
     """
-    soup = BeautifulSoup(html or "", "lxml")
+    soup = BeautifulSoup(html or "", "html.parser")
 
     # === Emails (all of them) ================================================
     extractor = EmailExtractor(html or "", site_domain=site_domain)
@@ -2480,15 +2514,24 @@ def extract_contacts(
     }
 
 
-# Street-type words that anchor a US/'/UK-style street address in free text.
+# Street-type words that anchor a street address in free text. Includes both
+# US/UK terms (street, road, ...) and South Asian ones (markaz, sector, ...)
+# that are just as common in scraped business addresses and were previously
+# entirely missing — a Pakistani business's own "F-8 Markaz Islamabad" style
+# address matched nothing at all before these were added.
 _STREET_SUFFIX = (
     r"(?:street|st|avenue|ave|boulevard|blvd|road|rd|drive|dr|lane|ln|way|"
     r"place|pl|court|ct|square|sq|plaza|parkway|pkwy|highway|hwy|terrace|"
-    r"suite|ste|floor|fl|unit)"
+    r"suite|ste|floor|fl|unit|"
+    r"markaz|sector|block|plot|phase|chowk|colony|society|cantt|gali)"
 )
 # "123 Main St, New York, NY 10001" — number + words + street-type + tail.
+# The number is followed by `(?:-[A-Za-z])?[\s,]+`, not `\s+` — two South Asian
+# conventions were previously unmatched entirely: a letter-suffixed plot/house
+# number ("17-E G-10 Markaz"), and a number followed directly by a comma
+# ("Office No 14, Ground Floor") rather than whitespace.
 _ADDRESS_RE = re.compile(
-    r"\d{1,6}\s+[A-Za-z0-9.\-'#, ]{2,45}?\b" + _STREET_SUFFIX +
+    r"\d{1,6}(?:-[A-Za-z])?[\s,]+[A-Za-z0-9.\-'#, ]{2,45}?\b" + _STREET_SUFFIX +
     r"\b\.?[A-Za-z0-9.,\-#/'’ ]{0,70}",
     re.IGNORECASE,
 )
@@ -3109,6 +3152,26 @@ async def process_single_lead(
             "Committed %d page(s) for %s -> storage/%s/ (%s)",
             crawl["pages_kept"], name, domain, status,
         )
+        # A committed business now has a stable domain folder, so Phase 3 can
+        # categorize it and harvest the five relevant review sources. This is
+        # cache-first and best-effort: it never delays a successful lead.
+        if REVIEW_ENRICHMENT_ENABLED:
+            try:
+                review_summary = await review_harvester.enrich_business(
+                    domain, name or "", industry or "", geo or "",
+                    address=crawl.get("address", ""),
+                    phone=phone or "",
+                )
+                logger.info(
+                    "Review enrichment for %s: %s | %d/%d listing(s) matched, "
+                    "%d review(s) extracted.",
+                    domain, review_summary.get("category", "Uncategorized"),
+                    review_summary.get("matched", 0),
+                    review_summary.get("checked", 0),
+                    review_summary.get("reviews", 0),
+                )
+            except Exception as exc:  # noqa: BLE001 - non-blocking enrichment
+                logger.warning("Review enrichment failed for %s: %s", domain, exc)
         # Back-fill each page's incoming-anchor evidence now that the whole
         # site's link graph is final (links.json only exists post-commit) —
         # best-effort, never blocks/breaks a successful commit.

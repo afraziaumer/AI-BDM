@@ -24,7 +24,7 @@ from typing import Any, Dict, List
 
 from LLM_planner import call_llm, get_client
 from model_router import TaskType
-from phase1_pipeline import _domain_key
+from domain_utils import domain_key as _domain_key
 from storage import get_store
 
 import page_retrieval as pr

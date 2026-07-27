@@ -119,6 +119,7 @@ def chunk(doc: SourceDoc) -> List[Chunk]:
             title=title,
             chunk_no=i,
             domain=domain,
+            source_type=doc.source_type or "website",
             chunk_id=f"{doc.url}#{i}",
         ))
     return chunks

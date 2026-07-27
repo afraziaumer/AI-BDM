@@ -27,6 +27,7 @@ class SourceDoc:
     title: str
     content: str
     domain: str = ""
+    source_type: str = "website"   # "website" (default) or "review" (see rag/ingest_reviews.py)
 
     @classmethod
     def from_dict(cls, d: dict) -> "SourceDoc":
@@ -35,6 +36,7 @@ class SourceDoc:
             title=d.get("title", "") or "",
             content=d.get("content", "") or "",
             domain=d.get("domain", "") or "",
+            source_type=d.get("source_type", "") or "website",
         )
 
 
@@ -46,6 +48,7 @@ class Chunk:
     title: str                     # source page title
     chunk_no: int                  # 0-based index within the document
     domain: str = ""               # registered domain, for per-business filtering
+    source_type: str = "website"   # "website" or "review" — see rag/ingest_reviews.py
     embedding: Optional[List[float]] = None   # filled in by the embedder
     chunk_id: str = ""             # unique id (e.g. f"{url}#{chunk_no}")
 
@@ -57,4 +60,5 @@ class Chunk:
             "chunk_no": self.chunk_no,
             "chunk_id": self.chunk_id,
             "domain": self.domain,
+            "source_type": self.source_type,
         }
