@@ -177,7 +177,7 @@ async def run(query: str, concurrency: int = 10,
         print(f"STEP 6 — RAG CHUNK INGESTION + RETRIEVAL")
         print("#" * 68)
         import rag.ingest_and_answer as raa
-        await asyncio.to_thread(raa.run, query, list(businesses.keys()))
+        await asyncio.to_thread(raa.run, query, domains)
 
     # ---- Step 7: Google Maps enrichment — rating/review-count/category via
     # Serper Places, address-matched against each business's own scraped

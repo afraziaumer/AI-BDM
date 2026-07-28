@@ -18,10 +18,11 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from phase3 import store
-from phase3.business_category import UNCATEGORIZED, categorize_domain
-from phase3.config import (DEFAULT_CONCURRENCY, MAX_REVIEWS_PER_PLATFORM,
-    REVIEW_CACHE_DAYS, REVIEW_MAX_PAGES, SERPER_API_KEY, SERPER_SEARCH_URL,
-    SERPER_TIMEOUT_S, ZENROWS_API_KEY)
+from phase3.business_category import categorize_domain
+from phase3.config import (APIFY_API_TOKEN, APIFY_MAX_REVIEWS_ATTEMPT, APIFY_REDDIT_RUN_SYNC_URL,
+    APIFY_REDDIT_TIMEOUT_S, APIFY_RUN_SYNC_URL, APIFY_TIMEOUT_S, DEFAULT_CONCURRENCY,
+    MAX_REVIEWS_PER_PLATFORM, REVIEW_CACHE_DAYS, REVIEW_MAX_PAGES, SERPER_API_KEY,
+    SERPER_SEARCH_URL, SERPER_TIMEOUT_S, ZENROWS_API_KEY)
 
 logger = logging.getLogger("Phase3ReviewHarvester")
 
@@ -305,6 +306,169 @@ async def _discover_google_maps(session: aiohttp.ClientSession, name: str, addre
              "maps_match_confidence": place.get("confidence", "high")})
 
 
+async def _fetch_apify_google_reviews(
+    session: aiohttp.ClientSession, listing_url: str
+) -> List[Dict[str, Any]]:
+    """Real Google Maps review TEXT — the one thing no direct fetch tier
+    (native, premium-scraper plain, premium-scraper JS-render) can ever get,
+    confirmed live: Google Maps' review panel is virtualized (never present
+    in any page source) and full browsing requires a signed-in Google
+    session, which this project will not automate.
+
+    Apify's compass/Google-Maps-Reviews-Scraper actor runs the actual
+    scraping on Apify's own infrastructure as a paid (here, free-tier)
+    service — this project never touches Google's page directly for review
+    text, only Apify's own API, given the SAME address/phone/name-verified
+    listing URL _discover_google_maps already produced (no re-verification
+    needed here; that already happened).
+
+    `run-sync-get-dataset-items` blocks until the run finishes and returns
+    the scraped rows directly — simpler than the async run-then-poll
+    pattern, and fine at this review count (MAX_REVIEWS_PER_PLATFORM caps
+    it well under Apify's own sync-endpoint time limit).
+
+    Not every raw review has written text (star-only ratings get filtered
+    out below), so requesting exactly MAX_REVIEWS_PER_PLATFORM from Apify
+    usually yields fewer than that with actual text. To still land on the
+    MAX_REVIEWS_PER_PLATFORM target, this escalates: if the first run comes
+    up short AND Apify returned as many raw reviews as asked for (a sign
+    there are more out there to fetch), it re-runs asking for more, doubling
+    each time up to APIFY_MAX_REVIEWS_ATTEMPT. It stops early the moment
+    Apify returns fewer raw reviews than requested — that means the
+    business's review pool is exhausted and asking again would just re-fetch
+    the same reviews at extra cost.
+    """
+    if not APIFY_API_TOKEN:
+        logger.info("Apify not configured (no API token) — skipping Google review text for %s",
+                    listing_url)
+        return []
+
+    request_count = MAX_REVIEWS_PER_PLATFORM
+    reviews: List[Dict[str, Any]] = []
+    while True:
+        logger.info("Apify Google Reviews run: %s (up to %d reviews)",
+                    listing_url, request_count)
+        payload = {
+            "startUrls": [{"url": listing_url}],
+            "maxReviews": request_count,
+            "reviewsSort": "newest",
+        }
+        try:
+            async with session.post(
+                APIFY_RUN_SYNC_URL, params={"token": APIFY_API_TOKEN}, json=payload,
+                timeout=aiohttp.ClientTimeout(total=APIFY_TIMEOUT_S),
+            ) as response:
+                if response.status not in (200, 201):
+                    body = (await response.text())[:300]
+                    logger.warning("Apify Google Reviews run failed (status=%s) for %s: %s",
+                                   response.status, listing_url, body)
+                    break
+                items = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("Apify Google Reviews run error for %s: %s", listing_url, exc)
+            break
+
+        items = items or []
+        reviews = []
+        for item in items:
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue  # a star-only rating with no written text -- nothing to chunk/RAG
+            reviews.append({
+                "text": text,
+                "rating": item.get("stars") or "",
+                "author": item.get("name") or "",
+                "date": item.get("publishedAtDate") or item.get("publishAt") or "",
+            })
+        logger.info("Apify Google Reviews: %d review(s) with text out of %d raw for %s",
+                    len(reviews), len(items), listing_url)
+
+        if len(reviews) >= MAX_REVIEWS_PER_PLATFORM:
+            reviews = reviews[:MAX_REVIEWS_PER_PLATFORM]
+            break
+        if len(items) < request_count:
+            break  # business has no more reviews to give -- asking again would just repeat this run
+        if request_count >= APIFY_MAX_REVIEWS_ATTEMPT:
+            break  # hit the spend/time ceiling for this business
+        request_count = min(request_count * 2, APIFY_MAX_REVIEWS_ATTEMPT)
+        logger.info("Apify Google Reviews: only %d/%d with text -- retrying with maxReviews=%d for %s",
+                    len(reviews), MAX_REVIEWS_PER_PLATFORM, request_count, listing_url)
+
+    return reviews
+
+
+async def _fetch_apify_reddit_mentions(
+    session: aiohttp.ClientSession, name: str, geo: str
+) -> List[Dict[str, Any]]:
+    """Reddit discussion mentioning this business, found by a direct keyword
+    search (business name + geo) via Apify's trudax/reddit-scraper-lite
+    actor -- not a Serper site:reddit.com lookup followed by a fetch, the
+    pattern every other platform uses. Reddit itself is the search surface
+    here, on Apify's own infrastructure, because reddit.com blocks every
+    direct fetch tier this project has (confirmed live: native 403,
+    api.reddit.com/old.reddit.com 403, ScrapingBee plain hits a
+    bot-verification wall, ScrapingBee JS-render times out).
+
+    Returns both posts and their top-level comments that matched the search,
+    normalized to the same {text, rating, author, date} shape every other
+    platform's `reviews` list uses (plus `url`/`community`, which no other
+    platform has, for traceability) -- `rating` is always empty since Reddit
+    has no star rating, but the shared shape is what lets
+    rag/ingest_reviews.py embed this identically to every other platform's
+    output with zero changes.
+    """
+    if not APIFY_API_TOKEN:
+        logger.info("Apify not configured (no API token) — skipping Reddit search for %r", name)
+        return []
+    if not name:
+        return []
+    query = f"{name} {geo}".strip()
+    payload = {
+        "searches": [query],
+        "searchPosts": True,
+        "searchComments": True,
+        "sort": "relevance",
+        "maxItems": MAX_REVIEWS_PER_PLATFORM,
+        "maxPostCount": MAX_REVIEWS_PER_PLATFORM,
+        "maxComments": MAX_REVIEWS_PER_PLATFORM,
+        "skipUserPosts": True,
+        "skipCommunity": True,
+    }
+    logger.info("Apify Reddit search: %r (up to %d items)", query, MAX_REVIEWS_PER_PLATFORM)
+    try:
+        async with session.post(
+            APIFY_REDDIT_RUN_SYNC_URL, params={"token": APIFY_API_TOKEN}, json=payload,
+            timeout=aiohttp.ClientTimeout(total=APIFY_REDDIT_TIMEOUT_S),
+        ) as response:
+            if response.status not in (200, 201):
+                body = (await response.text())[:300]
+                logger.warning("Apify Reddit search failed (status=%s) for %r: %s",
+                               response.status, query, body)
+                return []
+            items = await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        logger.warning("Apify Reddit search error for %r: %s", query, exc)
+        return []
+
+    mentions: List[Dict[str, Any]] = []
+    for item in items or []:
+        title = (item.get("title") or "").strip()
+        body = (item.get("body") or "").strip()
+        text = f"{title}\n{body}".strip() if title and body else (title or body)
+        if not text:
+            continue  # e.g. a media-only post with no title/body text
+        mentions.append({
+            "text": text,
+            "rating": "",
+            "author": item.get("username") or "",
+            "date": item.get("createdAt") or "",
+            "url": item.get("url") or item.get("link") or "",
+            "community": item.get("communityName") or "",
+        })
+    logger.info("Apify Reddit search: %d mention(s) with text for %r", len(mentions), query)
+    return mentions
+
+
 async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str, address: str,
                            geo: str, platform: str, hosts: Sequence[str],
                            phone: str = "") -> Dict[str, Any]:
@@ -314,6 +478,26 @@ async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str
                     domain, platform, cached.get("review_count_extracted", 0))
         return cached
     logger.info("[%s] %s: checking (no cache) ...", domain, platform)
+    if platform == "reddit":
+        # Reddit has no single canonical "listing" page like every other
+        # platform (a profile/review page found via Serper's site: search) --
+        # it's scattered posts/comments across communities, found directly by
+        # keyword search instead. See _fetch_apify_reddit_mentions.
+        mentions = await _fetch_apify_reddit_mentions(session, name, geo)
+        record = {
+            "platform": platform, "business_name": name, "matched": bool(mentions),
+            "listing_url": "", "reviews": mentions, "review_count_extracted": len(mentions),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if mentions:
+            record["fetch_method"] = "apify"
+        elif not APIFY_API_TOKEN:
+            record["reason"] = "Apify is not configured (no API token)"
+        else:
+            record["reason"] = "no Reddit mentions found"
+        logger.info("[%s] %s: done -> %d mention(s) extracted", domain, platform, len(mentions))
+        store.save(domain, platform, record)
+        return record
     if platform == "google_reviews":
         listing, extra_fields = await _discover_google_maps(session, name, address, geo, phone)
     else:
@@ -324,6 +508,23 @@ async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str
     if not listing:
         record["reason"] = "no confident public listing found"
         logger.info("[%s] %s: no confident listing found", domain, platform)
+    elif platform == "google_reviews":
+        # Google Maps review text is unreachable by any generic fetch tier
+        # (see _fetch_apify_google_reviews's docstring) -- Apify replaces the
+        # whole native/premium fetch+extract loop for this platform only.
+        logger.info("[%s] %s: listing found -> %s", domain, platform, listing)
+        reviews = await _fetch_apify_google_reviews(session, listing)
+        record["pages_fetched"] = 1 if reviews or APIFY_API_TOKEN else 0
+        if reviews:
+            record["fetch_method"] = "apify"
+            record["reviews"] = reviews
+            record["review_count_extracted"] = len(reviews)
+        elif not APIFY_API_TOKEN:
+            record["reason"] = "listing found but Apify is not configured (no API token)"
+        else:
+            record["reason"] = "listing found but Apify returned no review text"
+        logger.info("[%s] %s: done -> %d review(s) extracted", domain, platform,
+                    record["review_count_extracted"])
     else:
         logger.info("[%s] %s: listing found -> %s", domain, platform, listing)
         reviews: List[Dict[str, Any]] = []
@@ -385,18 +586,22 @@ async def enrich_business(domain: str, name: str, industry: str = "", geo: str =
     entirely for it.
     """
     category = categorize_domain(domain, industry, name, page_title)
-    selected = platforms_for_category(category)
-    if category == UNCATEGORIZED or not selected:
-        logger.info("[%s] uncategorized — no review platforms to check", domain)
-        return {"category": category, "checked": 0, "matched": 0, "reviews": 0}
+    # Reddit isn't a category-specific review site -- discussion of any
+    # business, any category, can turn up there -- so it's appended
+    # unconditionally instead of coming from CATEGORY_PLATFORMS.
+    selected: List[tuple[str, Sequence[str]]] = list(platforms_for_category(category))
+    selected.append(("reddit", ()))
     logger.info("[%s] category=%s -> checking %d platform(s): %s",
                 domain, category, len(selected), ", ".join(p for p, _ in selected))
-    # Discovery itself needs Serper; ZenRows is now only a fallback fetch
-    # tier behind the native fetch, so it's no longer required up front.
+    # Category-specific platforms all need Serper for discovery; reddit only
+    # needs Apify (direct keyword search, no site: lookup) -- so a missing
+    # Serper key narrows the list to reddit instead of blocking everything.
     if not SERPER_API_KEY:
+        selected = [item for item in selected if item[0] == "reddit"]
+    if not SERPER_API_KEY and not APIFY_API_TOKEN:
         return {
             "category": category, "checked": 0, "matched": 0, "reviews": 0,
-            "reason": "SERPER_API_KEY is not configured",
+            "reason": "SERPER_API_KEY and APIFY_API_TOKEN are not configured",
         }
     sem = asyncio.Semaphore(min(DEFAULT_CONCURRENCY, 2))
     async with aiohttp.ClientSession() as session:

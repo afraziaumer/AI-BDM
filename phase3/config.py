@@ -32,6 +32,44 @@ SERPER_TIMEOUT_S = 15
 # what review_harvester.py's premium-tier fetch actually calls through).
 ZENROWS_API_KEY = os.getenv("zenrows") or os.getenv("ZENROWS_API_KEY")
 
+# Google Maps' review panel is virtualized (never in any static or JS-rendered
+# page source) and full browsing requires a signed-in Google session, which
+# this project will not automate — confirmed live, no fetch tier (native,
+# premium plain, premium JS-render) can ever get review TEXT from it. Apify's
+# compass/Google-Maps-Reviews-Scraper actor is the one thing that does: it
+# runs the actual scraping on Apify's own infrastructure as a paid (here,
+# free-tier, ~$0.0006/review) service — this project never touches Google's
+# page directly for review text, only Apify's own API, given the SAME
+# address/phone/name-verified listing URL google_reviews discovery already
+# produces. See phase3/review_harvester.py's _fetch_apify_google_reviews.
+APIFY_API_TOKEN = os.getenv("apify") or os.getenv("APIFY_API_TOKEN")
+APIFY_GOOGLE_REVIEWS_ACTOR = "compass~Google-Maps-Reviews-Scraper"
+APIFY_RUN_SYNC_URL = (
+    f"https://api.apify.com/v2/acts/{APIFY_GOOGLE_REVIEWS_ACTOR}/run-sync-get-dataset-items"
+)
+APIFY_TIMEOUT_S = 180
+# _fetch_apify_google_reviews retries with a bigger maxReviews when the first
+# run comes up short of MAX_REVIEWS_PER_PLATFORM reviews WITH TEXT (star-only
+# ratings get filtered out, so raw count != texted count). This bounds how
+# far it escalates (doubling each retry) so a business with a huge review
+# pool but a low text ratio can't blow past a sane per-business Apify spend.
+APIFY_MAX_REVIEWS_ATTEMPT = 100
+
+# Reddit blocks every direct fetch tier this project has (native 403,
+# api.reddit.com/old.reddit.com 403, ScrapingBee plain = bot-verification
+# wall, ScrapingBee JS-render = timeout) -- confirmed live. Apify's
+# trudax/reddit-scraper-lite actor searches Reddit itself (posts + comments,
+# by keyword) on Apify's own infrastructure instead, the same escape hatch
+# APIFY_GOOGLE_REVIEWS_ACTOR is for Google Maps. See
+# phase3/review_harvester.py's _fetch_apify_reddit_mentions.
+APIFY_REDDIT_ACTOR = "trudax~reddit-scraper-lite"
+APIFY_REDDIT_RUN_SYNC_URL = (
+    f"https://api.apify.com/v2/acts/{APIFY_REDDIT_ACTOR}/run-sync-get-dataset-items"
+)
+# Observed live: a 15-item search run took ~2-4 minutes (slower than the
+# Google Reviews actor) -- given a generous margin over APIFY_TIMEOUT_S.
+APIFY_REDDIT_TIMEOUT_S = 280
+
 # Enabled by default after a business is committed. Set false to skip the
 # category-specific review harvest on a particular run.
 REVIEW_ENRICHMENT_ENABLED = os.getenv(
@@ -41,7 +79,7 @@ REVIEW_ENRICHMENT_ENABLED = os.getenv(
 # for this workflow. ``None`` tells Phase 3's store never to expire them;
 # remove a platform JSON file manually when a deliberate refresh is wanted.
 REVIEW_CACHE_DAYS = None
-MAX_REVIEWS_PER_PLATFORM = 20
+MAX_REVIEWS_PER_PLATFORM = 25
 # Hard cap on how many review-listing pages get fetched per platform (page 1
 # plus up to 2 more via a "?page=N"/"&page=N" guess). Pagination stops early,
 # before this cap, the moment a page contributes zero NEW reviews — this is a
