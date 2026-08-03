@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List
 
 from LLM_planner import call_llm, get_client
@@ -43,7 +44,16 @@ def _txt_path_by_filename(domain: str) -> Dict[str, str]:
             continue
         txt_path = row.get("txt_path") or ""
         if txt_path:
-            lookup.setdefault(txt_path.rsplit("/", 1)[-1], txt_path)
+            # crawl_index.csv's txt_path is an OS-native filesystem path, not
+            # a URL -- on Windows that's backslash-separated
+            # ("storage\\domain\\home.txt"), so a forward-slash-only
+            # rsplit("/") never finds a separator and returns the WHOLE path
+            # instead of just "home.txt". That silently broke every match
+            # against hit.filename below, which made every answer_query()
+            # call fail with "no_page_text_available" on Windows regardless
+            # of how much real page text was actually available.
+            basename = re.split(r"[\\/]", txt_path)[-1]
+            lookup.setdefault(basename, txt_path)
     return lookup
 
 

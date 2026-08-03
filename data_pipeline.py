@@ -39,6 +39,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import textwrap
 from collections import Counter, defaultdict
@@ -256,6 +257,13 @@ def dedupe_pages(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return list(best.values())
 
 
+_NAME_WORDS = re.compile(r"[a-z0-9]{3,}")
+
+
+def _name_tokens(text: str) -> set:
+    return set(_NAME_WORDS.findall((text or "").lower()))
+
+
 def _richness(r: Dict[str, str]) -> int:
     """Heuristic completeness score used to pick the best of duplicate rows."""
     score = int(r.get("content_length") or 0)
@@ -281,6 +289,22 @@ def to_business_level(pages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         home = rows_sorted[0]  # shortest path == homepage
 
         names = Counter(r["company_name"] for r in rows if r["company_name"])
+        # "Shortest path == homepage" breaks when the site's real root ("/")
+        # was never actually crawled -- e.g. a business that's really one
+        # subsection of a larger institutional site (a park's shared
+        # "/contact" page outranks that park's OWN page about this specific
+        # marina on path length alone, purely because "/contact" happens to
+        # be a shorter URL). When that happens, prefer whichever committed
+        # page's own title best matches the business's name instead --
+        # confirmed live: this is what fixed page_title picking a generic
+        # "Contact Us" title over the marina's own "Pier 25 Marina" one.
+        if pp.urlparse(home["page_url"]).path.rstrip("/") not in ("", "/"):
+            winning_name = names.most_common(1)[0][0] if names else ""
+            name_tokens = _name_tokens(winning_name)
+            if name_tokens:
+                best = max(rows, key=lambda r: len(name_tokens & _name_tokens(r.get("page_title", ""))))
+                if name_tokens & _name_tokens(best.get("page_title", "")):
+                    home = best
         # Union every unique email / phone found across all of the site's pages.
         emails = pp._union_contacts(rows, "email")
         phones = pp._union_contacts(rows, "phone_number")

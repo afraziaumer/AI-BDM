@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import logging
 import re
 import sys
 from typing import Any, Dict, List, Optional
@@ -41,6 +42,8 @@ from phase3.config import (
     SERPER_PLACES_URL,
     SERPER_TIMEOUT_S,
 )
+
+logger = logging.getLogger("Phase3GoogleMaps")
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
@@ -137,9 +140,20 @@ def _name_only_match(candidate_title: str, known_name: str) -> bool:
 
 
 async def _serper_places(session: aiohttp.ClientSession, query: str,
-                          num: int = 5) -> List[Dict[str, Any]]:
-    """One Serper Places search -> list of place results. [] on any failure —
-    this never raises, matching the fail-safe rule for every Phase 3 source."""
+                          num: int = 5) -> Optional[List[Dict[str, Any]]]:
+    """One Serper Places search -> list of place results.
+
+    Returns `[]` only when the request genuinely SUCCEEDED with zero places
+    (a real "no listing" signal, safe to cache forever). Returns `None` on
+    any failure (network error, timeout, non-200) -- distinct from `[]` so
+    callers can tell "this business has no Google listing" apart from "the
+    request itself failed," and skip caching the latter. Caching a transient
+    failure as a permanent miss (observed live: a business with a confirmed
+    Google Maps match minutes earlier got silently locked in as "no Serper
+    results" after one bad network moment) is worse than just retrying next
+    run -- this never raises either way, matching the fail-safe rule for
+    every Phase 3 source.
+    """
     if not SERPER_API_KEY:
         return []
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
@@ -150,10 +164,12 @@ async def _serper_places(session: aiohttp.ClientSession, query: str,
             timeout=aiohttp.ClientTimeout(total=SERPER_TIMEOUT_S),
         ) as resp:
             if resp.status != 200:
-                return []
+                logger.warning("Serper Places request failed (status=%s) for %r", resp.status, query)
+                return None
             data = await resp.json()
-    except Exception:  # noqa: BLE001 - network layer, degrade quietly
-        return []
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        logger.warning("Serper Places request error for %r: %s", query, exc)
+        return None
     return data.get("places", []) or []
 
 
@@ -201,6 +217,11 @@ async def find_place(session: aiohttp.ClientSession, name: str,
 
     query = f"{name} {geo}".strip()
     results = await _serper_places(session, query)
+    if results is None:
+        # The request itself failed (network/timeout/non-200) -- distinct
+        # from a real "Serper successfully found nothing," which is safe to
+        # trust. Flagged so enrich_domain() knows not to cache this forever.
+        return {"matched": False, "reason": "Serper Places request failed", "transient_failure": True}
     if not results:
         return {"matched": False, "reason": "no Serper results"}
 
@@ -250,11 +271,16 @@ async def enrich_domain(session: aiohttp.ClientSession, domain: str, name: str,
         return cached
 
     result = await find_place(session, name, address, geo, phone)
-    # Cache both matches and definite misses forever. Repeating an unchanged
-    # no-result lookup spends Serper credits without adding information; users
-    # can delete this platform's JSON file when they intentionally want a
-    # fresh lookup.
-    store.save(domain, PLATFORM, result)
+    # Cache both matches and definite misses forever -- but NOT a transient
+    # request failure (see find_place/_serper_places): caching that would
+    # permanently lock in "no match" for a business that may well have one,
+    # just because one lookup hit a bad network moment. Leaving it uncached
+    # means the next run simply retries instead of trusting a false miss
+    # forever. Repeating an unchanged genuine no-result lookup spends Serper
+    # credits without adding information; users can delete this platform's
+    # JSON file when they intentionally want a fresh lookup.
+    if not result.get("transient_failure"):
+        store.save(domain, PLATFORM, result)
     return result
 
 

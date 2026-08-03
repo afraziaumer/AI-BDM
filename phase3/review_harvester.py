@@ -296,7 +296,11 @@ async def _discover_google_maps(session: aiohttp.ClientSession, name: str, addre
     if not place.get("matched") or not place.get("cid"):
         logger.info("No verified Google Maps match for %r (%s)",
                     name, place.get("reason", "unknown"))
-        return "", {}
+        # transient_failure means the Serper request itself failed rather
+        # than genuinely finding no listing -- propagated so the caller
+        # doesn't cache a network blip as a permanent miss (see
+        # phase3.google_maps._serper_places's docstring).
+        return "", ({"transient_failure": True} if place.get("transient_failure") else {})
     logger.info("Google Maps match (via %s, confidence=%s): %s (rating=%s, %s review(s))",
                 place.get("match_basis", "?"), place.get("confidence", "high"),
                 place.get("title"), place.get("rating"), place.get("rating_count"))
@@ -399,7 +403,7 @@ async def _fetch_apify_google_reviews(
 
 async def _fetch_apify_reddit_mentions(
     session: aiohttp.ClientSession, name: str, geo: str
-) -> List[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
     """Reddit discussion mentioning this business, found by a direct keyword
     search (business name + geo) via Apify's trudax/reddit-scraper-lite
     actor -- not a Serper site:reddit.com lookup followed by a fetch, the
@@ -416,6 +420,12 @@ async def _fetch_apify_reddit_mentions(
     has no star rating, but the shared shape is what lets
     rag/ingest_reviews.py embed this identically to every other platform's
     output with zero changes.
+
+    Returns `None` (not `[]`) when the Apify request itself fails (network
+    error, timeout, non-200) -- distinct from a genuine zero-result search,
+    so the caller doesn't cache a transient network blip as a permanent "no
+    mentions found" (observed live: a DNS blip during the request produced
+    exactly that false-negative before this distinction existed).
     """
     if not APIFY_API_TOKEN:
         logger.info("Apify not configured (no API token) — skipping Reddit search for %r", name)
@@ -444,11 +454,11 @@ async def _fetch_apify_reddit_mentions(
                 body = (await response.text())[:300]
                 logger.warning("Apify Reddit search failed (status=%s) for %r: %s",
                                response.status, query, body)
-                return []
+                return None  # request failed -- distinct from a genuine zero-result search
             items = await response.json()
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         logger.warning("Apify Reddit search error for %r: %s", query, exc)
-        return []
+        return None  # ditto -- caller must not cache this as "no mentions found" forever
 
     mentions: List[Dict[str, Any]] = []
     for item in items or []:
@@ -484,6 +494,8 @@ async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str
         # it's scattered posts/comments across communities, found directly by
         # keyword search instead. See _fetch_apify_reddit_mentions.
         mentions = await _fetch_apify_reddit_mentions(session, name, geo)
+        transient_failure = mentions is None
+        mentions = mentions or []
         record = {
             "platform": platform, "business_name": name, "matched": bool(mentions),
             "listing_url": "", "reviews": mentions, "review_count_extracted": len(mentions),
@@ -491,18 +503,24 @@ async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str
         }
         if mentions:
             record["fetch_method"] = "apify"
+        elif transient_failure:
+            record["reason"] = "Apify Reddit request failed (network/timeout) -- not cached, will retry next run"
         elif not APIFY_API_TOKEN:
             record["reason"] = "Apify is not configured (no API token)"
         else:
             record["reason"] = "no Reddit mentions found"
         logger.info("[%s] %s: done -> %d mention(s) extracted", domain, platform, len(mentions))
-        store.save(domain, platform, record)
+        # A transient request failure must not get cached as a permanent "no
+        # mentions found" -- same principle as _discover_google_maps below.
+        if not transient_failure:
+            store.save(domain, platform, record)
         return record
     if platform == "google_reviews":
         listing, extra_fields = await _discover_google_maps(session, name, address, geo, phone)
     else:
         listing = await _discover(session, name, hosts, geo)
         extra_fields = {}
+    transient_failure = extra_fields.pop("transient_failure", False)
     record: Dict[str, Any] = {"platform": platform, "business_name": name, "matched": bool(listing), "listing_url": listing or "", "reviews": [], "review_count_extracted": 0, "checked_at": datetime.now(timezone.utc).isoformat()}
     record.update(extra_fields)
     if not listing:
@@ -568,7 +586,10 @@ async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str
             record["reason"] = "listing found but no public review text was exposed"
         logger.info("[%s] %s: done -> %d review(s) extracted across %d page(s)",
                     domain, platform, record["review_count_extracted"], pages_fetched)
-    store.save(domain, platform, record)
+    # A transient Serper failure (google_reviews only) must not get cached as
+    # a permanent "no listing" -- see _discover_google_maps/_serper_places.
+    if not transient_failure:
+        store.save(domain, platform, record)
     return record
 
 
@@ -612,6 +633,9 @@ async def enrich_business(domain: str, name: str, industry: str = "", geo: str =
         records = await asyncio.gather(*(one(item) for item in selected))
     matched = sum(bool(x.get("matched")) for x in records)
     review_count = sum(int(x.get("review_count_extracted", 0)) for x in records)
-    logger.info("[%s] review harvest complete: %d/%d platform(s) matched, %d review(s) extracted",
-                domain, matched, len(records), review_count)
-    return {"category": category, "checked": len(records), "matched": matched, "reviews": review_count, "platforms": records}
+    matched_sites = [x["platform"] for x in records if x.get("matched")]
+    sites_tag = f" ({', '.join(matched_sites)})" if matched_sites else ""
+    logger.info("[%s] review harvest complete: %d/%d site(s) matched%s, %d review(s) extracted",
+                domain, matched, len(records), sites_tag, review_count)
+    return {"category": category, "checked": len(records), "matched": matched, "reviews": review_count,
+            "matched_sites": matched_sites, "platforms": records}

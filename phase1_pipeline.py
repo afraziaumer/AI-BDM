@@ -3128,6 +3128,7 @@ async def process_single_lead(
     )
     status = _commit_status(qualification, classification)
 
+    review_summary: Dict[str, Any] = {}
     if status != "rejected":
         store.commit_domain(domain, extra_fields={
             "relevance_category": (classification or {}).get("category", ""),
@@ -3162,12 +3163,15 @@ async def process_single_lead(
                     address=crawl.get("address", ""),
                     phone=phone or "",
                 )
+                matched_sites = review_summary.get("matched_sites") or []
+                sites_tag = f" ({', '.join(matched_sites)})" if matched_sites else ""
                 logger.info(
-                    "Review enrichment for %s: %s | %d/%d listing(s) matched, "
+                    "Review enrichment for %s: %s | %d/%d site(s) matched%s, "
                     "%d review(s) extracted.",
                     domain, review_summary.get("category", "Uncategorized"),
                     review_summary.get("matched", 0),
                     review_summary.get("checked", 0),
+                    sites_tag,
                     review_summary.get("reviews", 0),
                 )
             except Exception as exc:  # noqa: BLE001 - non-blocking enrichment
@@ -3321,7 +3325,8 @@ async def process_single_lead(
             "text_len": len(crawl["sample_text"]),
             "email": email, "phone": phone,
             "qualification": qualification,
-            "classification": classification}
+            "classification": classification,
+            "review_summary": review_summary}
 
 
 def _is_lead(r: Dict[str, Any]) -> bool:
@@ -3786,6 +3791,7 @@ async def run_pipeline(
             "email": r.get("email") or "N/A",
             "phone": r.get("phone") or "N/A",
             "matched_include": r["qualification"].get("matched_include", []),
+            "review_summary": r.get("review_summary") or {},
         }
         for r in results
         if _is_lead(r)
@@ -3917,6 +3923,12 @@ def print_summary(summary: Dict[str, Any]) -> None:
         print(f"  • {lead['company_name']}")
         print(f"      site : {lead['website_url']}")
         print(f"      email: {lead['email']}  |  phone: {lead['phone']}")
+        rs = lead.get("review_summary") or {}
+        if rs.get("checked"):
+            sites = rs.get("matched_sites") or []
+            sites_tag = f" ({', '.join(sites)})" if sites else " (none)"
+            print(f"      reviews: {rs.get('matched', 0)}/{rs['checked']} site(s) matched{sites_tag} "
+                  f"— {rs.get('reviews', 0)} review(s) total")
     shortfall = summary.get("shortfall", 0)
     if shortfall:
         print("-" * 64)

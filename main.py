@@ -191,6 +191,23 @@ async def run(query: str, concurrency: int = 10,
         from phase3 import google_maps as gm
         await gm.enrich("leads_clean.csv", "leads_with_maps.csv", plan.get("geo_location", "") or "")
 
+    # ---- Step 8: Accuracy check — read-only QA pass over everything just
+    # committed (field validity, cross-source identity consistency, review-
+    # relevance grounding). Always runs automatically so there's no separate
+    # `python accuracy_check.py` step to remember. Points at leads_clean.csv
+    # instead of leads_with_maps.csv when --no-maps skipped Step 7 this run —
+    # otherwise it would silently audit a stale leads_with_maps.csv left over
+    # from an earlier run instead of what this run actually committed.
+    if businesses:
+        print("\n" + "#" * 68)
+        print(f"STEP 8 — ACCURACY CHECK")
+        print("#" * 68)
+        import accuracy_check
+        accuracy_check.run(
+            geo=plan.get("geo_location", "") or "",
+            path="leads_clean.csv" if no_maps else "leads_with_maps.csv",
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
