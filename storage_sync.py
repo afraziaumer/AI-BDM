@@ -146,7 +146,16 @@ class R2StorageProvider(StorageProvider):
         new_manifest = dict(manifest)
 
         for path in files:
-            relative_path = str(path.relative_to(local_dir))
+            # S3/R2 has no real directories -- nesting in the bucket is
+            # purely simulated by "/" in the object key. Path.relative_to()
+            # returns OS-native separators, which on Windows is "\\" --
+            # using that directly produces keys like
+            # "domain/reviews\\file.json", a single flat file literally
+            # named "reviews\file.json" instead of a nested "reviews/"
+            # folder (confirmed live: broke the hierarchy in the real
+            # bucket). as_posix() always uses "/", matching S3's convention
+            # regardless of the host OS.
+            relative_path = path.relative_to(local_dir).as_posix()
             data = path.read_bytes()
             file_hash = hashlib.sha256(data).hexdigest()
 
