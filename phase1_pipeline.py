@@ -72,21 +72,33 @@ import page_intelligence
 # scope — none of these scrape linkedin.com or any other social platform
 # directly; all read data already legitimately crawled, or Serper's search
 # index, never a live fetch of a third-party social profile page).
+# linkedin_enrichment/public_search_decision_makers are consumed only
+# through bi_providers.GoogleXRayProvider now — see the Business
+# Intelligence Provider Architecture note below.
 import social_discovery
 import linkedin_discovery
-import linkedin_enrichment
 import decision_maker_extractor
 import schema_org_extractor
-import public_search_decision_makers
 import organization
 import buying_committee
 import business_intelligence
 import github_enrichment
+# Pluggable Business Intelligence Provider Architecture — the ONLY entry
+# point the orchestration below uses for social/LinkedIn/decision-maker
+# DISCOVERY (as opposed to the free, already-crawled Website-tier data
+# above, which phase1_pipeline.py still populates directly during the
+# crawl and simply hands to the manager as context). Swapping or adding a
+# provider (Apify, Apollo, ...) never touches this file — see
+# bi_providers.py's module docstring.
+import bi_providers
 import youtube_enrichment
 
 # Modular storage layer: cleaned page text + link metadata + per-page index.
-# Local filesystem today; swap the backend in storage.get_store() for R2 later.
+# ALWAYS local filesystem — storage.py has zero knowledge of any remote
+# provider. Syncing a finished domain folder to remote storage (R2 or
+# otherwise) is a separate, independent post-commit step; see storage_sync.py.
 from storage import get_store
+import storage_sync
 
 # Search-result triage (official website / discovery source to mine / noise)
 # and the deduplicated discovery queue — independent of the crawler; new
@@ -3117,59 +3129,46 @@ async def process_single_lead(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Anchor enrichment failed for %s: %s", domain, exc)
 
-        # Social/LinkedIn fallback discovery (Step 2) — gated to committed/
-        # qualified leads only, since (unlike social-link extraction above)
-        # this costs real Serper API calls; never worth spending on a
-        # business that just got discarded. Cached: only runs for whichever
-        # platforms social_profiles.json doesn't already have a URL for — a
-        # future run against the same committed domain skips straight past
-        # this, satisfying "reuse cached data, don't repeat discovery."
+        # Social/LinkedIn discovery (Step 2) — routed through
+        # BusinessIntelligenceManager (bi_providers.py): Website tier first
+        # (free — already-crawled social links), falling back to the
+        # Google X-Ray provider only for platforms still missing after
+        # that, gated to committed/qualified leads only since the X-Ray
+        # tier costs real Serper API calls. Cached the same way as before:
+        # a future run against the same committed domain with every
+        # platform already in social_profiles.json skips the provider
+        # chain entirely ("reuse cached data, don't repeat discovery").
         social_profiles: Dict[str, Any] = {}
         li_data: Optional[Dict[str, Any]] = None
         city, country = linkedin_discovery.city_country_from_geo(geo or "")
+        bi_manager = bi_providers.get_manager()
+        _SOCIAL_REQUIRED_FIELDS = ["linkedin", "facebook", "instagram", "x"]
         try:
-            social_profiles = store.read_social_profiles(domain) or {}
-            if not social_profiles.get("linkedin"):
-                match = await linkedin_discovery.discover_company_linkedin(
-                    session, name or "", domain, city, country, industry or "",
+            cached_socials = store.read_social_profiles(domain) or {}
+            still_missing = [f for f in _SOCIAL_REQUIRED_FIELDS if not cached_socials.get(f)]
+            if still_missing:
+                social_result = await bi_manager.discover_social_profiles(
+                    session, name=name or "", domain=domain,
+                    external_links=crawl.get("external_links") or [], known_socials=cached_socials,
+                    city=city, country=country, industry=industry or "",
+                    store=store, required_fields=_SOCIAL_REQUIRED_FIELDS,
                 )
-                if match:
-                    social_profiles["linkedin"] = match.url
-                    store.write_social_profiles_now(domain, social_profiles)
-                    li_data = await linkedin_enrichment.enrich_linkedin_company(match, domain)
-                    store.write_linkedin_company_now(domain, li_data)
-                    logger.info(
-                        "LinkedIn company page found for %s: %s (confidence=%.2f)",
-                        domain, match.url, match.confidence,
-                    )
+                social_profiles = dict(cached_socials)
+                for k, v in social_result.get("socials", {}).items():
+                    if v and not social_profiles.get(k):
+                        social_profiles[k] = v
             else:
-                li_data = store.read_linkedin_company(domain)
-
-            # Same fallback engine, generalized to Facebook/Instagram/X (see
-            # linkedin_discovery.discover_profile_via_search's docstring —
-            # one search/confidence implementation, not four near-copies).
-            # Still never scrapes any of these platforms directly.
-            _FALLBACK_PLATFORMS = (
-                ("facebook", "facebook.com"),
-                ("instagram", "instagram.com"),
-                ("x", "x.com"),
-            )
-            for platform, host in _FALLBACK_PLATFORMS:
-                if social_profiles.get(platform):
-                    continue
-                queries = [f'site:{host} "{name}"'] if name else []
-                queries.append(f"site:{host} {domain}")
-                match = await linkedin_discovery.discover_profile_via_search(
-                    session, queries, name or "",
-                    lambda link, h=host: h in link,
-                )
-                if match:
-                    social_profiles[platform] = match.url
-                    logger.info(
-                        "%s profile found for %s: %s (confidence=%.2f)",
-                        platform, domain, match.url, match.confidence,
-                    )
+                social_profiles = cached_socials
             store.write_social_profiles_now(domain, social_profiles)
+
+            # GoogleXRayProvider.discover_linkedin_company (called internally
+            # by discover_social_profiles above, when it ran) already wrote
+            # linkedin_company.json as a side effect when it found/enriched
+            # a match — this just reads whatever's there now. Empty if the
+            # linkedin URL came from the Website tier only (never enriched,
+            # same as today: a site-found link alone triggers no separate
+            # enrichment call).
+            li_data = store.read_linkedin_company(domain)
         except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
             logger.warning("Social/LinkedIn discovery failed for %s: %s", domain, exc)
 
@@ -3190,42 +3189,22 @@ async def process_single_lead(
         except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
             logger.warning("GitHub/YouTube enrichment failed for %s: %s", domain, exc)
 
-        # Decision makers (Step 4) — merge sources #1/#2 (already staged
-        # during the crawl: website team/about/contact pages + schema.org)
-        # with source #4 (public search), used ONLY as a last resort when
-        # nothing named was found on-site, then annotate with likely
+        # Decision makers (Step 4) — routed through BusinessIntelligenceManager:
+        # Website tier (source #1/#2, already staged during the crawl —
+        # website team/about/contact pages + schema.org) is used whole if it
+        # found anyone at all; the Google X-Ray provider (public search +
+        # LinkedIn X-Ray, Step 10-cached exactly as before) is only reached
+        # when nothing named was found on-site. Then annotate with likely
         # business-problem ownership (Step 7) and build the org chart
         # (Step 6) and consolidated summary (Step 8).
         try:
-            people: List[Dict[str, Any]] = list(crawl.get("decision_makers") or [])
-            if not any(p.get("name") for p in people):
-                fallback_people = await public_search_decision_makers.discover_via_public_search(
-                    session, domain,
-                )
-                people.extend(fallback_people)
-
-                # LinkedIn X-Ray decision-maker discovery — Step 8: still
-                # strictly lower priority than website sources (only reached
-                # when nothing named was found on-site, same gate as the
-                # public-search fallback above), and Step 10-cached: a fresh
-                # linkedin_candidates.json is reused as-is rather than
-                # re-searching Google for a company already discovered
-                # within LINKEDIN_CANDIDATES_TTL_DAYS.
-                cached_candidates = store.read_linkedin_candidates(domain)
-                if linkedin_discovery.is_cache_fresh(cached_candidates):
-                    xray_people = cached_candidates.get("profiles") or []
-                    logger.info(
-                        "LinkedIn candidates cache HIT for %s (%d profile(s)).",
-                        domain, len(xray_people),
-                    )
-                else:
-                    xray_people = await linkedin_discovery.discover_decision_makers(
-                        session, name or "", domain, city, country, industry or "",
-                    )
-                    linkedin_discovery.save_linkedin_candidates(
-                        store, domain, social_profiles.get("linkedin"), xray_people,
-                    )
-                people.extend(xray_people)
+            dm_result = await bi_manager.discover_decision_makers(
+                session, name=name or "", domain=domain,
+                crawl_decision_makers=crawl.get("decision_makers") or [],
+                city=city, country=country, industry=industry or "",
+                known_socials=social_profiles, store=store,
+            )
+            people: List[Dict[str, Any]] = list(dm_result.get("decision_makers") or [])
 
             people = buying_committee.annotate_buying_committee(people)
             store.write_decision_makers_now(domain, {"people": people})
@@ -3247,6 +3226,21 @@ async def process_single_lead(
             )
         except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
             logger.warning("Business intelligence assembly failed for %s: %s", domain, exc)
+
+        # Remote sync (storage_sync.py) — everything for this domain is now
+        # on local disk (crawl_site's commit_domain + every write above), so
+        # sync the WHOLE finished folder to remote storage as one unit, not
+        # per-file during the crawl. No-op when no provider is configured
+        # (see storage_sync.get_provider) — best-effort either way, a sync
+        # failure never unwinds an already-successful local commit.
+        try:
+            sync_provider = storage_sync.get_provider()
+            if sync_provider is not None:
+                local_dir = store.local_path(domain)
+                if local_dir is not None:
+                    sync_provider.sync_folder(domain, local_dir)
+        except Exception as exc:  # noqa: BLE001 - best-effort, never blocks a commit
+            logger.warning("Remote storage sync failed for %s: %s", domain, exc)
     else:
         store.discard_domain(domain)
         reason = (classification or {}).get("category") or qualification.get("reason")

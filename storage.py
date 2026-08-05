@@ -268,6 +268,17 @@ class PageStore(ABC):
     def has_domain(self, domain: str) -> bool:
         """True if the domain is already committed to final storage."""
 
+    def local_path(self, domain: str) -> Optional[Path]:
+        """The domain's local filesystem directory, if this backend is
+        filesystem-backed — None otherwise (a hypothetical remote-only
+        backend has no local path to give). Concrete default (not
+        abstract): most backends don't need to implement this. Used by
+        storage_sync.py to find what to upload AFTER a domain is committed
+        — the crawler/storage layer stays completely independent of any
+        remote-storage provider; this is just "where do my files live,"
+        nothing about syncing them anywhere."""
+        return None
+
     @abstractmethod
     def read_index(self) -> List[Dict[str, str]]:
         """Return all committed per-page index rows."""
@@ -641,6 +652,10 @@ class LocalPageStore(PageStore):
         d = self._final_dir(domain)
         return d.exists() and any(d.glob("*.txt"))
 
+    def local_path(self, domain: str) -> Optional[Path]:
+        d = self._final_dir(domain)
+        return d if d.exists() else None
+
     def read_index(self) -> List[Dict[str, str]]:
         if not self.index_path.exists():
             return []
@@ -795,13 +810,17 @@ class LocalPageStore(PageStore):
         )
 
 
-# --- Singleton accessor: the ONE place to swap the backend for R2 later. -----
+# --- Singleton accessor -----------------------------------------------------
+# The crawler ALWAYS writes locally — this is the only PageStore backend.
+# Syncing a completed domain's folder to remote storage (R2 or otherwise) is
+# a separate, independent concern handled by storage_sync.py AFTER commit;
+# see StorageProvider there. That keeps this file free of any cloud-provider
+# dependency, per the crawler/storage layer's own design intent.
 _STORE: Optional[PageStore] = None
 
 
 def get_store() -> PageStore:
-    """Return the process-wide PageStore. Replace the constructor here to move
-    from local disk to Cloudflare R2 — no crawler code changes."""
+    """Return the process-wide (local-filesystem) PageStore."""
     global _STORE
     if _STORE is None:
         _STORE = LocalPageStore(
