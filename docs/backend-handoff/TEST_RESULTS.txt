@@ -3,7 +3,7 @@ AI-BDM — Test Results
 
 Offline + mocked suite (`pytest -q`)
 -------------------------------------
-Commit:  PLACEHOLDER_COMMIT
+Commit:  f563301
 Date:    2026-08-06
 Command: pytest -q
 Result:  115 passed, 4 deselected, 2 warnings
