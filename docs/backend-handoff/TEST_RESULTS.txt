@@ -3,10 +3,10 @@ AI-BDM — Test Results
 
 Offline + mocked suite (`pytest -q`)
 -------------------------------------
-Commit:  b268394412a05237113ca7549ed840c80cea070b
+Commit:  d76736f
 Date:    2026-08-06
 Command: pytest -q
-Result:  62 passed, 4 deselected, 2 warnings in 7.38s
+Result:  62 passed, 4 deselected, 2 warnings in 4.21s
 
 Deselected tests are the 4 live-provider tests in tests/integration/,
 excluded by default via pytest.ini's `addopts = -m "not live"`.

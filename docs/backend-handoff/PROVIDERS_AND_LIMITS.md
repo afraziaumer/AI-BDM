@@ -14,6 +14,10 @@ One consolidated table, matching the Laravel Backend Construction Handoff Guide'
 | Wappalyzer / tech detection | Technology profile (Stage 5) | None (vendored, not pip-installed — see `vendor/wappalyzer/README.md`) | Local fingerprint match against already-fetched HTML/headers + one DNS lookup + one small `robots.txt` fetch | N/A — local computation, only two small bounded network extras | Bounded by the one DNS lookup and one `robots.txt` fetch | Each of the 4 engines wrapped independently — one failing doesn't break the others | Result written to `storage/<domain>/tech_stack.json` |
 | `sentence-transformers` / Chroma | Evidence embedding + retrieval (Stage 6) | None — local model, no API key | N/A — local computation | N/A | N/A (bounded by local compute) | N/A | Chroma vector store at `rag/.chroma/`; rebuild by deleting that directory |
 
+## Note on cost
+
+Groq's real per-call cost (`$0.0002–$0.0007`, see `docs/ARCHITECTURE.md`'s Stage 1 record) is stated because it was actually observed and measured live during this handoff. **No equivalent per-call dollar figure is documented for ScrapingBee, Serper, or Apify** — this codebase only knows their quota *counts* (e.g. ScrapingBee's 1,000 calls/month), not their price. Stated honestly as absent rather than estimated, since an invented number would be worse than no number.
+
 ## Notes on quota/rate-limit behavior generally
 
 - Every provider integration in this codebase distinguishes a **genuinely empty response** (safe to cache) from a **request failure** (network/timeout/non-200/rate-limit — never cached, always retried on the next run). This is tested directly in `tests/mocked/test_cache_correctness.py` and is the single most load-bearing reliability property of the whole pipeline — see `docs/DATA_CONTRACTS.md`.
