@@ -1,0 +1,759 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import time
+from typing import Any, Dict, List
+
+from dotenv import load_dotenv
+from groq import APIStatusError, Groq
+
+import prompt_cache
+from model_router import TaskType, estimate_cost, select_model
+
+logger = logging.getLogger("ai_bdm.llm_planner")
+
+
+def get_client() -> Groq:
+    """Create Groq client; called only from CLI entrypoints (not on import)."""
+    load_dotenv()
+
+    api_key = os.getenv("groq_llm_apikey1") or os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Missing Groq API key. Put `groq_llm_apikey1=...` in .env (same folder as this script) "
+            "or set `GROQ_API_KEY` env var."
+        )
+
+    return Groq(api_key=api_key)
+
+
+_CALL_LLM_RETRIES = 2          # attempts per model (1 initial + 1 retry)
+_CALL_LLM_BACKOFF_S = 1.5      # base backoff between retries of the SAME model
+_CALL_LLM_MAX_WAIT_S = 60      # cap on how long a single 429 backoff waits --
+                                # Groq's `retry-after` can be minutes when the
+                                # org's daily token quota is nearly exhausted;
+                                # waiting that long blocks the whole request,
+                                # so beyond this cap we stop waiting and let
+                                # the caller surface a clear "rate limited"
+                                # error instead of hanging.
+
+# Status codes worth retrying the SAME model for: rate limits and server-side
+# errors are transient. 4xx client errors (bad request, invalid JSON schema,
+# auth, not-found) are deterministic — retrying them wastes time and just
+# delays falling through to the fallback model.
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in _RETRYABLE_STATUS_CODES
+    return True  # connection errors, timeouts, etc. — no status_code at all
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Groq returns a `retry-after` header (seconds) on 429s, computed from
+    the ACTUAL token-bucket refill — far more reliable than guessing with a
+    fixed backoff, which is close to certain to fail again instantly when the
+    org is this close to its daily quota ceiling."""
+    response = getattr(exc, "response", None)
+    header = getattr(response, "headers", None)
+    value = header.get("retry-after") if header else None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _log_call(
+    task: str, model: str, reasoning_effort: str, cache_status: str,
+    elapsed_s: float, usage: Any, fallback_triggered: bool,
+    failure_reason: str = "",
+) -> None:
+    """Centralized per-call token/latency/cost logging (one place, not
+    repeated at every call site) — lets token usage AND unreliable
+    models/expensive tasks be monitored over time instead of only
+    discovered after the fact via a 429."""
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+    reasoning_tokens = (
+        getattr(usage.completion_tokens_details, "reasoning_tokens", None)
+        if usage and usage.completion_tokens_details else None
+    )
+    cost = estimate_cost(model, prompt_tokens, completion_tokens)
+    logger.info(
+        "[llm_call] task=%s model=%s reasoning_effort=%s cache=%s "
+        "prompt_tokens=%s completion_tokens=%s reasoning_tokens=%s time=%.2fs "
+        "cost_estimate=$%.6f fallback_triggered=%s%s",
+        task, model, reasoning_effort, cache_status,
+        prompt_tokens or "?", completion_tokens or "?",
+        reasoning_tokens if reasoning_tokens is not None else "?",
+        elapsed_s, cost, fallback_triggered,
+        f" failure_reason={failure_reason!r}" if failure_reason else "",
+    )
+
+
+def call_llm(
+    client: Groq,
+    messages: List[Dict[str, str]],
+    response_format: Dict[str, str] | None = None,
+    *,
+    task: TaskType,
+    cache_status: str = "n/a",
+) -> str:
+    """Call LLM through the centralized ModelRouter. Returns raw assistant
+    text. Never hardcode a model/reasoning-effort/token-budget at a call
+    site — `task` resolves ALL of that via `model_router.select_model(task)`,
+    which is the one place those decisions live (see model_router.py).
+
+    `response_format={"type": "json_object"}` forces strict JSON output.
+
+    The router resolves a two-model chain for `task`: the task's own primary
+    model (gpt-oss-20b for lightweight tasks, gpt-oss-120b for tasks that
+    genuinely need deeper reasoning — see model_router.TASK_CONFIG) first,
+    then `qwen/qwen3.6-27b` as a universal emergency fallback — NEVER an
+    intermediate upgrade to a bigger primary model on failure (that would
+    silently multiply cost exactly where this router exists to prevent it).
+    Each model in the chain gets its OWN reasoning-effort string — Qwen does
+    not accept the gpt-oss family's "low"/"medium"/"high" vocabulary, only
+    "none"/"default" (verified live against the Groq API), so blindly
+    reusing the primary task's reasoning_effort for the fallback model would
+    make every Qwen fallback call fail outright.
+
+    Each model gets up to `_CALL_LLM_RETRIES` attempts with a short backoff
+    before falling through to the next model — but only for TRANSIENT
+    failures (429/5xx/timeouts/connection errors); a deterministic 4xx (e.g.
+    a schema-invalid or truncated JSON response) skips straight to the next
+    model instead of retrying something that will fail identically every
+    time. Callers whose failure mode is "silently treat as unavailable"
+    (e.g. the lead relevance classifier) rely on this to make that failure
+    mode rare, not routine.
+    """
+    cfg = select_model(task)
+    chain = (
+        (cfg.primary_model, cfg.reasoning_effort),
+        (cfg.fallback_model, cfg.fallback_reasoning_effort),
+    )
+
+    # Prompt cache: keyed on task + the task's PRIMARY model + the exact
+    # messages, checked BEFORE any API call — an identical prompt never
+    # needs to be recomputed. Keyed on the primary model specifically (not
+    # whichever model happens to answer) so the cache is stable to check
+    # even before we know if this call will need to fall back.
+    cached = prompt_cache.get(task.value, cfg.primary_model, messages)
+    if cached is not None:
+        logger.info("[llm_call] task=%s model=%s cache=hit (no API call made)",
+                     task.value, cfg.primary_model)
+        return cached
+
+    kwargs: Dict[str, Any] = {
+        "temperature": cfg.temperature,
+        "max_completion_tokens": cfg.max_completion_tokens,
+        "timeout": cfg.timeout_s,
+    }
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+
+    last_exc: Exception | None = None
+    for chain_idx, (model, reasoning_effort) in enumerate(chain):
+        is_fallback = chain_idx > 0
+        for attempt in range(cfg.max_retries):
+            try:
+                t0 = time.monotonic()
+                response = client.chat.completions.create(
+                    model=model, messages=messages,
+                    reasoning_effort=reasoning_effort, **kwargs,
+                )
+                _log_call(
+                    task.value, model, reasoning_effort, cache_status,
+                    time.monotonic() - t0, response.usage, is_fallback,
+                )
+                content = response.choices[0].message.content
+                if not is_fallback:
+                    # Only cache a PRIMARY-model success — never a fallback
+                    # answer, which would otherwise entrench a degraded-path
+                    # response under the primary model's cache key forever,
+                    # even after the primary recovers.
+                    prompt_cache.set(task.value, model, messages, content)
+                return content
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                print(f"Model {model} failed (attempt {attempt + 1}/"
+                      f"{cfg.max_retries}): {e}")
+                if not _is_retryable(e):
+                    break  # deterministic failure — don't retry, try next model
+                if attempt < cfg.max_retries - 1:
+                    wait = _CALL_LLM_BACKOFF_S * (attempt + 1)
+                    if isinstance(e, APIStatusError) and e.status_code == 429:
+                        retry_after = _retry_after_seconds(e)
+                        if retry_after is not None:
+                            # Honor Groq's own estimate (capped) instead of a
+                            # fixed backoff that's almost guaranteed to hit
+                            # the same 429 again a beat later.
+                            wait = min(retry_after, _CALL_LLM_MAX_WAIT_S)
+                    time.sleep(wait)
+
+    _log_call(
+        task.value, chain[-1][0], chain[-1][1], cache_status, 0.0, None,
+        True, failure_reason=str(last_exc),
+    )
+    raise last_exc  # both the primary and the Qwen fail-safe exhausted their retries
+
+
+# --- Query moderation -------------------------------------------------------
+# Runs FIRST, before intent deconstruction (Step 1) or any discovery/scraping
+# resources are touched -- a query violating any of a standard trust & safety
+# taxonomy (child sexual abuse material, sexual exploitation, hate speech,
+# harassment, self-harm, suicide, violence, other illegal activity) should
+# never reach Serper/the premium scraper/the LLM route planner, all of which cost real
+# money per query. One small classification call here is negligible next to
+# what it prevents spending on a blocked query. Deliberately CONSERVATIVE on
+# ordinary business categories: only flags a clear, unambiguous violation,
+# never merely "unusual" or "sensitive" business categories (a legitimate
+# lead-gen request about, say, a firearms retailer, a bail bondsman, or a
+# legally-operating adult-entertainment venue is not itself a violation).
+MODERATION_SYSTEM_PROMPT = """\
+You are a content-safety gate for a B2B lead-generation tool. Users submit \
+short natural-language requests like "find me marinas in Miami with no CRM" \
+or "5 dental clinics in Karachi with no online booking". Almost every \
+request is a completely ordinary business search and must be allowed \
+through unchanged.
+
+Block a request if it clearly falls into any of these categories (standard \
+trust & safety taxonomy):
+- csae: ANY sexual content involving minors, or facilitating access to it. \
+Zero tolerance -- always block, regardless of how it's phrased or framed.
+- sexual_exploitation: facilitates finding businesses/venues for explicit \
+sexual services, prostitution, or hyper-sexual content -- especially where \
+illegal in the request's own stated jurisdiction (use your knowledge of \
+that jurisdiction's laws). Distinct from ordinary, legally-operating adult \
+entertainment (e.g. a licensed strip club/adult venue where that's legal) \
+-- the signal here is explicit sexual services being sought, not merely \
+"adult" subject matter.
+- hate_speech: targets or disparages people based on race, ethnicity, \
+religion, nationality, gender, sexual orientation, disability, or similar \
+protected characteristics, OR asks to find/filter businesses or people \
+whose purpose is to discriminate against or harass a protected group.
+- harassment: targets a NAMED PRIVATE INDIVIDUAL (not a business) for \
+contact-finding with apparent intent to harass, stalk, dox, or intimidate.
+- self_harm: seeks means, methods, or facilitation of self-harm.
+- suicide: seeks means, methods, or facilitation of suicide.
+- violence: facilitates finding people/businesses to enable violence, \
+weapons for attacks, or similar physical harm to people.
+- illegal_activity: facilitates other clearly illegal activity (e.g. human \
+trafficking, buying stolen goods, drug trafficking where illegal).
+
+Do NOT block merely because a business category is sensitive, adult, \
+controversial, or unfamiliar (e.g. firearms DEALERS as an ordinary retail \
+category, cannabis dispensaries where legal, legally-operating adult \
+entertainment venues, bail bondsmen, political organizations, religious \
+institutions as a business CATEGORY being searched for generally) -- those \
+are legitimate lead-gen targets. Only the categories above justify \
+blocking. When genuinely unsure, allow it through (safe=true) -- false \
+positives block legitimate business use; false negatives are rare and this \
+is one layer, not the only one.
+
+Respond with ONLY a single JSON object, no markdown, no prose:
+{"safe": true, "category": "", "reason": ""}
+or
+{"safe": false, "category": "hate_speech", "reason": "short reason, not a template for evasion"}
+"""
+
+
+def moderate_query(user_query: str) -> Dict[str, Any]:
+    """Classify a query as safe or policy-violating BEFORE any discovery/
+    scraping resources are spent on it.
+
+    Returns {"safe": bool, "category": str, "reason": str}. On ANY failure
+    (LLM/network down, bad JSON) this fails OPEN (safe=True) -- a moderation
+    outage must never silently block every legitimate query; the categories
+    it guards against are also rare, so the cost of occasionally missing one
+    during an outage is far lower than blocking the entire product.
+    """
+    try:
+        client = get_client()
+        text = call_llm(
+            client,
+            messages=[
+                {"role": "system", "content": MODERATION_SYSTEM_PROMPT},
+                {"role": "user", "content": f"REQUEST: {user_query}"},
+            ],
+            response_format={"type": "json_object"},
+            task=TaskType.JSON_EXTRACTION,
+        )
+        result = json.loads(text)
+        return {
+            "safe": bool(result.get("safe", True)),
+            "category": str(result.get("category") or ""),
+            "reason": str(result.get("reason") or ""),
+        }
+    except Exception as exc:  # noqa: BLE001 - fail open, see docstring
+        print(f"Query moderation check failed (failing open): {exc}")
+        return {"safe": True, "category": "", "reason": ""}
+
+
+# System role: explains the WHOLE pipeline to the model so it knows exactly how
+# each field is consumed downstream. This is what makes the plan executable.
+PLANNER_SYSTEM_PROMPT = """\
+You are the Query Deconstruction Engine for an automated B2B lead-generation \
+pipeline. A salesperson types a messy natural-language request; you turn it into \
+one precise JSON plan that downstream tools execute WITHOUT any further human help.
+
+How your JSON is consumed downstream (this dictates how you must fill each field):
+  1. DISCOVERY: `search_query` is sent VERBATIM to a Google web search (via Serper) \
+to pull candidate business websites. Write it the way a human would type it into \
+Google to find many such businesses: usually "<category> in <place>" \
+(e.g. "marinas in Dubai"). Keep it broad enough to return lots of real \
+businesses — do NOT bake the exclusion words into it (we filter those later), \
+and do NOT add quotes or operators. If the city name could plausibly exist in \
+more than one country/region (e.g. "Venice" is both Italy and Florida, \
+"Cambridge" is both UK and Massachusetts, "Portland" is both Oregon and \
+Maine), include the disambiguating region/country in `search_query` too \
+(e.g. "salons in Venice, Italy", not just "salons in Venice") — do not rely \
+on geo_location/country_code alone to carry that disambiguation.
+  2. SCALE: `result_limit` tells the pipeline how many businesses to pull. Read it \
+from the request ("give me 50 marinas..." -> 50). If the user gives no number, \
+use 20.
+  3. QUALIFICATION: after each candidate's website is scraped to plain text, \
+`exclude_keywords` and `include_keywords` are matched case-insensitively as \
+substrings against that text to DROP or KEEP the lead.
+
+The single most important rule — KEYWORD EXPANSION:
+A real website almost never uses the user's exact wording. If the user says \
+"no smart monitoring tools", the site will instead say "IoT sensors", "remote \
+telemetry", "real-time dashboard", "vessel tracking", etc. So you must EXPAND \
+every constraint into the full set of realistic surface forms that would appear \
+on such a website: synonyms, abbreviations, acronyms, product/tech names, and \
+common phrasings. A single literal phrase is a FAILURE — aim for 6-15 varied, \
+lowercase terms per concept. Do NOT include the generic industry word itself \
+(e.g. don't put "marina") as a keyword.
+
+PRECISION GUARD (equally important): every keyword is substring-matched, so it \
+must be SPECIFIC enough not to match unrelated text. NEVER output a bare generic \
+word like "app", "access", "entry", "gate", "system", "online", "digital", \
+"smart" on its own — these cause false matches ("app" hits "happy"/"appetizer"). \
+Always qualify them into a 2+ word phrase ("mobile app", "online booking", \
+"smart gate access"). Prefer distinctive multi-word phrases over short fragments.
+
+Decomposition steps you must perform internally before writing JSON:
+  A. Identify the core business CATEGORY to search for (singular, generic).
+  B. Identify and normalize the LOCATION (city + region/country if inferable).
+  C. Extract the requested COUNT. Set `count_explicit` to true ONLY if the \
+user's text itself states a number of businesses (e.g. "50 marinas", "find 10 \
+salons", "give me twenty..."). If NO number appears anywhere in the request \
+(e.g. "find salons in Spain", "marinas in Dubai with no CRM"), set \
+`count_explicit` to false and `result_limit` to 20 — the caller ignores that \
+default value whenever count_explicit is false, so its exact number doesn't \
+matter, but it must still be present and > 0. When count_explicit is true, \
+result_limit MUST be the exact number the user stated.
+  D. Detect NEGATIVE constraints (no / without / lacking / excluding / not using) \
+-> exclude_keywords. Expand each per the rule above. Note: business jargon and \
+acronyms count — e.g. "no crm" must expand to "crm", "customer relationship \
+management", "hubspot", "salesforce", "zoho crm", "pipedrive", etc.
+  E. Detect POSITIVE constraints (must have / with / using / that offer) \
+-> include_keywords. Expand each.
+  F. Decide intent: "find" if there are no constraints, else "find_and_filter".
+  G. Classify SEARCH TYPE into search_type:
+     - "specific": the request targets ONE named business or a website/domain \
+(e.g. "xyzmarina.com", "info on Blue Bay Marina", "is acme-marina.com using a \
+CRM?"). When a domain/URL is present, put the bare domain (no scheme, no path, \
+no www) in target_domain, e.g. "xyzmarina.com". If only a business name is given \
+with no domain, set target_domain to "".
+     - "general": a category + place that should return MANY businesses \
+(e.g. "marinas in Dubai", "give me 50 pizza shops in NYC"). Set target_domain "".
+  H. Determine country_code: ISO 3166-1 alpha-2 for the geo_location (e.g. "US", \
+"AE", "GB", "AU", "SG"). Use "" when unknown or multiple countries.
+  I. Generate phone_regex: a Python regex string (no flags, no re.compile wrapper) \
+that matches the standard phone formats for that specific country. Rules:
+     - Use look-around boundaries (?<!\\d) / (?!\\d) so zip codes or version \
+numbers cannot be mistaken for phone numbers. A digit-only blob like "77586" \
+or "1998-2026" must NOT match.
+     - Handle the optional country prefix AND the local format (with/without the \
+leading zero or area code in parentheses).
+     - Cover mobile AND landline formats for that country.
+     - US  : r"(?:(?:\\+1|1)[\\s.\\-]?)?(?<!\\d)(?:\\([2-9]\\d{2}\\)|[2-9]\\d{2})[\\s.\\-]?[2-9]\\d{2}[\\s.\\-]?\\d{4}(?!\\d)"
+     - UAE : r"(?:\\+971|00971|0)[\\s.\\-]?(?:2|3|4|6|7|9|5[024568])[\\s.\\-]?\\d{3}[\\s.\\-]?\\d{4}(?!\\d)"
+     - UK  : r"(?:\\+44|0)[\\s.\\-]?(?:7\\d{9}|[1-9]\\d{8,9})(?!\\d)"
+     (The double-backslash is required because these are JSON string values.)
+     The regex will be compiled with re.IGNORECASE | re.MULTILINE by the pipeline.
+  J. Detect whether the request needs TECHNOLOGY STACK ANALYSIS \
+-> needs_tech_stack (boolean). This is a SEPARATE, OPTIONAL pipeline stage that \
+only runs after the normal lead collection above. Set it true ONLY when the \
+request is actually asking about a website's technology, not just business \
+qualities. Examples that must be true: "does this company use a CRM?", "what \
+tech stack does this site use?", "is their website outdated?", "are they using \
+WordPress?", "do they use React?", "what technologies power this website?", \
+"do they have a customer portal?", "should we pitch a website redesign?", \
+"what services could we offer based on their current tech?". Set it false for \
+ordinary lead requests, even ones that happen to mention a technology as an \
+EXCLUDE/INCLUDE keyword filter (e.g. "marinas with no CRM" is a keyword filter \
+on exclude_keywords, NOT a tech-stack analysis request -> false). Default false \
+whenever unsure.
+  K. Decide needs_clarification: whether to STOP and ask the user something \
+before running, instead of guessing. Set it true whenever leaving something \
+unresolved would materially change WHICH businesses come back OR whether the \
+results are actually useful to the user's real goal -- reason about THIS \
+specific request and THIS specific category on their own merits every time; \
+never pattern-match against a fixed list of "categories that get asked about" \
+-- almost any category can have an ambiguity worth surfacing, and almost any \
+request can be missing the one detail that actually matters. Check across \
+these angles, and ask ONLY about whichever ones genuinely apply to THIS \
+request (never a fixed checklist asked every time, never invent a question \
+that doesn't change the results):
+     - Location too broad to search well: an entire country or huge multi- \
+state/multi-region area with no city, state, province, or comparably narrow \
+region at all (e.g. "marinas in the USA", "dentists in Canada"). A real \
+city, region, or well-known metro area ("marinas in South Florida") is \
+already narrow enough -- do not ask just because no exact street/neighborhood \
+was given.
+     - Category missing, or too broad/generic to search at all (e.g. "find \
+me some good leads" -- no industry stated whatsoever; "find some tech \
+companies" -- so broad it could mean almost anything).
+     - Segmentation ambiguity: does this category have more than one common \
+sense of "one business" that would change the count/results? The most \
+frequent case is independent single-location businesses vs. multi-location \
+chains/franchises (salons, clinics, gyms, restaurants, retail, real estate, \
+and plenty of others not worth listing exhaustively -- reason it out for \
+whatever category is actually in the request), but also consider: \
+freelancers/solo operators vs. agencies/firms, product sellers vs. service \
+providers within the same category, or B2C vs. B2B versions of the same \
+label. Ask ONLY when the category plausibly has this split AND it would \
+change what "counts" -- skip it for categories that are essentially always \
+one kind (e.g. "marinas", "wedding photographers"). This is INDEPENDENT of \
+everything else in the request -- an explicit count, a specific city, AND/OR \
+an unrelated include/exclude filter (e.g. "dental clinics in Islamabad with \
+no online booking" -- having a booking-system filter says nothing about \
+whether chains should count) do NOT resolve segmentation ambiguity by \
+themselves. Evaluate this dimension on its own; do not skip it just because \
+the request already has some other, unrelated criterion.
+     - The actual goal behind the search: when the request gives NO signal \
+at all about WHY these businesses are being sought -- no include/exclude \
+keywords, no stated pain point, gap, or qualifying signal, just a bare \
+"<category> in <place>" -- ask what's actually driving the search, since \
+"every marina in Miami" and "marinas in Miami that are outgrowing their \
+current booking process" return completely different lists even though the \
+category and location are identical. Example question: "Is there a specific \
+problem, gap, or signal you're targeting -- something these businesses might \
+be missing or dealing with that makes them a good fit?" Skip this whenever \
+the request already states ANY criterion, however small -- that's already \
+enough of a signal not to ask.
+     - Filter strictness, ONLY when the request gives NO include/exclude \
+criteria at all AND the category is one where borderline/ambiguous matches \
+are common. Example question: "Should I hide anything that isn't clearly a \
+match, or keep borderline results too and just rank them?"
+   When true: still fill in every other field with your best guess (never \
+leave the plan unusable if the user ignores the question and reruns as-is), \
+and set clarification_questions to a list of 1-4 short, specific, genuinely \
+useful questions covering only the angles above that actually apply -- never \
+ask about anything that doesn't change which businesses get returned or how \
+they're filtered (no questions about budget, outreach, campaigns, company \
+size, etc. unless the user's own text already implies that dimension \
+matters). When false, clarification_questions must be [].
+
+Output rules: respond with ONLY a single valid JSON object. No markdown, no prose.
+"""
+
+# One fully worked example anchors the format and the expansion behaviour.
+PLANNER_EXAMPLE = {
+    "geo_location": "Miami, Florida, USA",
+    "broad_industry": "marina",
+    "search_query": "marinas in Miami",
+    "result_limit": 20,
+    "count_explicit": False,
+    "search_type": "general",
+    "target_domain": "",
+    "intent": "find_and_filter",
+    "country_code": "US",
+    "phone_regex": r"(?:(?:\+1|1)[\s.\-]?)?(?<!\d)(?:\([2-9]\d{2}\)|[2-9]\d{2})[\s.\-]?[2-9]\d{2}[\s.\-]?\d{4}(?!\d)",
+    "needs_tech_stack": False,
+    "needs_clarification": False,
+    "clarification_questions": [],
+    "exclude_keywords": [
+        "smart monitoring", "remote monitoring", "real-time monitoring",
+        "iot", "internet of things", "sensors", "telemetry",
+        "vessel tracking", "digital dashboard", "online dashboard",
+        "automated alerts", "connected devices",
+    ],
+    "include_keywords": [],
+    "reasoning": (
+        "User wants marinas in Miami that do NOT use smart/IoT monitoring "
+        "technology. No number of businesses was stated, so count_explicit is "
+        "false and result_limit is a placeholder the caller will ignore in "
+        "favor of its own small default. exclude_keywords cover the realistic "
+        "surface forms such tech uses on marina websites so the Step-5 filter "
+        "can detect them."
+    ),
+}
+
+
+def plan_query(user_query: str) -> Dict[str, Any]:
+    """Decompose a messy human query into a strict, executable JSON plan.
+
+    Output schema:
+      geo_location      - normalized place string
+      broad_industry    - singular business category to search for
+      search_query      - natural Google web-search query for Serper discovery
+      result_limit      - how many businesses to pull; meaningful ONLY when
+                          count_explicit is true (the caller substitutes its
+                          own small default otherwise)
+      count_explicit    - True only if the user's own text stated a number of
+                          businesses; False means no count was given at all
+      search_type       - "general" (category+place) or "specific" (one business)
+      target_domain     - bare domain for a specific search, else ""
+      intent            - "find" or "find_and_filter"
+      country_code      - ISO 3166-1 alpha-2 for the location ("US", "AE", …)
+      phone_regex       - Python regex matching that country's phone formats
+      needs_tech_stack  - True only if the request asks about website technology
+                          (CRM/CMS/framework/outdated-site/redesign questions);
+                          gates the optional Tech Stack Detection stage, which
+                          runs after normal lead collection, never instead of it
+      needs_clarification    - True only when something about the request is
+                          unresolved enough that guessing would materially
+                          change which businesses come back (location too
+                          broad to search, category missing, chain-vs-
+                          independent scope ambiguous, or no filter criteria
+                          at all on a category prone to borderline matches).
+                          False (the default) means the request is already
+                          specific enough to run immediately, same as before
+                          this field existed. The caller stops BEFORE any
+                          discovery/scraping happens when this is true — see
+                          phase1_pipeline.run_pipeline's early-return branch.
+      clarification_questions - 1-3 short, specific questions to show the
+                          user when needs_clarification is true; [] otherwise.
+      exclude_keywords  - expanded lowercase phrases that DISqualify a lead
+      include_keywords  - expanded lowercase phrases that a lead should mention
+      reasoning         - short note on how the query was interpreted
+    """
+    example_json = json.dumps(PLANNER_EXAMPLE, ensure_ascii=False, indent=2)
+
+    user_content = (
+        "Deconstruct this lead-generation request into the JSON plan.\n\n"
+        f"REQUEST: {user_query}\n\n"
+        "Follow this exact shape (your values WILL differ; expand the keywords "
+        "thoroughly for THIS request):\n"
+        f"{example_json}"
+    )
+
+    client = get_client()
+    text = call_llm(
+        client,
+        messages=[
+            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        response_format={"type": "json_object"},
+        task=TaskType.INTENT_PLANNING,
+    )
+
+    # Be robust: if the model returns accidental text, attempt JSON extraction.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start : end + 1])
+        raise
+
+
+VALID_CATEGORIES = (
+    "match", "product_shop", "aggregator", "listicle", "unrelated", "wrong_location",
+)
+
+
+def classify_business(
+    industry: str, geo: str, name: str, page_text: str
+) -> Dict[str, str]:
+    """Classify a scraped website by relevance to the lead request.
+
+    Returns {"category", "reason"}. Only "match" is a usable lead; every other
+    category is a reason to DROP the result:
+      match         - a single real `industry` business in the right place
+      product_shop  - an online store selling products, not a service business
+      aggregator    - a directory / marketplace / booking platform (many listings)
+      listicle      - a blog/article/ranking that lists many businesses
+      unrelated     - not an `industry` business at all
+      wrong_location- a real business but NOT in the requested location
+
+    On malformed output (unparseable JSON, unexpected category string) this
+    fails CLOSED to "unrelated" — a classifier hiccup must never silently
+    admit a bad lead; it should simply mean one fewer qualified result.
+    """
+    snippet = (page_text or "")[:1800]  # cap tokens; the gist is near the top
+    system = (
+        "You are the Lead Relevance Classifier for a B2B lead-generation "
+        f"pipeline. The salesperson wants INDIVIDUAL '{industry}' businesses "
+        f"located in '{geo}' that they can contact and sell to. The single "
+        "correct answer for a usable lead is a real business's OWN official "
+        "website.\n\n"
+        "Classify the website into EXACTLY one category:\n"
+        f"  - \"match\": ONE real {industry} business, its OWN official site, "
+        f"physically in/near '{geo}'. A usable lead.\n"
+        "  - \"product_shop\": primarily an online store selling physical products "
+        "(cart, checkout, shipping), not a local service business.\n"
+        "  - \"aggregator\": a directory/marketplace/booking platform that lists or "
+        "books MANY businesses (Yelp, TripAdvisor, Zomato, Justdial, OpenTable…).\n"
+        "  - \"listicle\": a blog/news/article/ranking/'best of'/'guide' page that "
+        "describes or lists multiple businesses (titles like 'Best cafes in X', "
+        "'Top 10…', 'Exploring…', city blogs, WordPress/Medium posts).\n"
+        f"  - \"wrong_location\": a real {industry} business but NOT in '{geo}' "
+        "(e.g. a different city or country).\n"
+        f"  - \"unrelated\": not a {industry} business at all (app store, social "
+        "media, unrelated company, error page).\n\n"
+        "Be STRICT: if the page lists many different businesses, it is an "
+        "aggregator or listicle, never a match. When the location clearly differs "
+        f"from '{geo}', return wrong_location.\n\n"
+        "WATCH FOR NAME/PLACE COINCIDENCE: the word "
+        f"'{industry}' appearing on the page is NOT enough by itself. It may "
+        "appear only because it's part of a NEIGHBORHOOD, BUILDING, or AREA "
+        f"NAME (e.g. a hotel, restaurant, or shop that happens to be located "
+        f"in a place called 'Marina del Rey' will mention \"marina\" constantly "
+        f"without itself being a marina). Judge by what the business's OWN "
+        f"CORE OFFERING actually is — what it sells or does — not by incidental "
+        f"word overlap with its address, neighborhood, or view. Likewise, a "
+        f"business in a related or adjacent field (e.g. a boat rental/club, a "
+        f"boat tour company, a marine-supply store) is NOT the same as a "
+        f"'{industry}' business unless its own core service literally IS what a "
+        f"'{industry}' provides — return \"unrelated\" for merely adjacent or "
+        "themed businesses, even if boats/water/the industry word feature "
+        "heavily in their marketing copy.\n"
+        'Respond with ONLY JSON: {"category": "...", "reason": "<one short line>"}.'
+    )
+    user = f"BUSINESS NAME: {name}\n\nWEBSITE TEXT:\n{snippet}"
+
+    client = get_client()
+    text = call_llm(
+        client,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        task=TaskType.JSON_EXTRACTION,
+    )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        data = json.loads(text[start : end + 1]) if start != -1 and end > start else {}
+
+    category = str(data.get("category", "")).strip().lower()
+    if category not in VALID_CATEGORIES:
+        # A malformed/unexpected category string is a classifier hiccup, not
+        # evidence the business matches — fail CLOSED (caller's _is_lead()
+        # treats anything other than "match" as not-a-lead), same principle
+        # as the model-unavailable path in phase1_pipeline.classify_relevance.
+        category = "unrelated"
+    return {"category": category, "reason": str(data.get("reason", "")) or "malformed_classifier_output"}
+
+
+def generate_query_variations(
+    user_query: str, industry: str, geo: str, exclude: List[str], max_variations: int = 5
+) -> List[str]:
+    """Generate additional Google search-query variations that preserve the
+    SAME industry + location intent as the original request — used ONLY when
+    the original query's discovery has been fully exhausted and more
+    candidates are still needed to reach an explicitly-requested count.
+
+    NEVER broadens the industry or the country/region: a variation may vary
+    phrasing/synonyms, add search operators (e.g. "site:.es"), or narrow to
+    specific well-known cities within the SAME requested location — never
+    widen to a different industry or a different country.
+
+    Returns up to `max_variations` new query strings not already in `exclude`
+    (case-insensitive). Raises on failure (missing client, bad response) —
+    the caller degrades to "no more variations" (treats discovery as
+    genuinely exhausted) rather than ever broadening scope to compensate.
+    """
+    exclude_lower = {q.strip().lower() for q in exclude}
+    system = (
+        "You generate ADDITIONAL Google search queries for a B2B lead-generation "
+        "crawler whose first search query didn't turn up enough real businesses. "
+        f"The user wants '{industry}' businesses located in '{geo}' — every "
+        "variation you produce MUST preserve exactly that industry and exactly "
+        "that location/country. NEVER broaden the industry (e.g. don't widen "
+        "'hair salon' to 'beauty business') and NEVER broaden the location (e.g. "
+        "don't widen 'Spain' to 'Europe', don't switch to a different country). "
+        f"You MAY narrow the location to specific well-known cities within "
+        f"'{geo}', vary the industry phrasing with close synonyms, or add search "
+        'operators (e.g. "site:.es").\n\n'
+        "Respond with ONLY valid JSON of exactly this form: "
+        '{"variations": ["query one", "query two", ...]}\n'
+        f"Produce up to {max_variations} variations, each a short natural Google "
+        "search query (no explanation, no surrounding quotes)."
+    )
+    user = (
+        f"Original request: {user_query}\n"
+        f"Already-tried search queries (do not repeat these): "
+        f"{json.dumps(exclude, ensure_ascii=False)}"
+    )
+
+    client = get_client()
+    text = call_llm(
+        client,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        task=TaskType.QUERY_REWRITE,
+    )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        data = json.loads(text[start : end + 1]) if start != -1 and end > start else {}
+
+    raw_variations = data.get("variations")
+    if not isinstance(raw_variations, list):
+        return []
+    variations: List[str] = []
+    for v in raw_variations:
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if v and v.lower() not in exclude_lower:
+            exclude_lower.add(v.lower())
+            variations.append(v)
+        if len(variations) >= max_variations:
+            break
+    return variations
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="LLM Planner: verify API + produce structured plans")
+    parser.add_argument("--test-api", action="store_true", help="Run a minimal Groq API test")
+    parser.add_argument(
+        "--plan",
+        type=str,
+        default=None,
+        help="Generate planning JSON for the given query string",
+    )
+
+    args = parser.parse_args()
+
+    if not args.test_api and not args.plan:
+        parser.print_help()
+        raise SystemExit(2)
+
+    client = get_client()
+
+    if args.test_api:
+        messages = [{"role": "user", "content": "Say 'API is working' in one line."}]
+        out = call_llm(client, messages, task=TaskType.JSON_EXTRACTION)
+        print(out)
+        return
+
+    if args.plan is not None:
+        blueprint = plan_query(args.plan)
+        print(json.dumps(blueprint, ensure_ascii=False, indent=2))
+        return
+
+
+if __name__ == "__main__":
+    main()
+

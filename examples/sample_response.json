@@ -1,0 +1,59 @@
+{
+  "_description": "Sanitized response matching the REAL structure phase1_pipeline.run_pipeline() returns (what api.py's POST /pipeline/run gives back today, Stages 1-2 only). Business data below is fictional, not a real scraped result. See docs/INTEGRATION_NOTES.md for the known gap: Stages 3-8 are not yet folded into one structured response like this.",
+  "query": "find 3 dental clinics in Islamabad with no online booking",
+  "plan": {
+    "geo_location": "Islamabad, Pakistan",
+    "broad_industry": "dental clinic",
+    "search_query": "dental clinics in Islamabad",
+    "result_limit": 3,
+    "count_explicit": true,
+    "search_type": "general",
+    "target_domain": "",
+    "intent": "find_and_filter",
+    "country_code": "PK",
+    "phone_regex": "(?:(?:\\+92|0092|0)[\\s.\\-]?(?:[2-9]\\d{2})[\\s.\\-]?\\d{3}[\\s.\\-]?\\d{4}(?!\\d))",
+    "needs_tech_stack": false,
+    "needs_clarification": false,
+    "clarification_questions": [],
+    "exclude_keywords": [
+      "online booking", "online appointment", "online reservation",
+      "booking system", "appointment scheduling software", "online scheduling"
+    ],
+    "include_keywords": [],
+    "reasoning": "User wants 3 dental clinics in Islamabad without online booking capability. Count is explicit (3). Exclude keywords cover common surface forms a clinic's own website would use to advertise this feature."
+  },
+  "limit": 3,
+  "discovery_mode": "aggressive",
+  "discovered": 6,
+  "processed": 4,
+  "counts": {
+    "scraped": 3,
+    "rejected_low_relevance": 1
+  },
+  "qualified_count": 3,
+  "shortfall": 0,
+  "_note_qualified": "qualified_count is 3 in a real response; only 1 sample entry is shown here for brevity -- the other 2 have the identical shape.",
+  "qualified": [
+    {
+      "company_name": "Example Dental Clinic",
+      "website_url": "https://example-dental-clinic.test/",
+      "email": "info@example-dental-clinic.test",
+      "phone": "+923001234567",
+      "matched_include": [],
+      "review_summary": {
+        "category": "Health & Medical",
+        "checked": 6,
+        "matched": 2,
+        "matched_sites": ["google_reviews", "reddit"],
+        "reviews": 18
+      }
+    }
+  ],
+  "filtered_out": [],
+  "excluded_by_keyword": [],
+  "error": null,
+  "blocked": false,
+  "block_reason": "",
+  "needs_clarification": false,
+  "clarification_questions": []
+}

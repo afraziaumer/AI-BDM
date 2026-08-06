@@ -1,0 +1,830 @@
+"""
+Modular storage layer for the Lead Scravenger stage.
+
+The streaming crawler writes cleaned page text, per-page link metadata, and a
+per-page metadata index THROUGH this interface — it never touches the filesystem
+directly. Today the interface is backed by the local filesystem; the same
+interface can be backed by Cloudflare R2 later WITHOUT changing any crawler
+logic. Swap the implementation returned by `get_store()` and nothing upstream
+changes.
+
+Local layout:
+    storage/
+        <domain>/
+            <page>.txt           cleaned, LLM-ready page text (one file per page,
+                                  named after the page's own URL slug — see
+                                  page_name_for)
+            page_index.json      master per-page manifest {"pages": [...]} —
+                                  future components (routing, embeddings, RAG,
+                                  search) should read THIS, not scan the
+                                  filesystem. Written incrementally, one entry
+                                  per page, as the crawl streams (see
+                                  stage_page_index_entry)
+            links.json           per-page extracted internal links (for Step 3)
+            tech_stack.json      normalized tech capabilities (see tech_stack.py)
+            website_profile.json full tech-intelligence profile (see tech_stack.py)
+            route_planner_request.json  the exact LLM request (messages),
+                                  raw response, and resulting plan from the
+                                  LLM Route Planner (see route_planner.py) —
+                                  written at query time, after commit
+            search_index/        local BM25 + embedding search index over
+                                  this domain's page CONTEXT (not full text)
+                                  — see page_retrieval.py:
+                bm25_corpus.json    tokenized per-page corpus + filenames
+                embeddings.npy      per-page embedding vectors (numpy)
+                index_meta.json     page_index_hash + RETRIEVAL_VERSION used
+                                     to invalidate the index when the site
+                                     changes or the retrieval logic does
+            scraper_cache.json   {page_path: "normal"|"premium"} —
+                                  which scraper tier each SPECIFIC page
+                                  needed last time (see
+                                  phase1_pipeline.execute_scavenger_scrape) —
+                                  lets a re-crawl skip straight to the tier a
+                                  page already proved it needs, without ever
+                                  assuming one page's needs apply site-wide
+    crawl_index.csv           per-page metadata index (NO page text, NO raw HTML)
+
+Staging & commit
+----------------
+Pages are streamed to a temporary per-domain area first (`storage/.staging/`).
+The business is committed to final storage only if it qualifies; if it is
+rejected (aggregator / unrelated / spam) its staged files and buffered metadata
+are discarded. On R2 this maps cleanly to a staging key-prefix that is
+server-side copied to the final prefix on commit and deleted on discard — so the
+crawler's commit/discard calls stay identical.
+
+Memory
+------
+Only lightweight metadata (index rows, link lists) is buffered in RAM, and only
+for the ONE business currently being crawled. Cleaned text is flushed to storage
+per page and dropped from memory immediately; raw HTML never reaches this layer.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+import shutil
+import threading
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import urlsplit
+
+import numpy as np
+
+# Per-page metadata columns for the crawl index. Deliberately excludes page TEXT
+# and raw HTML — the cleaned text lives only in the .txt files. Contacts and
+# title/meta ARE metadata (and the footer text they come from is stripped from
+# the cleaned text), so they are captured here for the per-business rollup.
+INDEX_COLUMNS: List[str] = [
+    "company_name",
+    "domain",
+    "website_url",      # root site (groups all pages of one business)
+    "page_url",         # the specific page this row indexes
+    "page_title",
+    "meta_description",
+    "email",
+    "phone_number",
+    "physical_address",
+    "txt_path",         # local path (or R2 key) of the cleaned text
+    "crawl_status",     # ok | empty | failed
+    "http_status",      # HTTP code or scrape method fallback
+    "content_length",   # characters of cleaned text
+    "word_count",
+    "timestamp",        # ISO-8601 UTC
+    "page_type",        # home | contact | about | services | products | blog | legal | other
+    "relevance_category",  # relevance_scoring.score_relevance() verdict:
+                            # match | unrelated (an LLM safety-net call only
+                            # runs for its ambiguous "possible_match" band —
+                            # see relevance_scoring.py)
+    "relevance_reason",     # short reason string for that verdict
+    "relevance_score",      # 0-100 deterministic relevance score
+    "relevance_verdict",    # very_relevant | relevant | possible_match | reject
+    "scoring_version",      # relevance_scoring.SCORING_VERSION at commit time —
+                             # phase1_pipeline._reuse_cached_relevance only
+                             # trusts a cached verdict computed under the
+                             # CURRENT version; empty when no scoring ran
+                             # (LEAD_FILTERING_ENABLED=False)
+    "validated_industry",   # the industry this business was validated against
+    "validated_geo",        # the location this business was validated against
+    "qualification_status", # qualified | excluded_by_keyword — see
+                             # phase1_pipeline._commit_status. A real match
+                             # that fails a keyword requirement (e.g. "no
+                             # CRM" asked, this one has one) is still
+                             # committed, just tagged distinctly from a
+                             # true qualified lead.
+    "excluded_keywords",     # comma-joined matched exclude keywords, if any
+                             # (empty for "qualified" rows)
+]
+
+
+class PageStore(ABC):
+    """Storage interface the crawler depends on. Implement once per backend."""
+
+    # --- filename helper (shared; deterministic across backends) -----------
+    @staticmethod
+    def page_name_for(url: str) -> str:
+        """Deterministic, filesystem/key-safe base name for a page URL, from
+        its LAST path segment only — human-readable regardless of how deeply
+        the URL is nested.
+
+        Homepage -> "home"; "/about" -> "about"; "/services/plumbing" ->
+        "plumbing" (not "services-plumbing" — the full nested path used to be
+        concatenated, producing long, ugly names for any multi-segment URL).
+        Two different URLs that happen to share a last segment are
+        disambiguated by _unique_name's numeric suffix ("plumbing-2"), not by
+        lengthening the name up front.
+        """
+        path = urlsplit(url).path.strip("/")
+        if not path:
+            return "home"
+        segments = [s for s in path.split("/") if s]
+        leaf = segments[-1] if segments else ""
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", leaf).strip("-").lower()
+        return (name or "home")[:120]
+
+    # --- streaming writes (staging) ----------------------------------------
+    @abstractmethod
+    def stage_page(self, domain: str, page_name: str, text: str) -> str:
+        """Persist one cleaned page to the staging area. Returns its store path."""
+
+    @abstractmethod
+    def buffer_index_row(self, domain: str, row: Dict[str, str]) -> None:
+        """Buffer one per-page metadata row (flushed to the index on commit)."""
+
+    @abstractmethod
+    def buffer_links(self, domain: str, page_url: str, links: List[Dict[str, str]]) -> None:
+        """Buffer one page's extracted internal links (written on commit)."""
+
+    @abstractmethod
+    def stage_page_index_entry(self, domain: str, entry: Dict[str, Any]) -> None:
+        """Append one page's metadata to this domain's page_index.json and
+        persist it to the staging area IMMEDIATELY (not just buffered in RAM,
+        unlike buffer_index_row/buffer_links) — the master per-page manifest
+        future components (routing, embeddings, RAG, search) read instead of
+        scanning the filesystem. Promoted/discarded together with the rest of
+        this domain's staged files by commit_domain/discard_domain."""
+
+    @abstractmethod
+    def stage_page_context(self, domain: str, page_name: str, context: Dict[str, Any]) -> None:
+        """Stage `<page_name>_context.json` (see page_intelligence.py) next to
+        this page's staged .txt — a generic, reusable per-page semantic
+        summary (page type, meta, structure, content, metrics; anchors filled
+        later by page_intelligence.enrich_anchors). Promoted/discarded with
+        the rest of this domain's staged files by commit_domain/discard_domain."""
+
+    @abstractmethod
+    def read_page_context(self, domain: str, filename: str) -> Optional[Dict[str, Any]]:
+        """Read one COMMITTED page's context JSON by its context filename
+        (e.g. "about_context.json"). None if missing/unreadable."""
+
+    @abstractmethod
+    def write_page_context(self, domain: str, filename: str, context: Dict[str, Any]) -> None:
+        """Overwrite one COMMITTED page's context JSON in place — used by
+        page_intelligence.enrich_anchors to back-fill `anchors` once the
+        whole site's link graph is known (i.e. AFTER commit_domain)."""
+
+    @abstractmethod
+    def list_page_context_filenames(self, domain: str) -> List[str]:
+        """Filenames (e.g. "about_context.json") of every COMMITTED page
+        context file for this domain."""
+
+    @abstractmethod
+    def stage_tech_profile(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        """Stage tech_stack.json (capabilities) + website_profile.json (full)
+        alongside this domain's staged pages. Promoted/discarded together with
+        them by commit_domain/discard_domain — no separate lifecycle needed."""
+
+    @abstractmethod
+    def stage_scraper_cache(self, domain: str, cache: Dict[str, str]) -> None:
+        """Stage scraper_cache.json — {page_path: tier_name} ("normal" |
+        "premium") — alongside this domain's staged pages (see
+        phase1_pipeline.execute_scavenger_scrape). Promoted/discarded
+        together with them — no separate lifecycle needed."""
+
+    @abstractmethod
+    def stage_social_profiles(self, domain: str, profiles: Dict) -> None:
+        """Stage social_profiles.json (see social_discovery.py)."""
+
+    @abstractmethod
+    def stage_linkedin_company(self, domain: str, data: Dict) -> None:
+        """Stage linkedin_company.json (see linkedin_discovery.py /
+        linkedin_enrichment.py)."""
+
+    @abstractmethod
+    def stage_decision_makers(self, domain: str, data: Dict) -> None:
+        """Stage decision_makers.json — {"people": [...]} — (see
+        decision_maker_extractor.py)."""
+
+    @abstractmethod
+    def stage_organization(self, domain: str, data: Dict) -> None:
+        """Stage organization.json (see organization.py)."""
+
+    @abstractmethod
+    def stage_business_intelligence(self, domain: str, data: Dict) -> None:
+        """Stage business_intelligence.json (see business_intelligence.py)."""
+
+    # --- lifecycle ---------------------------------------------------------
+    @abstractmethod
+    def commit_domain(
+        self, domain: str, extra_fields: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Promote staged pages to final storage; write links + index rows.
+
+        `extra_fields` (e.g. relevance_category/reason, validated_industry/geo)
+        is merged into every buffered index row before it's written — the
+        relevance verdict is only known after the whole crawl finishes, well
+        after each page's row was buffered, so it's attached here at commit
+        time rather than per-page."""
+
+    @abstractmethod
+    def discard_domain(self, domain: str) -> None:
+        """Delete staged pages and buffered metadata for a rejected business."""
+
+    @abstractmethod
+    def retire_domain(self, domain: str) -> None:
+        """Remove an already-committed domain from final storage + the index
+        (a cache-hit that no longer qualifies under re-evaluation)."""
+
+    @abstractmethod
+    def cleanup_orphaned_staging(self) -> List[str]:
+        """Delete any staged domain left over from a previous unclean shutdown
+        (killed process, crash outside the commit/discard try-block, etc.).
+
+        A domain's staging directory only ever outlives its own crawl if the
+        process died before reaching commit_domain/discard_domain — a normal
+        run always calls one or the other for every domain it touches. Call
+        this once, before a new run starts crawling anything. Returns the
+        domain names that were cleaned up.
+        """
+
+    # --- reads (cache, rollup, Step 3) -------------------------------------
+    @abstractmethod
+    def has_domain(self, domain: str) -> bool:
+        """True if the domain is already committed to final storage."""
+
+    def local_path(self, domain: str) -> Optional[Path]:
+        """The domain's local filesystem directory, if this backend is
+        filesystem-backed — None otherwise (a hypothetical remote-only
+        backend has no local path to give). Concrete default (not
+        abstract): most backends don't need to implement this. Used by
+        storage_sync.py to find what to upload AFTER a domain is committed
+        — the crawler/storage layer stays completely independent of any
+        remote-storage provider; this is just "where do my files live,"
+        nothing about syncing them anywhere."""
+        return None
+
+    @abstractmethod
+    def read_index(self) -> List[Dict[str, str]]:
+        """Return all committed per-page index rows."""
+
+    @abstractmethod
+    def read_page_text(self, txt_path: str) -> str:
+        """Return the cleaned text for a stored page (by its index txt_path)."""
+
+    @abstractmethod
+    def read_links(self, domain: str) -> Dict[str, List[Dict[str, str]]]:
+        """Return committed {page_url: [links]} for a domain (for Step 3)."""
+
+    @abstractmethod
+    def read_search_index(self, domain: str) -> Optional[Dict]:
+        """Return the committed search index for a domain as
+        {"bm25_corpus": {...}, "embeddings": np.ndarray, "index_meta": {...}},
+        or None if never built (or its committed run predates this feature)."""
+
+    @abstractmethod
+    def write_search_index_now(
+        self, domain: str, bm25_corpus: Dict, embeddings: np.ndarray, index_meta: Dict,
+    ) -> None:
+        """Write search_index/{bm25_corpus.json, embeddings.npy,
+        index_meta.json} straight to FINAL storage for an already-committed
+        domain (query-time build — see page_retrieval.py: the index is built
+        lazily on first retrieval, well after the crawl committed, same
+        pattern as write_tech_profile_now — not part of an in-progress
+        crawl's staging/commit decision)."""
+
+    @abstractmethod
+    def read_scraper_cache(self, domain: str) -> Optional[Dict[str, str]]:
+        """Return the committed scraper_cache.json ({page_path: tier_name})
+        for a domain, or None if it was never built (or predates this
+        feature) — lets a re-crawl of an already-committed domain skip
+        straight to the tier a specific page already proved it needs."""
+
+    @abstractmethod
+    def read_tech_profile(self, domain: str) -> Optional[Dict]:
+        """Return the committed website_profile.json for a domain, or None."""
+
+    @abstractmethod
+    def write_tech_profile_now(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        """Write a tech profile straight to FINAL storage for an already-
+        committed domain (query-time backfill scan — not part of an in-
+        progress crawl, so there is no staging/commit decision to make)."""
+
+    @abstractmethod
+    def write_route_planner_request(self, domain: str, record: Dict) -> None:
+        """Write route_planner_request.json straight to FINAL storage for an
+        already-committed domain (query-time artifact, same pattern as
+        write_tech_profile_now — route_planner.py only ever runs AFTER a
+        domain is committed). Captures the exact LLM request (messages sent),
+        raw response, and resulting plan for transparency/audit/reuse."""
+
+    @abstractmethod
+    def read_route_planner_request(self, domain: str) -> Optional[Dict]:
+        """Return the committed route_planner_request.json for a domain, or
+        None if it was never planned. The read half of
+        write_route_planner_request — lets plan_routes() check for and reuse
+        a cached plan instead of recomputing/re-calling the LLM every time."""
+
+    @abstractmethod
+    def read_page_index(self, domain: str) -> Optional[Dict]:
+        """Return the committed page_index.json ({"pages": [...]})  for a
+        domain, or None if it was never built (crawled before this feature
+        existed). The master per-page manifest — future components should
+        read this instead of scanning the filesystem."""
+
+    @abstractmethod
+    def read_social_profiles(self, domain: str) -> Optional[Dict]:
+        """Return the committed social_profiles.json for a domain, or None."""
+
+    @abstractmethod
+    def write_social_profiles_now(self, domain: str, profiles: Dict) -> None:
+        """Write social_profiles.json straight to FINAL storage for an
+        already-committed domain (query-time refresh — same pattern as
+        write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_linkedin_company(self, domain: str) -> Optional[Dict]:
+        """Return the committed linkedin_company.json for a domain, or None."""
+
+    @abstractmethod
+    def write_linkedin_company_now(self, domain: str, data: Dict) -> None:
+        """Write linkedin_company.json straight to FINAL storage (query-time
+        refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_linkedin_candidates(self, domain: str) -> Optional[Dict]:
+        """Return the committed linkedin_candidates.json (Step 9 of
+        linkedin_discovery.py's X-Ray pipeline: {"company_page", "profiles":
+        [...]}) for a domain, or None if it was never discovered. Query-time-
+        only artifact (like route_planner_request.json) — no stage_ variant,
+        since discovery only ever runs post-commit."""
+
+    @abstractmethod
+    def write_linkedin_candidates_now(self, domain: str, data: Dict) -> None:
+        """Write linkedin_candidates.json straight to FINAL storage (query-
+        time write/refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_decision_makers(self, domain: str) -> Optional[Dict]:
+        """Return the committed decision_makers.json ({"people": [...]}) for
+        a domain, or None if it was never built."""
+
+    @abstractmethod
+    def write_decision_makers_now(self, domain: str, data: Dict) -> None:
+        """Write decision_makers.json straight to FINAL storage (query-time
+        refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_organization(self, domain: str) -> Optional[Dict]:
+        """Return the committed organization.json for a domain, or None."""
+
+    @abstractmethod
+    def write_organization_now(self, domain: str, data: Dict) -> None:
+        """Write organization.json straight to FINAL storage (query-time
+        refresh — same pattern as write_tech_profile_now)."""
+
+    @abstractmethod
+    def read_business_intelligence(self, domain: str) -> Optional[Dict]:
+        """Return the committed business_intelligence.json for a domain, or
+        None."""
+
+    @abstractmethod
+    def write_business_intelligence_now(self, domain: str, data: Dict) -> None:
+        """Write business_intelligence.json straight to FINAL storage
+        (query-time refresh — same pattern as write_tech_profile_now)."""
+
+
+class LocalPageStore(PageStore):
+    """Filesystem-backed PageStore. Swap for an R2-backed one later."""
+
+    def __init__(self, root: str = "storage", index_path: str = "crawl_index.csv") -> None:
+        self.root = Path(root)
+        self.staging_root = self.root / ".staging"
+        self.index_path = Path(index_path)
+        # Buffered per-domain metadata (lightweight, one business at a time).
+        self._index_buffers: Dict[str, List[Dict[str, str]]] = {}
+        self._link_buffers: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+        self._page_index_buffers: Dict[str, List[Dict[str, Any]]] = {}
+        self._staged_names: Dict[str, set] = {}
+        self._lock = threading.Lock()
+
+    # -- paths --
+    def _staging_dir(self, domain: str) -> Path:
+        return self.staging_root / domain
+
+    def _final_dir(self, domain: str) -> Path:
+        return self.root / domain
+
+    def _unique_name(self, domain: str, page_name: str) -> str:
+        """Avoid collisions when two URLs map to the same base name."""
+        used = self._staged_names.setdefault(domain, set())
+        candidate = page_name
+        n = 2
+        while candidate in used:
+            candidate = f"{page_name}-{n}"
+            n += 1
+        used.add(candidate)
+        return candidate
+
+    # -- streaming writes --
+    def stage_page(self, domain: str, page_name: str, text: str) -> str:
+        with self._lock:
+            name = self._unique_name(domain, page_name)
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.txt").write_text(text, encoding="utf-8")
+        # Final path recorded in the index (where the file will live post-commit).
+        return str(self._final_dir(domain) / f"{name}.txt")
+
+    def stage_page_context(self, domain: str, page_name: str, context: Dict[str, Any]) -> None:
+        # `page_name` must be the EXACT deduped stem `stage_page` already
+        # picked for this page (e.g. Path(txt_path).stem) — NOT re-deduped
+        # here, so "pricing_context.json" reliably pairs with "pricing.txt".
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{page_name}_context.json").write_text(
+            json.dumps(context, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def read_page_context(self, domain: str, filename: str) -> Optional[Dict[str, Any]]:
+        f = self._final_dir(domain) / filename
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def write_page_context(self, domain: str, filename: str, context: Dict[str, Any]) -> None:
+        f = self._final_dir(domain) / filename
+        f.write_text(
+            json.dumps(context, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def list_page_context_filenames(self, domain: str) -> List[str]:
+        d = self._final_dir(domain)
+        if not d.exists():
+            return []
+        return sorted(p.name for p in d.glob("*_context.json"))
+
+    def buffer_index_row(self, domain: str, row: Dict[str, str]) -> None:
+        with self._lock:
+            self._index_buffers.setdefault(domain, []).append(row)
+
+    def buffer_links(self, domain: str, page_url: str, links: List[Dict[str, str]]) -> None:
+        with self._lock:
+            self._link_buffers.setdefault(domain, {})[page_url] = links
+
+    def stage_page_index_entry(self, domain: str, entry: Dict[str, Any]) -> None:
+        with self._lock:
+            entries = self._page_index_buffers.setdefault(domain, [])
+            entries.append(entry)
+            snapshot = list(entries)
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "page_index.json").write_text(
+            json.dumps({"pages": snapshot}, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_tech_profile(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        self._write_tech_profile_files(d, capabilities, full_profile)
+
+    def stage_scraper_cache(self, domain: str, cache: Dict[str, str]) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "scraper_cache.json").write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_social_profiles(self, domain: str, profiles: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "social_profiles.json").write_text(
+            json.dumps(profiles, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_linkedin_company(self, domain: str, data: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "linkedin_company.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_decision_makers(self, domain: str, data: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "decision_makers.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_organization(self, domain: str, data: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "organization.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def stage_business_intelligence(self, domain: str, data: Dict) -> None:
+        d = self._staging_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "business_intelligence.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    # -- lifecycle --
+    def commit_domain(
+        self, domain: str, extra_fields: Optional[Dict[str, str]] = None
+    ) -> None:
+        staged = self._staging_dir(domain)
+        final = self._final_dir(domain)
+        # Move staged text files into final storage (replace any prior copy).
+        if staged.exists():
+            if final.exists():
+                shutil.rmtree(final)
+            final.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged), str(final))
+        with self._lock:
+            links = self._link_buffers.pop(domain, {})
+            rows = self._index_buffers.pop(domain, [])
+            self._page_index_buffers.pop(domain, None)
+            self._staged_names.pop(domain, None)
+        if links:
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "links.json").write_text(
+                json.dumps(links, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        if extra_fields:
+            rows = [{**row, **extra_fields} for row in rows]
+        self._append_index(rows)
+
+    def discard_domain(self, domain: str) -> None:
+        staged = self._staging_dir(domain)
+        if staged.exists():
+            shutil.rmtree(staged, ignore_errors=True)
+        with self._lock:
+            self._index_buffers.pop(domain, None)
+            self._link_buffers.pop(domain, None)
+            self._page_index_buffers.pop(domain, None)
+            self._staged_names.pop(domain, None)
+
+    def cleanup_orphaned_staging(self) -> List[str]:
+        if not self.staging_root.exists():
+            return []
+        orphaned = [d.name for d in self.staging_root.iterdir() if d.is_dir()]
+        for name in orphaned:
+            shutil.rmtree(self.staging_root / name, ignore_errors=True)
+        with self._lock:
+            for name in orphaned:
+                self._index_buffers.pop(name, None)
+                self._link_buffers.pop(name, None)
+                self._page_index_buffers.pop(name, None)
+                self._staged_names.pop(name, None)
+        return orphaned
+
+    def retire_domain(self, domain: str) -> None:
+        """Remove a PREVIOUSLY COMMITTED domain from final storage entirely:
+        deletes storage/<domain>/ and drops its rows from crawl_index.csv.
+
+        Used when a cache-hit re-qualification finds that a domain committed
+        under an earlier query (or before a relevance-classifier fix existed)
+        no longer qualifies — it must not keep sitting in final storage where
+        a later, unrelated query could resurface it as a "clean" cached lead."""
+        final = self._final_dir(domain)
+        if final.exists():
+            shutil.rmtree(final, ignore_errors=True)
+        if not self.index_path.exists():
+            return
+        with self._lock:
+            with open(self.index_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            kept = [r for r in rows if r.get("domain") != domain]
+            if len(kept) == len(rows):
+                return
+            with open(self.index_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=INDEX_COLUMNS, extrasaction="ignore")
+                writer.writeheader()
+                for row in kept:
+                    writer.writerow({c: row.get(c, "") for c in INDEX_COLUMNS})
+
+    # -- index i/o --
+    def _append_index(self, rows: List[Dict[str, str]]) -> None:
+        if not rows:
+            return
+        with self._lock:
+            new_file = not self.index_path.exists() or self.index_path.stat().st_size == 0
+            with open(self.index_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=INDEX_COLUMNS, extrasaction="ignore")
+                if new_file:
+                    writer.writeheader()
+                for row in rows:
+                    writer.writerow({c: row.get(c, "") for c in INDEX_COLUMNS})
+
+    # -- reads --
+    def has_domain(self, domain: str) -> bool:
+        d = self._final_dir(domain)
+        return d.exists() and any(d.glob("*.txt"))
+
+    def local_path(self, domain: str) -> Optional[Path]:
+        d = self._final_dir(domain)
+        return d if d.exists() else None
+
+    def read_index(self) -> List[Dict[str, str]]:
+        if not self.index_path.exists():
+            return []
+        with open(self.index_path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def read_page_text(self, txt_path: str) -> str:
+        try:
+            return Path(txt_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    def read_links(self, domain: str) -> Dict[str, List[Dict[str, str]]]:
+        f = self._final_dir(domain) / "links.json"
+        if not f.exists():
+            return {}
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def read_search_index(self, domain: str) -> Optional[Dict]:
+        d = self._final_dir(domain) / "search_index"
+        if not d.exists():
+            return None
+        try:
+            bm25_corpus = json.loads((d / "bm25_corpus.json").read_text(encoding="utf-8"))
+            embeddings = np.load(d / "embeddings.npy")
+            index_meta = json.loads((d / "index_meta.json").read_text(encoding="utf-8"))
+            return {"bm25_corpus": bm25_corpus, "embeddings": embeddings, "index_meta": index_meta}
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def read_scraper_cache(self, domain: str) -> Optional[Dict[str, str]]:
+        return self._read_final_json(domain, "scraper_cache.json")
+
+    def read_tech_profile(self, domain: str) -> Optional[Dict]:
+        f = self._final_dir(domain) / "website_profile.json"
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def write_tech_profile_now(
+        self, domain: str, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        d = self._final_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        self._write_tech_profile_files(d, capabilities, full_profile)
+
+    def write_search_index_now(
+        self, domain: str, bm25_corpus: Dict, embeddings: np.ndarray, index_meta: Dict,
+    ) -> None:
+        d = self._final_dir(domain) / "search_index"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "bm25_corpus.json").write_text(
+            json.dumps(bm25_corpus, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        np.save(d / "embeddings.npy", embeddings)
+        (d / "index_meta.json").write_text(
+            json.dumps(index_meta, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def write_route_planner_request(self, domain: str, record: Dict) -> None:
+        d = self._final_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "route_planner_request.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def read_route_planner_request(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "route_planner_request.json")
+
+    def read_page_index(self, domain: str) -> Optional[Dict]:
+        f = self._final_dir(domain) / "page_index.json"
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def read_social_profiles(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "social_profiles.json")
+
+    def write_social_profiles_now(self, domain: str, profiles: Dict) -> None:
+        self._write_final_json(domain, "social_profiles.json", profiles)
+
+    def read_linkedin_company(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "linkedin_company.json")
+
+    def write_linkedin_company_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "linkedin_company.json", data)
+
+    def read_linkedin_candidates(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "linkedin_candidates.json")
+
+    def write_linkedin_candidates_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "linkedin_candidates.json", data)
+
+    def read_decision_makers(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "decision_makers.json")
+
+    def write_decision_makers_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "decision_makers.json", data)
+
+    def read_organization(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "organization.json")
+
+    def write_organization_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "organization.json", data)
+
+    def read_business_intelligence(self, domain: str) -> Optional[Dict]:
+        return self._read_final_json(domain, "business_intelligence.json")
+
+    def write_business_intelligence_now(self, domain: str, data: Dict) -> None:
+        self._write_final_json(domain, "business_intelligence.json", data)
+
+    def _read_final_json(self, domain: str, filename: str):
+        f = self._final_dir(domain) / filename
+        if not f.exists():
+            return None
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _write_final_json(self, domain: str, filename: str, data) -> None:
+        d = self._final_dir(domain)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / filename).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_tech_profile_files(
+        directory: Path, capabilities: Dict, full_profile: Dict
+    ) -> None:
+        (directory / "tech_stack.json").write_text(
+            json.dumps(capabilities, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        (directory / "website_profile.json").write_text(
+            json.dumps(full_profile, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+
+# --- Singleton accessor -----------------------------------------------------
+# The crawler ALWAYS writes locally — this is the only PageStore backend.
+# Syncing a completed domain's folder to remote storage (R2 or otherwise) is
+# a separate, independent concern handled by storage_sync.py AFTER commit;
+# see StorageProvider there. That keeps this file free of any cloud-provider
+# dependency, per the crawler/storage layer's own design intent.
+_STORE: Optional[PageStore] = None
+
+
+def get_store() -> PageStore:
+    """Return the process-wide (local-filesystem) PageStore."""
+    global _STORE
+    if _STORE is None:
+        _STORE = LocalPageStore(
+            root=os.getenv("STORAGE_ROOT", "storage"),
+            index_path=os.getenv("CRAWL_INDEX", "crawl_index.csv"),
+        )
+    return _STORE

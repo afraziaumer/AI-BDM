@@ -1,0 +1,13 @@
+{
+  "platform": "reddit",
+  "business_name": "Example Dental Clinic",
+  "matched": true,
+  "listing_url": "",
+  "reviews": [
+    {"text": "Anyone been to Example Dental Clinic in Islamabad? Thinking of booking a cleaning there.", "rating": "", "author": "fixture_user_1", "date": "2026-02-01T00:00:00Z", "url": "https://reddit.test/r/islamabad/1", "community": "islamabad"},
+    {"text": "Yeah get a waterflosser too, helps a lot with gum health in general.", "rating": "", "author": "fixture_user_2", "date": "2026-02-02T00:00:00Z", "url": "https://reddit.test/r/islamabad/2", "community": "islamabad"}
+  ],
+  "review_count_extracted": 2,
+  "checked_at": "2026-08-05T00:00:00Z",
+  "fetch_method": "apify"
+}

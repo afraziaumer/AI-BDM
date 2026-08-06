@@ -1,0 +1,5 @@
+{
+  "_description": "Sanitized request matching api.py's POST /pipeline/run schema (PipelineRequest). This is the real, current request contract -- not a proposed future one.",
+  "query": "find 3 dental clinics in Islamabad with no online booking",
+  "concurrency": 5
+}
