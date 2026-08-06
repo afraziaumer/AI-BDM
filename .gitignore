@@ -9,6 +9,7 @@ api.env
 __pycache__/
 *.pyc
 .tldextract-cache/
+.pytest_cache/
 
 # rag layer — local vector store data (generated)
 rag/.chroma/

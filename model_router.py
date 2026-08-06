@@ -86,8 +86,30 @@ class TaskConfig:
 # not re-guessed. FINAL_REASONING is the one genuinely new task, sized for
 # reasoning over 3-5 full page texts (a few thousand characters of prompt).
 TASK_CONFIG: Dict[TaskType, TaskConfig] = {
+    # Tier 2, not Tier 1: this task now does more than structured extraction
+    # (industry/location/keywords) -- it also judges whether a request is
+    # specific enough to run or needs a clarifying question first (see
+    # LLM_planner.py's step K), a genuine reasoning call, not a lookup. Tier
+    # 1 at "low" effort was measurably inconsistent on that judgment (same-
+    # shape queries like "marinas in Miami" vs "law firms in Chicago" got
+    # different answers) -- moved to the same tier FINAL_REASONING uses for
+    # the same reason. Every query pays this cost now, not just ambiguous
+    # ones, since the model can't know in advance whether it'll need to
+    # reason about ambiguity until it's read the request.
+    #
+    # max_completion_tokens=1500 was NOT enough headroom for this model:
+    # at "medium" effort, gpt-oss-120b's invisible reasoning tokens are
+    # spent from the SAME budget before the visible JSON even starts.
+    # Confirmed live: a clarification round-2 query ("3 salons in lahore" +
+    # "no crm", needing ~15-19 expanded exclude_keywords plus a reasoning
+    # field) hit "max completion tokens reached before generating a valid
+    # document" -- a 400, silently falling back to the weaker qwen model
+    # every time a request was even moderately complex, defeating the point
+    # of the upgrade for exactly the cases that need it most. Raised to give
+    # ample room for medium-effort reasoning plus a large expanded-keyword
+    # JSON payload.
     TaskType.INTENT_PLANNING: TaskConfig(
-        GPT_OSS_20B, QWEN_FAILSAFE, "low", "none", 1000, 0.0, 20.0, 2,
+        GPT_OSS_120B, QWEN_FAILSAFE, "medium", "none", 3000, 0.0, 30.0, 2,
     ),
     TaskType.WEBSITE_CLASSIFICATION: TaskConfig(
         GPT_OSS_20B, QWEN_FAILSAFE, "low", "none", 300, 0.0, 15.0, 2,

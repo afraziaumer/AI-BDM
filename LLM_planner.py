@@ -393,6 +393,66 @@ ordinary lead requests, even ones that happen to mention a technology as an \
 EXCLUDE/INCLUDE keyword filter (e.g. "marinas with no CRM" is a keyword filter \
 on exclude_keywords, NOT a tech-stack analysis request -> false). Default false \
 whenever unsure.
+  K. Decide needs_clarification: whether to STOP and ask the user something \
+before running, instead of guessing. Set it true whenever leaving something \
+unresolved would materially change WHICH businesses come back OR whether the \
+results are actually useful to the user's real goal -- reason about THIS \
+specific request and THIS specific category on their own merits every time; \
+never pattern-match against a fixed list of "categories that get asked about" \
+-- almost any category can have an ambiguity worth surfacing, and almost any \
+request can be missing the one detail that actually matters. Check across \
+these angles, and ask ONLY about whichever ones genuinely apply to THIS \
+request (never a fixed checklist asked every time, never invent a question \
+that doesn't change the results):
+     - Location too broad to search well: an entire country or huge multi- \
+state/multi-region area with no city, state, province, or comparably narrow \
+region at all (e.g. "marinas in the USA", "dentists in Canada"). A real \
+city, region, or well-known metro area ("marinas in South Florida") is \
+already narrow enough -- do not ask just because no exact street/neighborhood \
+was given.
+     - Category missing, or too broad/generic to search at all (e.g. "find \
+me some good leads" -- no industry stated whatsoever; "find some tech \
+companies" -- so broad it could mean almost anything).
+     - Segmentation ambiguity: does this category have more than one common \
+sense of "one business" that would change the count/results? The most \
+frequent case is independent single-location businesses vs. multi-location \
+chains/franchises (salons, clinics, gyms, restaurants, retail, real estate, \
+and plenty of others not worth listing exhaustively -- reason it out for \
+whatever category is actually in the request), but also consider: \
+freelancers/solo operators vs. agencies/firms, product sellers vs. service \
+providers within the same category, or B2C vs. B2B versions of the same \
+label. Ask ONLY when the category plausibly has this split AND it would \
+change what "counts" -- skip it for categories that are essentially always \
+one kind (e.g. "marinas", "wedding photographers"). This is INDEPENDENT of \
+everything else in the request -- an explicit count, a specific city, AND/OR \
+an unrelated include/exclude filter (e.g. "dental clinics in Islamabad with \
+no online booking" -- having a booking-system filter says nothing about \
+whether chains should count) do NOT resolve segmentation ambiguity by \
+themselves. Evaluate this dimension on its own; do not skip it just because \
+the request already has some other, unrelated criterion.
+     - The actual goal behind the search: when the request gives NO signal \
+at all about WHY these businesses are being sought -- no include/exclude \
+keywords, no stated pain point, gap, or qualifying signal, just a bare \
+"<category> in <place>" -- ask what's actually driving the search, since \
+"every marina in Miami" and "marinas in Miami that are outgrowing their \
+current booking process" return completely different lists even though the \
+category and location are identical. Example question: "Is there a specific \
+problem, gap, or signal you're targeting -- something these businesses might \
+be missing or dealing with that makes them a good fit?" Skip this whenever \
+the request already states ANY criterion, however small -- that's already \
+enough of a signal not to ask.
+     - Filter strictness, ONLY when the request gives NO include/exclude \
+criteria at all AND the category is one where borderline/ambiguous matches \
+are common. Example question: "Should I hide anything that isn't clearly a \
+match, or keep borderline results too and just rank them?"
+   When true: still fill in every other field with your best guess (never \
+leave the plan unusable if the user ignores the question and reruns as-is), \
+and set clarification_questions to a list of 1-4 short, specific, genuinely \
+useful questions covering only the angles above that actually apply -- never \
+ask about anything that doesn't change which businesses get returned or how \
+they're filtered (no questions about budget, outreach, campaigns, company \
+size, etc. unless the user's own text already implies that dimension \
+matters). When false, clarification_questions must be [].
 
 Output rules: respond with ONLY a single valid JSON object. No markdown, no prose.
 """
@@ -410,6 +470,8 @@ PLANNER_EXAMPLE = {
     "country_code": "US",
     "phone_regex": r"(?:(?:\+1|1)[\s.\-]?)?(?<!\d)(?:\([2-9]\d{2}\)|[2-9]\d{2})[\s.\-]?[2-9]\d{2}[\s.\-]?\d{4}(?!\d)",
     "needs_tech_stack": False,
+    "needs_clarification": False,
+    "clarification_questions": [],
     "exclude_keywords": [
         "smart monitoring", "remote monitoring", "real-time monitoring",
         "iot", "internet of things", "sensors", "telemetry",
@@ -449,6 +511,19 @@ def plan_query(user_query: str) -> Dict[str, Any]:
                           (CRM/CMS/framework/outdated-site/redesign questions);
                           gates the optional Tech Stack Detection stage, which
                           runs after normal lead collection, never instead of it
+      needs_clarification    - True only when something about the request is
+                          unresolved enough that guessing would materially
+                          change which businesses come back (location too
+                          broad to search, category missing, chain-vs-
+                          independent scope ambiguous, or no filter criteria
+                          at all on a category prone to borderline matches).
+                          False (the default) means the request is already
+                          specific enough to run immediately, same as before
+                          this field existed. The caller stops BEFORE any
+                          discovery/scraping happens when this is true — see
+                          phase1_pipeline.run_pipeline's early-return branch.
+      clarification_questions - 1-3 short, specific questions to show the
+                          user when needs_clarification is true; [] otherwise.
       exclude_keywords  - expanded lowercase phrases that DISqualify a lead
       include_keywords  - expanded lowercase phrases that a lead should mention
       reasoning         - short note on how the query was interpreted

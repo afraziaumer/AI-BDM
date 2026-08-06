@@ -49,7 +49,21 @@ import argparse
 import asyncio
 import json
 import logging
+import sys
 from typing import Dict
+
+# Windows' default console encoding is cp1252, not UTF-8 (confirmed live:
+# sys.stdout.encoding == "cp1252" here) -- every OTHER printed string in
+# this codebase is a fixed English literal we wrote ourselves, so this never
+# came up, but clarification_questions (LLM_planner.py's step K) is raw
+# LLM-generated free text, which routinely includes "smart" punctuation
+# (non-breaking hyphens, curly quotes, em dashes) that cp1252 can't encode --
+# confirmed live: printing a real model response crashed with
+# UnicodeEncodeError on U+2011. Reconfiguring stdout/stderr to UTF-8 here,
+# once, protects every print() in the whole run, not just this one feature.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import final_reasoning as fr
 import phase1_pipeline as p1
@@ -57,11 +71,75 @@ import route_planner as rp
 
 logger = logging.getLogger("ai_bdm.main")
 
+# How many rounds of clarifying questions to accept in one run before just
+# proceeding with the planner's best guess. Bounds how long a terminal
+# session can go back-and-forth if the model keeps finding more to ask.
+MAX_CLARIFICATION_ROUNDS = 3
+
+
+async def _plan_interactively(query: str, concurrency: int) -> Dict:
+    """Run Step 1+2 (p1.run_pipeline), resolving clarification questions in
+    THIS terminal session before any real discovery/scraping happens --
+    print the question(s), read the answer with input(), append it to the
+    query in plain text, and re-plan. plan_query() already parses arbitrary
+    natural language, so no separate answer-parsing logic is needed here;
+    each round is just a richer version of the same query string.
+
+    Capped at MAX_CLARIFICATION_ROUNDS so a model that keeps finding more to
+    ask can't loop forever -- after the cap (or if the user just presses
+    enter with no answer), proceeds with that round's plan regardless. Every
+    field is always filled in with a best guess even when needs_clarification
+    is true (see LLM_planner.py's step K), so forcing it through never
+    leaves the plan unusable.
+    """
+    current_query = query
+    summary: Dict = {}
+    for round_num in range(1, MAX_CLARIFICATION_ROUNDS + 1):
+        summary = await p1.run_pipeline(current_query, concurrency=concurrency)
+        if not summary.get("needs_clarification"):
+            return summary
+
+        questions = summary.get("clarification_questions") or []
+        print("\n" + "=" * 64)
+        print("A bit more detail would help before I search:")
+        for i, q in enumerate(questions, start=1):
+            print(f"  {i}. {q}")
+        print("=" * 64)
+
+        if round_num == MAX_CLARIFICATION_ROUNDS:
+            print("(That's enough back-and-forth -- proceeding with my best guess.)")
+            break
+
+        answer = input("Your answer: ").strip()
+        if not answer:
+            print("(No answer given -- proceeding with my best guess.)")
+            break
+        # Ties the answer back to the exact question(s) it's answering,
+        # instead of just tacking it onto the end of the query as a bare
+        # sentence. Confirmed live this matters: a query like "3 salons in
+        # lahore. both, make sure they have no crm" left it unclear whether
+        # "both" meant chains+independents or something else entirely to a
+        # FRESH LLM call with no memory of what was actually asked -- it
+        # correctly picked up "no crm" but re-asked the exact same
+        # chain-scope question right back, ignoring the answer already
+        # given. Restating the question next to the answer removes that
+        # ambiguity.
+        questions_text = " / ".join(questions)
+        current_query = (
+            f"{current_query}\n\n"
+            f"(Previously asked: \"{questions_text}\" -- answer: \"{answer}\")"
+        )
+
+    summary["needs_clarification"] = False
+    return summary
+
 
 async def run(query: str, concurrency: int = 10,
               no_rag: bool = False, no_maps: bool = False) -> None:
-    # ---- Step 1 (plan) + Step 2 (discover + scrape + store homepage HTML) ----
-    summary = await p1.run_pipeline(query, concurrency=concurrency)
+    # ---- Step 1 (plan, interactively resolving any clarification questions
+    # in this terminal session) + Step 2 (discover + scrape + store homepage
+    # HTML) ----
+    summary = await _plan_interactively(query, concurrency)
     p1.print_summary(summary)
 
     plan = summary.get("plan") or {}

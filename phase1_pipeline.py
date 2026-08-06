@@ -3340,6 +3340,26 @@ def _is_lead_count(results: List[Dict[str, Any]]) -> int:
     return sum(1 for r in results if _is_lead(r))
 
 
+def resolve_effective_limit(plan: Dict[str, Any], limit: Optional[int]) -> Tuple[int, bool]:
+    """Resolve the effective result count: explicit override > plan (only if
+    the user's OWN text stated a number) > default. The returned bool gates
+    whether the general-search round-loop is allowed to page Serper
+    repeatedly and mine directories across multiple rounds to reach the
+    count ("aggressive"), or must stay to a single, cheap, predictable pass
+    ("single_pass"). A caller-supplied `limit` counts as explicit (it's an
+    intentional override) even if the plan itself had no stated count.
+
+    Pure and side-effect-free -- extracted from run_pipeline() specifically
+    so this resolution logic is unit-testable without mocking the LLM/
+    network calls the rest of run_pipeline() makes.
+    """
+    count_explicit = bool(plan.get("count_explicit"))
+    aggressive_discovery = bool(limit) or count_explicit
+    effective_limit = limit or (plan.get("result_limit") if count_explicit else None) or DEFAULT_RESULT_LIMIT
+    effective_limit = max(1, int(effective_limit))
+    return effective_limit, aggressive_discovery
+
+
 async def run_pipeline(
     user_query: str, limit: Optional[int] = None, concurrency: int = 5
 ) -> Dict[str, Any]:
@@ -3377,6 +3397,8 @@ async def run_pipeline(
         "error": None,
         "blocked": False,
         "block_reason": "",
+        "needs_clarification": False,
+        "clarification_questions": [],
     }
 
     # Step 0: moderation gate — runs before ANY other resource (Serper, the
@@ -3398,16 +3420,17 @@ async def run_pipeline(
         return summary
     summary["plan"] = plan
 
-    # Resolve the effective count: explicit override > plan (only if the user's
-    # OWN text stated a number) > default. `aggressive_discovery` gates whether
-    # the general-search round-loop below is allowed to page Serper repeatedly
-    # and mine directories across multiple rounds to reach the count, or must
-    # stay to a single, cheap, predictable pass — see the loop below. A caller-
-    # supplied `limit` counts as explicit (it's an intentional override).
-    count_explicit = bool(plan.get("count_explicit"))
-    aggressive_discovery = bool(limit) or count_explicit
-    effective_limit = limit or (plan.get("result_limit") if count_explicit else None) or DEFAULT_RESULT_LIMIT
-    effective_limit = max(1, int(effective_limit))
+    # Step 0.5: clarification gate — mirrors the moderation gate above: stop
+    # BEFORE any discovery/scraping cost is spent if the planner judged the
+    # request too unresolved to run confidently (see LLM_planner's step K).
+    # The user re-runs with more detail added; this never blocks a request
+    # that was already specific enough, which is still the common case.
+    if plan.get("needs_clarification"):
+        summary["needs_clarification"] = True
+        summary["clarification_questions"] = plan.get("clarification_questions") or []
+        return summary
+
+    effective_limit, aggressive_discovery = resolve_effective_limit(plan, limit)
     summary["limit"] = effective_limit
     summary["discovery_mode"] = "aggressive" if aggressive_discovery else "single_pass"
 
@@ -3844,6 +3867,18 @@ def print_summary(summary: Dict[str, Any]) -> None:
         # (avoids handing back a roadmap for rephrasing around the filter).
         print(f"Query      : {summary['query']}")
         print("Status     : This request violates our usage policy and was not processed.")
+        print("=" * 64)
+        return
+    if summary.get("needs_clarification"):
+        # Nothing was searched/scraped yet -- see run_pipeline's clarification
+        # gate. The user answers in plain text as part of a re-run, since this
+        # is a one-shot CLI, not a live chat: e.g. "3 salons in Lahore,
+        # independent shops only, hide anything unclear".
+        print(f"Query      : {summary['query']}")
+        print("Status     : Need a bit more detail before running this search:")
+        for i, q in enumerate(summary.get("clarification_questions") or [], start=1):
+            print(f"  {i}. {q}")
+        print("\nRe-run with those details added to your query.")
         print("=" * 64)
         return
     if summary.get("error") and not summary.get("plan"):

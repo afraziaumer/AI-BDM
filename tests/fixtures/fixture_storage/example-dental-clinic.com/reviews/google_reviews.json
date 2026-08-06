@@ -1,0 +1,18 @@
+{
+  "platform": "google_reviews",
+  "business_name": "Example Dental Clinic",
+  "matched": true,
+  "listing_url": "https://www.google.com/maps?cid=0000000000000000000",
+  "reviews": [
+    {"text": "Very professional and gentle, would recommend.", "rating": "5", "author": "Fixture Reviewer 1", "date": "2026-01-01T00:00:00Z"},
+    {"text": "Clean clinic, friendly staff, fair pricing.", "rating": "4", "author": "Fixture Reviewer 2", "date": "2026-01-02T00:00:00Z"}
+  ],
+  "review_count_extracted": 2,
+  "checked_at": "2026-08-05T00:00:00+00:00",
+  "pages_fetched": 1,
+  "fetch_method": "apify",
+  "maps_rating": 4.6,
+  "maps_rating_count": 42,
+  "maps_match_basis": "address",
+  "maps_match_confidence": "high"
+}

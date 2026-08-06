@@ -33,6 +33,9 @@ propcache==0.5.2
 pydantic==2.13.4
 pydantic_core==2.46.4
 pyee==13.0.1
+pytest==9.1.1
+iniconfig==2.3.0
+pluggy==1.6.0
 python-dotenv==1.2.2
 phonenumbers==9.0.33
 rank-bm25==0.2.2
