@@ -1,0 +1,57 @@
+AI-BDM — Test Results
+======================
+
+Offline + mocked suite (`pytest -q`)
+-------------------------------------
+Commit:  b268394412a05237113ca7549ed840c80cea070b
+Date:    2026-08-06
+Command: pytest -q
+Result:  62 passed, 4 deselected, 2 warnings in 7.38s
+
+Deselected tests are the 4 live-provider tests in tests/integration/,
+excluded by default via pytest.ini's `addopts = -m "not live"`.
+
+Suite breakdown:
+  tests/smoke/      14 tests — core module imports, Stage 8 accuracy-check
+                     functions against fixtures. No network, no API keys.
+  tests/unit/        unit tests — request validation, effective-limit
+                     resolution, discovery-gate scoring, homepage-selection
+                     rollup, Windows path handling, Wappalyzer patch
+                     verification.
+  tests/mocked/      review-escalation logic, transient-failure-vs-genuine-
+                     empty caching, Google Maps matching hierarchy — real
+                     logic, provider HTTP calls replaced with fakes.
+
+Live-provider suite (`pytest -m live tests/integration`)
+-----------------------------------------------------------
+Last run against real credentials during this same handoff pass (prior to
+the Wappalyzer-vendoring commit; re-verified after that fix landed via the
+offline suite only, to avoid spending real provider quota twice for a
+change that didn't touch any live-provider code path):
+  4 passed — Groq key validity, ScrapingBee key/quota, Apify token
+  validity, Serper key validity (the Serper check spends 1 real search
+  credit, by design — see the test file for the documented cost).
+
+Not re-run as part of generating this file (would spend real quota with
+no code change to justify it). Re-run directly when needed:
+  pytest -m live tests/integration
+
+Known failing tests
+---------------------
+None, on either a genuinely fresh install or this development machine, as
+of the commit above.
+
+What this does NOT cover
+---------------------------
+- Contract tests validating a request/progress/result/error payload
+  against a JSON Schema — no such schema exists yet (see
+  docs/backend-handoff/schemas/README.md).
+- Resume/cancel behavior — no cancellation mechanism exists yet (see
+  docs/backend-handoff/JOB_EXECUTION.md).
+- A dedicated test for "untrusted scraped page text cannot alter LLM tool
+  configuration/paths/credentials/scope" (Laravel guide Section 4.9's
+  Security row) — see docs/backend-handoff/KNOWN_LIMITATIONS.md.
+- Stage 3 (route/page selection), Stage 4 (final reasoning), and Stage 6
+  (RAG embedding/retrieval) have no dedicated unit/mocked test — see
+  docs/backend-handoff/PIPELINE_STAGES.md for exactly what each stage's
+  coverage is.
