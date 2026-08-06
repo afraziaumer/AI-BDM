@@ -58,13 +58,32 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlsplit
 
 import requests
+
+# CRITICAL: every "import wappalyzer" / "from wappalyzer import ..." below
+# and throughout this module must resolve to the VENDORED copy at
+# vendor/wappalyzer/, not whatever pip happens to install for
+# wappalyzer==2.0.1. Confirmed live (2026-08-06): PyPI is currently serving
+# a DIFFERENT, incompatible build under that exact same version string --
+# no Wappalyzer.py, no Wappalyzer.latest() classmethod -- than what this
+# project was built and tested against. Pinning the version number does
+# NOT guarantee reproducible code for this package. The vendored copy
+# (already patched for the 3 known bugs -- see docs/KNOWN_LIMITATIONS.md)
+# is committed to this repository specifically so this can never happen
+# again, regardless of what PyPI serves in the future. Inserted at
+# position 0 so it's found before any same-named package pip might have
+# installed anyway (e.g. from an old requirements.txt).
+_VENDOR_DIR = str(Path(__file__).parent / "vendor")
+if _VENDOR_DIR not in sys.path:
+    sys.path.insert(0, _VENDOR_DIR)
 
 logger = logging.getLogger("ai_bdm.tech_stack")
 

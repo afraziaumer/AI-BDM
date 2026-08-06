@@ -63,21 +63,13 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.7.0
 uvicorn==0.49.0
-# wappalyzer 2.0.1 has three real bugs in the installed package itself, all
-# manually patched in this environment's site-packages (NOT tracked by this
-# repo -- a fresh `pip install` will silently reintroduce all three; reapply
-# by hand or via tech_stack.py's own doc-comments if you reinstall):
-#   1. wappalyzer/Wappalyzer.py:58 -- BeautifulSoup(self.html, 'lxml') hardcodes
-#      the lxml parser; changed to 'html.parser' (lxml conflicts with this
-#      project's other native deps -- see the note on lxml/pyarrow below).
-#   2. wappalyzer/core/config.py -- opens technologies.json/categories.json/
-#      groups.json without encoding='utf-8'; on Windows this defaults to
-#      cp1252 and crashes on the files' real UTF-8 content. Added
-#      encoding='utf-8' to all three `open()` calls.
-#   3. wappalyzer/data/technologies.json -- the Symfony fingerprint's `html`
-#      regex uses JS's `[^]` ("match any character") idiom, which Python's re
-#      module doesn't support and mis-parses as an unbalanced-paren error,
-#      silently disabling Symfony detection. Replaced `[^]` with the
-#      Python-compatible equivalent `[\s\S]`.
-wappalyzer==2.0.1
+# wappalyzer is intentionally NOT installed via pip -- do not add
+# "wappalyzer==2.0.1" here. Confirmed live (2026-08-06): PyPI serves
+# different, incompatible code under that exact same version string over
+# time (no Wappalyzer.py, no .latest() classmethod in the current build,
+# vs. what this project needs) -- the version pin does not guarantee
+# reproducible package contents. tech_stack.py instead uses a vendored,
+# pre-patched copy committed at vendor/wappalyzer/ (see that directory's
+# own README and docs/KNOWN_LIMITATIONS.md), which sidesteps this problem
+# permanently regardless of what PyPI serves in the future.
 yarl==1.24.2

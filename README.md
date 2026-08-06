@@ -37,13 +37,9 @@ pip uninstall -y pyarrow datasets
 
 This is safe — nothing in this codebase imports either package directly.
 
-### Known third-party package patches (required for full tech-stack detection)
+### Wappalyzer (tech-stack detection) — vendored, no post-install step needed
 
-The installed `wappalyzer==2.0.1` package has three real bugs, all currently patched by hand inside the installed package's own files (**not** tracked by this repository — a fresh install silently reintroduces all three, degrading Step 5 without any visible error). See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for the exact patch script. Until a repository-controlled patch/fork is in place, apply these manually after every fresh install:
-
-1. `wappalyzer/Wappalyzer.py` — hardcodes the `lxml` BeautifulSoup parser; change to `html.parser`.
-2. `wappalyzer/core/config.py` — opens its fingerprint-database JSON files without `encoding="utf-8"`; on Windows this defaults to `cp1252` and crashes on the files' real UTF-8 content. Add `encoding="utf-8"` to all three `open()` calls.
-3. `wappalyzer/data/technologies.json` — the Symfony fingerprint's `html` regex uses JavaScript's `[^]` ("match any character") idiom, which Python's `re` module doesn't support. Replace `[^]` with `[\s\S]`.
+`wappalyzer` is **not** pip-installed (deliberately not in `requirements.txt`). Confirmed live: PyPI currently serves a different, incompatible build under the `2.0.1` version string than what this codebase was built against, so a version pin alone doesn't guarantee reproducible behavior. Instead, a working, pre-patched copy (three real bugs fixed: BeautifulSoup parser, UTF-8 file encoding, a broken Symfony fingerprint regex) is committed directly at [`vendor/wappalyzer/`](vendor/wappalyzer/), and `tech_stack.py` adds `vendor/` to `sys.path` at import time so `import wappalyzer` always resolves to that copy. Nothing to install or patch after `pip install -r requirements.txt` — Step 5 (tech-stack detection) works out of the box. See [`vendor/wappalyzer/README.md`](vendor/wappalyzer/README.md) for provenance and the update procedure, and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) for the full incident history.
 
 ## Entry points
 
@@ -122,4 +118,4 @@ Observed on this development machine during real runs this session: single-digit
 
 ## Known issues
 
-See [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) if present, or the "Known Limitations" section of `AI-BDM_Master_Progress_Report.docx` for the full, current list (Yelp/Trustpilot bot-protection, Dockwa JS-rendered reviews, Roman Urdu/code-switched language detection, ScrapingBee monthly quota, third-party package patches not tracked by this repo).
+See [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) if present, or the "Known Limitations" section of `AI-BDM_Master_Progress_Report.docx` for the full, current list (Yelp/Trustpilot bot-protection, Dockwa JS-rendered reviews, Roman Urdu/code-switched language detection, ScrapingBee monthly quota).
