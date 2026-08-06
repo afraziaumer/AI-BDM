@@ -27,9 +27,26 @@ def _wappalyzer_root() -> str:
 def patch_beautifulsoup_parser(root: str) -> str:
     """Wappalyzer.py hardcodes the lxml BeautifulSoup parser, which
     conflicts with this project's other native dependencies. Swap it for
-    html.parser (stdlib, no conflict)."""
+    html.parser (stdlib, no conflict).
+
+    CRITICAL, discovered during a real fresh-install verification of this
+    handoff: PyPI's CURRENTLY-SERVED wheel for wappalyzer==2.0.1 is a
+    different, incompatible build than the one this project was built
+    against and patched -- same version string, no Wappalyzer.py at all,
+    a completely different module layout (analyzers/, browser/, parsers/),
+    and Wappalyzer.latest() doesn't exist on the new class (it now exposes
+    analyze/analyze_many/close instead). tech_stack.py's legacy engine is
+    CONFIRMED BROKEN against this new build on a genuinely fresh install --
+    not a hypothetical, reproduced live. See docs/KNOWN_LIMITATIONS.md.
+    This function degrades to a WARN (not a crash) when Wappalyzer.py
+    simply doesn't exist, so a fresh install at least gets a clear signal
+    instead of a traceback -- it does NOT fix the underlying incompatibility."""
     import os
     path = os.path.join(root, "Wappalyzer.py")
+    if not os.path.exists(path):
+        return (f"WARN: {path} does not exist -- this install's wappalyzer package "
+                f"is a different, incompatible build (see docs/KNOWN_LIMITATIONS.md). "
+                f"tech_stack.py's legacy engine will not work until this is resolved.")
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     old = "BeautifulSoup(self.html, 'lxml')"
