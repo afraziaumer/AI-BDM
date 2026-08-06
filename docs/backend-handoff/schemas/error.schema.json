@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "ErrorClass": {
+      "enum": [
+        "validation",
+        "authentication",
+        "quota",
+        "rate_limit",
+        "transient_provider",
+        "blocked_source",
+        "data_quality",
+        "internal"
+      ],
+      "title": "ErrorClass",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "code": {
+      "title": "Code",
+      "type": "string"
+    },
+    "error_class": {
+      "$ref": "#/$defs/ErrorClass"
+    },
+    "message": {
+      "title": "Message",
+      "type": "string"
+    },
+    "retryable": {
+      "title": "Retryable",
+      "type": "boolean"
+    },
+    "retry_after_seconds": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Retry After Seconds"
+    },
+    "fields": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Fields",
+      "type": "object"
+    },
+    "correlation_id": {
+      "title": "Correlation Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "error_class",
+    "message",
+    "retryable",
+    "correlation_id"
+  ],
+  "title": "ErrorEnvelope",
+  "type": "object",
+  "$id": "https://github.com/chirp-io/AI-BDM/docs/backend-handoff/schemas/error.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

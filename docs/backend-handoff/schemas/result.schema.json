@@ -1,0 +1,295 @@
+{
+  "$defs": {
+    "ArtifactManifestEntry": {
+      "properties": {
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "uri": {
+          "title": "Uri",
+          "type": "string"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        }
+      },
+      "required": [
+        "type",
+        "uri"
+      ],
+      "title": "ArtifactManifestEntry",
+      "type": "object"
+    },
+    "Company": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "website": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Website"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "Company",
+      "type": "object"
+    },
+    "ErrorClass": {
+      "enum": [
+        "validation",
+        "authentication",
+        "quota",
+        "rate_limit",
+        "transient_provider",
+        "blocked_source",
+        "data_quality",
+        "internal"
+      ],
+      "title": "ErrorClass",
+      "type": "string"
+    },
+    "ErrorEnvelope": {
+      "properties": {
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "error_class": {
+          "$ref": "#/$defs/ErrorClass"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "retryable": {
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "retry_after_seconds": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retry After Seconds"
+        },
+        "fields": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Fields",
+          "type": "object"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "error_class",
+        "message",
+        "retryable",
+        "correlation_id"
+      ],
+      "title": "ErrorEnvelope",
+      "type": "object"
+    },
+    "JobStatus": {
+      "enum": [
+        "queued",
+        "running",
+        "awaiting_input",
+        "completed",
+        "partially_completed",
+        "failed",
+        "cancelled"
+      ],
+      "title": "JobStatus",
+      "type": "string"
+    },
+    "Prospect": {
+      "properties": {
+        "source_identity": {
+          "$ref": "#/$defs/SourceIdentity"
+        },
+        "company": {
+          "$ref": "#/$defs/Company"
+        },
+        "score": {
+          "$ref": "#/$defs/Score"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source_identity",
+        "company",
+        "score"
+      ],
+      "title": "Prospect",
+      "type": "object"
+    },
+    "Score": {
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "model_version": {
+          "title": "Model Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_version"
+      ],
+      "title": "Score",
+      "type": "object"
+    },
+    "SourceIdentity": {
+      "properties": {
+        "domain": {
+          "title": "Domain",
+          "type": "string"
+        }
+      },
+      "required": [
+        "domain"
+      ],
+      "title": "SourceIdentity",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "correlation_id": {
+      "title": "Correlation Id",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/JobStatus"
+    },
+    "pipeline_version": {
+      "title": "Pipeline Version",
+      "type": "string"
+    },
+    "started_at": {
+      "format": "date-time",
+      "title": "Started At",
+      "type": "string"
+    },
+    "completed_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Completed At"
+    },
+    "counts": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Counts",
+      "type": "object"
+    },
+    "prospects": {
+      "items": {
+        "$ref": "#/$defs/Prospect"
+      },
+      "title": "Prospects",
+      "type": "array"
+    },
+    "artifact_manifest": {
+      "items": {
+        "$ref": "#/$defs/ArtifactManifestEntry"
+      },
+      "title": "Artifact Manifest",
+      "type": "array"
+    },
+    "errors": {
+      "items": {
+        "$ref": "#/$defs/ErrorEnvelope"
+      },
+      "title": "Errors",
+      "type": "array"
+    },
+    "warnings": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "job_id",
+    "correlation_id",
+    "status",
+    "pipeline_version",
+    "started_at"
+  ],
+  "title": "JobResult",
+  "type": "object",
+  "$id": "https://github.com/chirp-io/AI-BDM/docs/backend-handoff/schemas/result.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

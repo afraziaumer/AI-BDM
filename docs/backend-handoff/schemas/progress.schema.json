@@ -1,0 +1,71 @@
+{
+  "properties": {
+    "schema_version": {
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "correlation_id": {
+      "title": "Correlation Id",
+      "type": "string"
+    },
+    "stage": {
+      "title": "Stage",
+      "type": "string"
+    },
+    "completed_units": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Completed Units"
+    },
+    "total_units": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Total Units"
+    },
+    "message_code": {
+      "title": "Message Code",
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "title": "Timestamp",
+      "type": "string"
+    },
+    "last_heartbeat_at": {
+      "format": "date-time",
+      "title": "Last Heartbeat At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "job_id",
+    "correlation_id",
+    "stage",
+    "message_code",
+    "timestamp",
+    "last_heartbeat_at"
+  ],
+  "title": "ProgressEvent",
+  "type": "object",
+  "$id": "https://github.com/chirp-io/AI-BDM/docs/backend-handoff/schemas/progress.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

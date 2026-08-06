@@ -1,6 +1,6 @@
 # Known Limitations — Backend Handoff Scope
 
-Scoped to what a Laravel/backend reviewer needs: hard-coded paths, patched packages, Windows dependencies, report/code discrepancies, and everything blocked on the deferred job-contract work (Section 4.3–4.6). For the full limitations list (Yelp/Trustpilot bot-protection, Roman Urdu language detection, ScrapingBee quota, etc.), see `../KNOWN_LIMITATIONS.md` — not repeated here to avoid the two copies drifting apart.
+Scoped to what a Laravel/backend reviewer needs: hard-coded paths, patched packages, Windows dependencies, report/code discrepancies, and the job contract's real remaining gaps (Section 4.3–4.6 — now implemented, see below for what that does and doesn't cover). For the full limitations list (Yelp/Trustpilot bot-protection, Roman Urdu language detection, ScrapingBee quota, etc.), see `../KNOWN_LIMITATIONS.md` — not repeated here to avoid the two copies drifting apart.
 
 ## Discrepancy: the Laravel guide assumes a non-LLM entry point exists — it doesn't
 
@@ -8,18 +8,20 @@ The Laravel Backend Construction Handoff Guide's header states `LLM STATUS: Not 
 
 **This premise is factually incorrect for this codebase, and was already corrected once before during this same handoff process** (an earlier draft doc, `Python_Code_Handoff_Guide_Current_Non_LLM_System.docx`, made the same claim and was superseded). Query planning, the clarification layer, route-planning's fallback, final reasoning, the relevance safety-net check, and moderation are all genuinely, unavoidably LLM-based (Groq) — confirmed live with real API calls and real cost tracking throughout this handoff. **There is no non-LLM alternative implementation for any of these stages.** The LLM requirement is not hidden — it's the opposite of hidden, it's openly required in `README.md`'s external-services table — but it does mean this checklist line item cannot be satisfied as literally written, and isn't being silently worked around here.
 
-## Deferred: the job contract (Section 4.3–4.6)
+## The job contract (Section 4.3–4.6) — implemented, with real remaining gaps
 
-By explicit decision of the Python team lead, the following is **out of scope for this handoff pass**, not forgotten:
+Built: `job_contracts.py` (versioned `JobRequest`/`ProgressEvent`/`JobResult`/`ErrorEnvelope`, an 8-class error taxonomy with `classify_error()`), `job_translation.py` (structured request → the natural-language query the planner actually needs, with explicit warnings for fields that can't be honestly honored), `job_runner.py` (in-process job store, async execution, heartbeat), and `POST/GET /api/v1/jobs*` in `api.py`. Full design and status-mapping detail in `JOB_EXECUTION.md`.
 
-- No `job_id` / `tenant_ref` / `correlation_id` / `schema_version` concept exists anywhere in this codebase.
-- The request shape is a natural-language string (`{"query": "...", "concurrency": N}`), not the structured `target{industry, locations, company_size}` shape Section 4.3 describes.
-- Results are written to CSV files and returned as a loosely-shaped summary dict, not the structured `JobResult` (`prospects[]`, `artifact_manifest`, `errors[]`) Section 4.4 describes.
-- No progress emission, heartbeat, or cancellation mechanism exists (Section 4.5). A running pipeline call cannot be checked on mid-run or stopped early.
-- No error taxonomy exists (Section 4.6). Failures surface as log lines and free-text strings (e.g. `summary["error"] = "intent_failed: ..."`, generic `HTTPException` details), not the canonical `{code, retryable, retry_after_seconds, correlation_id}` envelope.
-- Consequently, the four schema files (`schemas/request.schema.json`, `progress.schema.json`, `result.schema.json`, `error.schema.json`) required by Section 7's folder structure are **not present in this folder** — they describe a contract that hasn't been designed yet. `JOB_EXECUTION.md` is likewise not present for the same reason.
-- No content hashing (SHA-256) exists for any artifact (see `ARTIFACTS_AND_STORAGE.md`).
-- ~~`api.py` has no `/v1` prefix and no cursor pagination on `GET /leads`~~ — fixed: all routes now live under `/api/v1`, and `GET /api/v1/leads` returns `{items, next_cursor}` with an opaque base64 cursor instead of a plain `limit`-only listing. See `docs/INTEGRATION_NOTES.md` for the updated curl examples.
+**What's still genuinely missing, not silently papered over:**
+
+- **Job store is in-process, not durable.** A process restart loses all job state — no Redis/Celery/database backing exists.
+- **Stages 3–8 are out of this job runner's scope entirely.** It wraps `run_pipeline()` only (Stages 1–2) — the same scope the pre-existing `POST /api/v1/pipeline/run` already had. `features.maps`/`features.tech_stack` in a request produce a warning, not real Maps/tech-stack data.
+- **No checkpoint/resume.** A crashed job can't resume — it would need a fresh `job_id` and would restart (though the pipeline's own existing per-business cache still avoids re-scraping already-committed domains).
+- **No content hashing (SHA-256)** for any artifact — `ArtifactManifestEntry.sha256` is always `null` (see `ARTIFACTS_AND_STORAGE.md`).
+- **No idempotency beyond job_id uniqueness** — resubmitting the same `job_id` is rejected (409), but there's no broader `Idempotency-Key` mechanism.
+- **Progress checkpoints are per discovery-round, not per-candidate** — a deliberate choice to avoid destabilizing the existing multi-round/query-variation discovery loop; see `JOB_EXECUTION.md` for why.
+
+~~`api.py` has no `/v1` prefix and no cursor pagination on `GET /leads`~~ — fixed: all routes now live under `/api/v1`, and `GET /api/v1/leads` returns `{items, next_cursor}` with an opaque base64 cursor instead of a plain `limit`-only listing. See `docs/INTEGRATION_NOTES.md` for the updated curl examples.
 
 ## Patched / vendored packages
 

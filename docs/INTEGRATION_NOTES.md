@@ -4,14 +4,15 @@ This documents the current, real integration boundary — not a target design. W
 
 ## Current state, honestly
 
-**An API already exists (`api.py`), but it's partial.** It's a FastAPI wrapper, versioned under `/api/v1` (Laravel guide, Section 5), exposing only:
-- `POST /api/v1/pipeline/run` → runs Stage 1 (planning) + Stage 2 (discovery/scraping) and returns `phase1_pipeline.run_pipeline()`'s structured summary dict directly.
+**An API already exists (`api.py`), but it's partial.** It's a FastAPI wrapper, versioned under `/api/v1` (Laravel guide, Section 5), exposing:
+- `POST /api/v1/pipeline/run` → runs Stage 1 (planning) + Stage 2 (discovery/scraping) **synchronously** and returns `phase1_pipeline.run_pipeline()`'s structured summary dict directly. Blocks the HTTP request for the whole run.
+- `POST /api/v1/jobs` / `GET /api/v1/jobs/{job_id}` / `GET /api/v1/jobs/{job_id}/result` / `POST /api/v1/jobs/{job_id}/cancel` → the same Stage 1–2 work, but async: submit returns immediately with a `job_id`, poll for progress/heartbeat, cancel mid-run, fetch the versioned `JobResult` once terminal. This is the guide's Section 4.3–4.6 contract — see `docs/backend-handoff/JOB_EXECUTION.md` for exact scope and status mapping.
 - `GET /api/v1/leads` → cursor-paginated (`items` + opaque `next_cursor`) read-only access to whatever is currently persisted in `crawl_index.csv`. `GET /api/v1/leads/count` returns the total.
 - `GET /api/v1/health` → liveness probe, also reports which provider keys are configured.
 
-**Stages 3–8 (routing, final reasoning, tech-stack detection, evidence retrieval, Maps enrichment, accuracy audit) are not exposed by this API today.** They only run as part of `main.py`'s `run()` function, which is a **print-based CLI orchestrator with no structured return value** (`async def run(...) -> None`) — it writes results to files (`leads_clean.csv`, `leads_with_maps.csv`, `accuracy_report.txt`) and prints progress to stdout, but does not currently return a JSON-serializable result object the way `api.py`'s Stage 1–2 endpoint does.
+**Stages 3–8 (routing, final reasoning, tech-stack detection, evidence retrieval, Maps enrichment, accuracy audit) are not exposed by ANY of the above today** — neither the synchronous endpoint nor the async job API cover them. They only run as part of `main.py`'s `run()` function, which is a **print-based CLI orchestrator with no structured return value** (`async def run(...) -> None`) — it writes results to files (`leads_clean.csv`, `leads_with_maps.csv`, `accuracy_report.txt`) and prints progress to stdout, but does not currently return a JSON-serializable result object the way the Stage 1–2 endpoints do.
 
-**This is the real integration gap.** Wrapping `main.py`'s full 8-stage orchestration into something with the same "returns a structured result" contract `api.py` already has for Stages 1–2 is real, scoped, achievable work — not yet done.
+**This is the real integration gap.** Wrapping `main.py`'s full 8-stage orchestration into something with the same "returns a structured result" contract Stages 1–2 already have is real, scoped, achievable work — not yet done. A job requesting `features.maps`/`features.tech_stack` via `POST /api/v1/jobs` gets an explicit warning in its result rather than silently-ignored fields.
 
 ## Recommended near-term step (not yet built)
 
@@ -19,35 +20,12 @@ Refactor `main.py`'s `run()` to return a structured result dict (mirroring `phas
 - `phase1_pipeline.run_pipeline()` already returns a structured summary (Stages 1–2).
 - `route_planner.plan_routes()`, `final_reasoning.answer_query()`, `phase3.google_maps.enrich()`, and `accuracy_check.run()` each already return/write structured data — they just aren't currently assembled into one combined return value by `main.py`.
 
-## Job/result schema — mapped to what this system actually produces
+## Job/result schema — now implemented, for Stages 1–2
 
-The Laravel backend guide proposes a `job_id`/`tenant_ref`/`target` request shape and a `prospects`/`evidence_refs`/`artifact_manifest` result shape. Mapped to AI-BDM's real, current field names (not a hypothetical rename):
+The `job_id`/`tenant_ref`/`target` request shape and `prospects`/`evidence_refs`/`artifact_manifest` result shape the Laravel guide proposes are implemented in `job_contracts.py` and exposed via `POST /api/v1/jobs`. This section used to describe a hypothetical field mapping; it's real now, so the mapping lives in code and in `docs/backend-handoff/JOB_EXECUTION.md` instead of being duplicated here. Two things worth knowing that aren't obvious from the schema files alone:
 
-**Conceptual request → today's actual input:**
-```json
-{
-  "query": "find 3 dental clinics in Islamabad with no online booking",
-  "concurrency": 10
-}
-```
-This is exactly `api.py`'s existing `PipelineRequest` schema. A future `target`-object-style request (industry/locations/company_size as separate structured fields, per the Laravel guide's example) would need a translation layer in front of `LLM_planner.plan_query()` — today, the whole request is one natural-language string that the LLM itself decomposes into `geo_location`/`broad_industry`/etc. There is no structured-field request path today.
-
-**Conceptual result → today's actual output**, assembled from real fields already produced by the pipeline (not currently returned as one JSON object — see the gap above):
-```json
-{
-  "status": "qualified_count vs shortfall in phase1_pipeline's summary",
-  "prospects": [
-    {
-      "source_identity": {"domain": "example.com"},
-      "company": {"name": "from leads_with_maps.csv company_name"},
-      "score": {"value": "relevance_score column", "verdict": "relevance_verdict column"},
-      "maps": {"rating": "maps_rating", "review_count": "maps_rating_count", "matched": "maps_matched"},
-      "evidence_refs": ["storage/<domain>/*.txt", "storage/<domain>/reviews/*.json"],
-      "warnings": "accuracy_report.txt's flags for this business, if any"
-    }
-  ]
-}
-```
+- **The request's `target.industry`/`target.locations` gets translated into one natural-language sentence** (`job_translation.target_to_query()`) before it ever reaches `LLM_planner.plan_query()` — there is still no structured-field planner path, this translation layer is the bridge. `target.company_size` has no equivalent anywhere in this pipeline and is dropped with an explicit warning, not silently ignored.
+- **The result's `prospects[].score` and `evidence_refs` are real**, sourced from `relevance_scoring.py`'s actual score and a `storage/<domain>/` artifact reference — but there is no `maps` field on a prospect, because Stage 7 (Google Maps enrichment) isn't part of what this job runner wraps. A job requesting `features.maps: true` gets a result-level warning instead of a fabricated `maps` object.
 
 **Distinguishing absent/unknown/failure** — already real behavior worth preserving in any Laravel-facing contract, not something to design from scratch: this pipeline already distinguishes a genuinely empty provider response (cached, safe to trust) from a request failure (never cached — see `docs/ARCHITECTURE.md`'s Stage 2/7 resilience notes). A Laravel-facing result contract should preserve this distinction rather than collapsing both into an empty field.
 

@@ -1,0 +1,192 @@
+{
+  "$defs": {
+    "CompanySize": {
+      "description": "Accepted on the wire per the guide's example -- NOT currently usable\nby this pipeline. There is no employee-count signal anywhere in the\nscrape/enrichment/scoring path. job_translation.target_to_query()\nsurfaces this as an explicit warning on the job result rather than\nsilently accepting and ignoring it.",
+      "properties": {
+        "min_employees": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Employees"
+        },
+        "max_employees": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Employees"
+        }
+      },
+      "title": "CompanySize",
+      "type": "object"
+    },
+    "Features": {
+      "properties": {
+        "maps": {
+          "default": true,
+          "title": "Maps",
+          "type": "boolean"
+        },
+        "reviews": {
+          "default": true,
+          "title": "Reviews",
+          "type": "boolean"
+        },
+        "tech_stack": {
+          "default": false,
+          "title": "Tech Stack",
+          "type": "boolean"
+        }
+      },
+      "title": "Features",
+      "type": "object"
+    },
+    "Limits": {
+      "properties": {
+        "max_prospects": {
+          "default": 20,
+          "maximum": 500,
+          "minimum": 1,
+          "title": "Max Prospects",
+          "type": "integer"
+        },
+        "max_pages_per_domain": {
+          "default": 20,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Pages Per Domain",
+          "type": "integer"
+        }
+      },
+      "title": "Limits",
+      "type": "object"
+    },
+    "Location": {
+      "properties": {
+        "country": {
+          "title": "Country",
+          "type": "string"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Region"
+        },
+        "city": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "City"
+        }
+      },
+      "required": [
+        "country"
+      ],
+      "title": "Location",
+      "type": "object"
+    },
+    "Target": {
+      "properties": {
+        "industry": {
+          "minLength": 1,
+          "title": "Industry",
+          "type": "string"
+        },
+        "locations": {
+          "items": {
+            "$ref": "#/$defs/Location"
+          },
+          "title": "Locations",
+          "type": "array"
+        },
+        "company_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CompanySize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "industry"
+      ],
+      "title": "Target",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "job_id": {
+      "minLength": 1,
+      "title": "Job Id",
+      "type": "string"
+    },
+    "tenant_ref": {
+      "minLength": 1,
+      "title": "Tenant Ref",
+      "type": "string"
+    },
+    "correlation_id": {
+      "minLength": 1,
+      "title": "Correlation Id",
+      "type": "string"
+    },
+    "requested_at": {
+      "format": "date-time",
+      "title": "Requested At",
+      "type": "string"
+    },
+    "target": {
+      "$ref": "#/$defs/Target"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
+    "features": {
+      "$ref": "#/$defs/Features"
+    }
+  },
+  "required": [
+    "job_id",
+    "tenant_ref",
+    "correlation_id",
+    "requested_at",
+    "target"
+  ],
+  "title": "JobRequest",
+  "type": "object",
+  "$id": "https://github.com/chirp-io/AI-BDM/docs/backend-handoff/schemas/request.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

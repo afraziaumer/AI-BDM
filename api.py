@@ -18,8 +18,20 @@ initial version, so there's nothing to stay compatible with yet.
 Endpoints:
   GET  /api/v1/health            - liveness probe
   POST /api/v1/pipeline/run      - run the full Phase 1 pipeline for a query
+                                    (synchronous -- blocks for the whole run)
   GET  /api/v1/leads             - cursor-paginated list of stored leads
   GET  /api/v1/leads/count       - number of stored leads
+  POST /api/v1/jobs               - submit an async job (Laravel guide Section 4.3)
+  GET  /api/v1/jobs/{job_id}      - job status + progress (Section 4.5)
+  GET  /api/v1/jobs/{job_id}/result - job result once terminal (Section 4.4)
+  POST /api/v1/jobs/{job_id}/cancel - request cancellation (Section 4.5)
+
+The /jobs/* routes and /pipeline/run are two INDEPENDENT ways to run the
+same underlying pipeline -- /pipeline/run blocks the HTTP request for the
+whole run (fine for a quick manual call); /jobs/* returns immediately with
+a job_id and is meant for a caller that queues work and polls, per the
+guide's "long work must not be performed inside a public HTTP request"
+rule. Both exist; neither is deprecated by the other.
 """
 
 from __future__ import annotations
@@ -29,11 +41,13 @@ import os
 import secrets
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Security
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
+import job_runner
 import phase1_pipeline as pipeline
+from job_contracts import JobRequest
 
 app = FastAPI(
     title="AI BDM Platform - Phase 1 API",
@@ -223,6 +237,70 @@ def list_leads(
 def leads_count() -> Dict[str, int]:
     """Return the number of leads currently persisted."""
     return {"count": len(_read_leads(include_text=False, limit=None))}
+
+
+# --- Async job routes (Laravel guide Sections 4.3-4.6) ----------------------
+# All four are `async def`, not plain `def` -- FastAPI runs sync endpoint
+# functions in a worker thread pool, which has no running asyncio event
+# loop of its own. job_runner.submit_job() calls asyncio.create_task()
+# internally and MUST run on the same event loop the background job task
+# and its heartbeat task run on, or task creation fails outright (confirmed
+# live: RuntimeError: no running event loop). Making these async runs them
+# on the real event loop thread, same as the existing /pipeline/run route.
+@router.post("/jobs", status_code=202, tags=["jobs"], dependencies=[Depends(require_api_key)])
+async def submit_job(req: JobRequest) -> Dict[str, Any]:
+    """Submit an async job and return immediately with its initial status.
+
+    202 Accepted, not 200/201 -- the job has been accepted for background
+    execution, not completed or created as a durable resource in the REST
+    sense. A repeated call with the same job_id is a 409 Conflict, not a
+    silent no-op or a second run -- job_id IS this endpoint's idempotency
+    key (Laravel guide, Section 5).
+    """
+    try:
+        job_runner.submit_job(req)
+    except job_runner.DuplicateJobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return job_runner.get_status(req.job_id)
+
+
+@router.get("/jobs/{job_id}", tags=["jobs"], dependencies=[Depends(require_api_key)])
+async def job_status(job_id: str) -> Dict[str, Any]:
+    """Current status + progress for a submitted job."""
+    try:
+        return job_runner.get_status(job_id)
+    except job_runner.JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}") from exc
+
+
+@router.get("/jobs/{job_id}/result", tags=["jobs"], dependencies=[Depends(require_api_key)])
+async def job_result(job_id: str, response: Response) -> Dict[str, Any]:
+    """The job's JobResult once it reaches a terminal status.
+
+    Still-running jobs return 202 with the current status instead of a
+    404/409 -- the job exists and is progressing normally, it's just not
+    done; the caller should poll GET /jobs/{job_id} or retry this endpoint.
+    """
+    try:
+        status = job_runner.get_status(job_id)
+        result = job_runner.get_result(job_id)
+    except job_runner.JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}") from exc
+    if result is None:
+        response.status_code = 202
+        return {"job_id": job_id, "status": status["status"], "detail": "Job is still running; poll again."}
+    return result.model_dump(mode="json")
+
+
+@router.post("/jobs/{job_id}/cancel", tags=["jobs"], dependencies=[Depends(require_api_key)])
+async def cancel_job(job_id: str) -> Dict[str, Any]:
+    """Request cancellation. `cancelled: false` means the job was already
+    in a terminal state when this was called -- not an error."""
+    try:
+        cancelled = job_runner.cancel_job(job_id)
+    except job_runner.JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}") from exc
+    return {"job_id": job_id, "cancelled": cancelled}
 
 
 app.include_router(router)

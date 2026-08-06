@@ -60,7 +60,7 @@ import socket
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote, urljoin
 
 import aiohttp
@@ -3361,14 +3361,42 @@ def resolve_effective_limit(plan: Dict[str, Any], limit: Optional[int]) -> Tuple
 
 
 async def run_pipeline(
-    user_query: str, limit: Optional[int] = None, concurrency: int = 5
+    user_query: str,
+    limit: Optional[int] = None,
+    concurrency: int = 5,
+    progress_cb: Optional[Callable[[str, Optional[int], Optional[int], str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Run the full Phase 1 pipeline end to end and return a result summary.
 
     `limit` is optional and overrides the plan; when omitted, the count is taken
     from the planner's `result_limit` (which it reads from the query), defaulting
     to DEFAULT_RESULT_LIMIT.
+
+    `progress_cb` and `cancel_check` are optional, backward-compatible hooks
+    for job_runner.py's async job wrapper (Section 4.5 of the Laravel
+    handoff guide) -- every existing caller (main.py, api.py's
+    POST /api/v1/pipeline/run) omits both and behaves exactly as before.
+
+    `progress_cb(stage, completed, total, message_code)` is called at a
+    small number of well-defined checkpoints, NOT inside the fine-grained
+    per-candidate scrape loop -- the discovery loop's round-based structure
+    (see the docstring above the `while` loop below) makes per-round the
+    natural, safe checkpoint granularity without risking a bug in this
+    already-intricate multi-round/query-variation logic.
+
+    `cancel_check()` is polled at the same checkpoints; if it returns True,
+    the pipeline stops starting new work and returns whatever was already
+    committed, with `summary["cancelled"] = True` -- never mid-candidate,
+    so a cancelled run never leaves a half-written storage/<domain>/ commit.
     """
+    def _progress(stage: str, completed: Optional[int], total: Optional[int], message_code: str) -> None:
+        if progress_cb is not None:
+            progress_cb(stage, completed, total, message_code)
+
+    def _cancelled() -> bool:
+        return cancel_check is not None and cancel_check()
+
     # Quiet the intermittent DNS-blip tracebacks from aiohttp's shielded futures.
     try:
         asyncio.get_running_loop().set_exception_handler(_quiet_dns_exception_handler)
@@ -3405,6 +3433,7 @@ async def run_pipeline(
     # premium scraper, the intent/route-planner LLM calls, storage) is touched,
     # so a policy-violating query costs at most this one small check, not a
     # full discovery+scrape+classify run.
+    _progress("planning", None, None, "pipeline_started")
     moderation = await moderate_user_query(user_query)
     if not moderation["safe"]:
         summary["blocked"] = True
@@ -3419,6 +3448,7 @@ async def run_pipeline(
         summary["error"] = f"intent_failed: {exc}"
         return summary
     summary["plan"] = plan
+    _progress("planning", 1, 1, "plan_resolved")
 
     # Step 0.5: clarification gate — mirrors the moderation gate above: stop
     # BEFORE any discovery/scraping cost is spent if the planner judged the
@@ -3456,6 +3486,11 @@ async def run_pipeline(
         if detected:
             target_domain, search_type = detected, "specific"
     summary["search_type"] = search_type
+
+    if _cancelled():
+        summary["cancelled"] = True
+        return summary
+    _progress("discover_scrape", 0, effective_limit, "scrape_started")
 
     results: List[Dict[str, Any]] = []
     semaphore = asyncio.Semaphore(concurrency)
@@ -3534,6 +3569,10 @@ async def run_pipeline(
                                 country_code=country_code, phone_regex=phone_regex,
                                 user_query=user_query,
                             ))
+            _progress(
+                "discover_scrape", _is_lead_count(results), max(effective_limit, 1),
+                "specific_lookup_complete",
+            )
         else:
             # GENERAL: keep discovering — deeper Serper pages, plus mining any
             # discovery sources (directories/associations/etc.) encountered —
@@ -3606,6 +3645,14 @@ async def run_pipeline(
                 and total_pages_used < MAX_TOTAL_SEARCH_PAGES_PER_RUN
                 and (aggressive_discovery or round_num == 0)
             ):
+                if _cancelled():
+                    # Checked at the top of each ROUND, not mid-round — a
+                    # round's own asyncio.gather() batch below is never
+                    # interrupted partway, so a cancelled job never leaves
+                    # a half-committed storage/<domain>/ write from a
+                    # candidate that was still being scraped.
+                    summary["cancelled"] = True
+                    break
                 if exhausted:
                     # Single-pass mode never gets here with anything useful to
                     # do (round_num == 0 already ends the loop above), so this
@@ -3766,6 +3813,10 @@ async def run_pipeline(
                         "Round %d: mined %d new business(es) from directory site(s) "
                         "encountered this round.", round_num, mined_count,
                     )
+                _progress(
+                    "discover_scrape", _is_lead_count(results), effective_limit,
+                    f"round_{round_num}_complete",
+                )
 
                 logger.info(
                     "Round %d (%r): attempted %d business(es) -> %d/%d qualified "
@@ -3852,6 +3903,9 @@ async def run_pipeline(
     # Record this query's scope so the data-quality report covers only the
     # latest query, not the whole cumulative store.
     _save_last_run(user_query, results, industry=industry, geo=geo)
+    _progress(
+        "finalizing", len(qualified), max(effective_limit, 1), "pipeline_complete"
+    )
     return summary
 
 
