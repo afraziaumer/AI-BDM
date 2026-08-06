@@ -4,6 +4,8 @@ Given one natural-language query (e.g. *"find 3 dental clinics in Islamabad with
 
 This document is the canonical, exact-commands reference for running AI-BDM on a clean machine. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for what each pipeline stage does internally, [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for day-to-day operation, and [`docs/INTEGRATION_NOTES.md`](docs/INTEGRATION_NOTES.md) for how an external system (e.g. a Laravel backend) is meant to call into this project.
 
+**Backend/Laravel integration reviewer — start at [`docs/backend-handoff/`](docs/backend-handoff/).** That folder is the required handoff structure per the Laravel Backend Construction Handoff Guide: a per-stage pipeline record (`PIPELINE_STAGES.md`), a consolidated provider/quota table (`PROVIDERS_AND_LIMITS.md`), storage/artifact contracts (`ARTIFACTS_AND_STORAGE.md`), backend-scoped known limitations (`KNOWN_LIMITATIONS.md`), and the latest test results (`TEST_RESULTS.txt`). The versioned job request/progress/result/error contract (Section 4.3–4.6 of that guide) is explicitly deferred — see that folder's `JOB_EXECUTION.md` and `schemas/README.md` for why, rather than treating their absence as an oversight.
+
 ## Runtime
 
 - **Python**: 3.12 (developed and tested on 3.12.10). No `pyproject.toml`/version pin file exists yet — pin your virtual environment to 3.12 explicitly.
