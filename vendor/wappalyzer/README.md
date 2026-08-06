@@ -11,6 +11,8 @@
 
 **Already patched** for the three real bugs documented in `docs/KNOWN_LIMITATIONS.md` (BeautifulSoup parser, UTF-8 file encoding, a broken Symfony fingerprint regex) — `scripts/patch_wappalyzer.py` applied these before this copy was vendored. Because this directory is committed to the repository, every future install gets this exact, already-working code — there is no post-install patch step anymore.
 
+**Fourth patch, found only by testing from a genuinely fresh venv**: `Wappalyzer.py`'s `latest()` classmethod originally loaded `data/technologies.json` via `pkg_resources.resource_string(...)`. `pkg_resources` comes from `setuptools`, isn't declared anywhere in `requirements.txt`, and recent `setuptools` releases have dropped it entirely — a fresh install hit `ModuleNotFoundError: No module named 'pkg_resources'` the first time `Wappalyzer.latest()` ran, even though the vendoring fix itself worked. Replaced with a plain relative `open(..., encoding='utf-8')` (stdlib only, no dependency). This is exactly why the update procedure below insists on re-testing from a fresh venv, not just re-running the local test suite.
+
 ## Updating this vendored copy
 
 Only do this deliberately, and re-verify `tests/unit/test_wappalyzer_patches.py` afterward:
