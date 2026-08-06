@@ -15,15 +15,17 @@ Re-running Step 8 (accuracy audit) alone, without a new query:
 python accuracy_check.py --geo "Islamabad"
 ```
 
-## Applying the Wappalyzer patches
+## Wappalyzer (tech-stack detection)
 
-Required after every fresh `pip install` (see `docs/KNOWN_LIMITATIONS.md` — this is a blocking condition, not optional):
+No post-install step needed — `wappalyzer` is vendored directly into `vendor/wappalyzer/` (a working, pre-patched copy) rather than pip-installed, so Stage 5 works immediately after `pip install -r requirements.txt`. See `docs/KNOWN_LIMITATIONS.md`'s RESOLVED entry for why this changed from a required patch step to a vendored dependency.
+
+`scripts/patch_wappalyzer.py` still exists, but only as the tool used to re-vendor a newer upstream release in the future — it is not something a developer needs to run after a normal install:
 
 ```powershell
 python scripts/patch_wappalyzer.py
 ```
 
-Idempotent — safe to run repeatedly. Prints `PATCHED`/`SKIP` per fix and ends with a verification pass (compile-tests all 1,270 technology fingerprints, confirms the config module loads).
+Idempotent — safe to run repeatedly. Prints `PATCHED`/`SKIP` per fix and ends with a verification pass (compile-tests all 1,270 technology fingerprints, confirms the config module loads). See `vendor/wappalyzer/README.md` for the full re-vendoring procedure.
 
 ## Clearing cache / state safely
 
@@ -53,6 +55,16 @@ Each flag is prefixed `[field]`, `[identity]`, or `[review]` (see `docs/ARCHITEC
 | `"Premium scraper failed 2 consecutive time(s) for <domain> — opening circuit breaker"` | Expected behavior, not an error — stops retrying a domain that's reliably failing, switches to native-fetch-only for its remaining pages. | No action needed. |
 | `UnicodeEncodeError: 'charmap' codec can't encode character ...` | Windows console defaults to cp1252; LLM-generated text (em-dashes, smart quotes) can't print. Already fixed in `main.py` (stdout/stderr reconfigured to UTF-8 at startup) — should not occur when running via `main.py`. If it appears in a script you wrote yourself, add `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` near the top. | Fixed in the supported entry point; only relevant if writing new ad-hoc scripts. |
 | Any `google_maps`/`reddit` review file with `"reason": "... request failed ..."` and no `matched` | A transient failure was correctly **not** cached (see `docs/ARCHITECTURE.md` Stage 2/7 resilience notes) — the next run will retry automatically. | No action needed; re-run to retry. |
+
+## Logging & observability
+
+Current, honest state — not a target design:
+
+- Standard library `logging`, one named logger per module (e.g. `Phase1Engine`, `ai_bdm.main`, `ai_bdm.llm_planner`), `StreamHandler` to stdout/stderr, level `INFO` by default. Format is `%(asctime)s [%(levelname)s] %(message)s` — timestamp, level, and message; the module name is only implicit in which logger emitted it, not a separate structured field.
+- **Gap vs. a production-service expectation**: there is no job/correlation ID, no per-stage/duration field, and no structured (JSON) log output today — every log line is free-text, not machine-parseable. A Laravel-facing service wrapper would need to inject its own correlation ID (e.g. via `logging.LoggerAdapter` or a `contextvars`-based filter) rather than assume one already exists here.
+- **Retry/backoff, documented per stage in `docs/ARCHITECTURE.md`**: LLM calls (`LLM_planner.call_llm`) retry the primary model up to its configured limit, then fall back to `qwen/qwen3.6-27b`; the premium (ScrapingBee) fetch tier opens a per-domain circuit breaker after 2 consecutive failures rather than retrying indefinitely; Google Maps/review-provider request failures are distinguished from genuine empty results and are never cached as false negatives (see `docs/DATA_CONTRACTS.md`'s cache-correctness table).
+- **Secrets**: no code path logs a raw API key, bearer token, or `.env` value — provider clients receive credentials directly from `os.environ`/`python-dotenv`, never through a logged string. Not independently audited line-by-line; this reflects the pattern used throughout, not a guarantee.
+- **Tracing/error reporting**: none is integrated (no Sentry/OpenTelemetry/etc.) — there is nothing to disable in local development because nothing external-facing is enabled by default.
 
 ## Windows-specific notes
 

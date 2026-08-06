@@ -147,6 +147,21 @@ If `needs_clarification` is true, `phase1_pipeline.run_pipeline()` returns immed
 
 ---
 
+## Scraping declaration
+
+Every external site/source family this pipeline collects from, honestly stated:
+
+| Source | Collection method | Auth | Rate limit / concurrency | robots.txt / TOS | On block/failure |
+|---|---|---|---|---|---|
+| Target business websites (arbitrary domains found via Serper) | Direct HTTP fetch (native `requests`-style fetch first; `ScrapingBee` premium tier — JS-render + anti-bot — escalates on failure) | ScrapingBee API key (`.env` `zenrows`) for the premium tier only; no auth for native fetch | `PREMIUM_MAX_CONCURRENCY = 2` concurrent proxied calls (`phase1_pipeline.py`); overall scrape worker pool is `--concurrency` (CLI flag, default 5–10) | `robots.txt` is fetched **only** to discover `Sitemap:` locations for contact-page discovery — **disallow rules are not parsed or enforced**; this is a real, current gap, not a design decision to respect/ignore robots.txt deliberately. No general TOS-compliance check exists per target site (arbitrary small-business sites, not a single named platform with fixed terms). | Per-domain circuit breaker opens the premium tier after 2 consecutive failures for that domain, falling back to native-fetch-only for its remaining pages rather than retrying indefinitely (see `docs/RUNBOOK.md`'s known-failure-modes table). |
+| Google Search / Google Maps / Places | Serper.dev API (third-party paid API, not direct scraping of Google) | Serper API key | Governed by the Serper.dev plan's own quota; not separately throttled by this codebase | Serper's own TOS governs this access, not a scrape of Google directly | A failed request is never cached as a genuine empty result (see `docs/DATA_CONTRACTS.md`'s cache-correctness table) — retried on the next run. |
+| Google Maps reviews, Reddit mentions | Apify actors (`trudax`-family and similar; third-party managed scraping infrastructure, not this codebase's own fetch logic) | Apify API token | Governed by the Apify actor's own run configuration/quota | Delegated to Apify's own compliance posture for each actor | Silently returns nothing (not an error) without an Apify token configured — see `docs/KNOWN_LIMITATIONS.md`. |
+| Yelp, Trustpilot | Attempted via the same native/ScrapingBee fetch path as target websites | None (public pages) | Same as target-website row | Bot-protection defeats even the premium fetch tier | Unresolved — see `docs/KNOWN_LIMITATIONS.md`; a production fix would need Yelp's official paid Places API, evaluated for cost but not implemented. |
+| Dockwa (and similar JS-rendered review widgets) | Same fetch path as target websites | None | Same as target-website row | Review text is populated client-side; the scraper only sees the pre-render HTML shell | Unresolved — see `docs/KNOWN_LIMITATIONS.md`. |
+| GitHub / YouTube (social-presence enrichment) | Official REST APIs | GitHub token / YouTube Data API key (optional) | Governed by each API's own published quota | Official API TOS | Degrades to "not found" without credentials configured. |
+
+Proxy requirements: none beyond ScrapingBee's own proxying for the premium fetch tier (no separate proxy pool is configured or required by this codebase directly).
+
 ## Cross-cutting: what requires an LLM vs. what doesn't
 
 | Requires LLM | Does not require LLM |

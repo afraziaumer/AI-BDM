@@ -88,6 +88,8 @@ Expected: all offline tests pass, no network calls, no API keys required. `pytes
 | `tests/mocked/` | Review-escalation logic, transient-failure-vs-genuine-empty caching, Google Maps matching hierarchy — real logic, provider HTTP calls replaced with fakes | No (mocked) |
 | `tests/integration/` | Real credential/quota validity for Groq, ScrapingBee, Apify, Serper | **Yes — run explicitly** |
 
+No lint (`ruff`/`black`) or type-check (`mypy`/`pyright`) tooling is configured in this repository — stated explicitly rather than left to silent absence.
+
 To run the live provider checks (only when you actually want to spend real quota verifying credentials — the Serper check costs 1 real search credit, the others are free account-info lookups):
 ```powershell
 pytest -m live tests/integration
