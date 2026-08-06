@@ -2,7 +2,7 @@ import aiohttp
 import asyncio
 import json
 import logging
-import pkg_resources
+import os
 import re
 import requests
 import warnings
@@ -163,10 +163,12 @@ class Wappalyzer:
         technologies_file, or alternatively the default in data/technologies.json
         """
         if technologies_file:
-            with open(technologies_file, 'r') as fd:
+            with open(technologies_file, 'r', encoding='utf-8') as fd:
                 obj = json.load(fd)
         else:
-            obj = json.loads(pkg_resources.resource_string(__name__, "data/technologies.json"))
+            default_path = os.path.join(os.path.dirname(__file__), "data", "technologies.json")
+            with open(default_path, 'r', encoding='utf-8') as fd:
+                obj = json.load(fd)
 
         return cls(categories=obj['categories'], technologies=obj['technologies'])
 
