@@ -78,7 +78,40 @@ def test_job_completes_successfully(monkeypatch):
     assert len(result.prospects) == 1
     assert result.prospects[0].source_identity.domain == "a.com"
     assert result.prospects[0].score.value == 85
+    assert result.prospects[0].score.state is None  # a real value needs no state explanation
     assert result.pipeline_version.startswith("git:")
+
+
+def test_score_state_not_attempted_when_classification_missing(monkeypatch):
+    """A qualified prospect whose results row has no classification score
+    (e.g. the cached-reuse path skipped fresh scoring) gets an explicit
+    NOT_ATTEMPTED state, not a bare null with no explanation."""
+    async def fake_run_pipeline(query, limit=None, progress_cb=None, cancel_check=None):
+        return _success_summary(
+            results=[{"website_url": "https://a.com", "classification": {}}],
+        )
+
+    monkeypatch.setattr(job_runner.phase1_pipeline, "run_pipeline", fake_run_pipeline)
+
+    result = asyncio.run(_run_and_await("job_score_gap_1", _request("job_score_gap_1")))
+
+    assert result.prospects[0].score.value is None
+    assert result.prospects[0].score.state == jc.DataState.NOT_ATTEMPTED
+
+
+def test_score_state_unknown_when_no_matching_results_row(monkeypatch):
+    """A qualified prospect with no corresponding row in summary["results"]
+    at all is a genuine data-consistency surprise -- UNKNOWN, not
+    NOT_ATTEMPTED (which implies we know scoring simply didn't run)."""
+    async def fake_run_pipeline(query, limit=None, progress_cb=None, cancel_check=None):
+        return _success_summary(results=[])  # qualified references a.com, but no results row for it
+
+    monkeypatch.setattr(job_runner.phase1_pipeline, "run_pipeline", fake_run_pipeline)
+
+    result = asyncio.run(_run_and_await("job_score_gap_2", _request("job_score_gap_2")))
+
+    assert result.prospects[0].score.value is None
+    assert result.prospects[0].score.state == jc.DataState.UNKNOWN
 
 
 def test_job_reports_progress_before_completing(monkeypatch):
@@ -229,3 +262,55 @@ def test_features_maps_true_produces_warning_in_final_result(monkeypatch):
     result = asyncio.run(_run_and_await("job_maps_warn_1", req))
 
     assert any("features.maps=true" in w for w in result.warnings)
+
+
+def test_resume_job_reuses_original_target_and_marks_lineage(monkeypatch):
+    async def fake_run_pipeline(query, limit=None, progress_cb=None, cancel_check=None):
+        return _success_summary()
+
+    monkeypatch.setattr(job_runner.phase1_pipeline, "run_pipeline", fake_run_pipeline)
+
+    async def scenario():
+        original_req = _request(
+            "job_resume_orig_1",
+            target=jc.Target(industry="dental clinics", locations=[jc.Location(country="PK", city="Lahore")]),
+        )
+        job_runner.submit_job(original_req)
+        await job_runner._JOBS["job_resume_orig_1"].task
+
+        job_runner.resume_job("job_resume_orig_1", "job_resume_new_1", "cor_resume_new")
+        await job_runner._JOBS["job_resume_new_1"].task
+        return job_runner.get_result("job_resume_new_1")
+
+    result = asyncio.run(scenario())
+    assert result.resumed_from == "job_resume_orig_1"
+    new_record = job_runner._JOBS["job_resume_new_1"]
+    assert new_record.request.target.industry == "dental clinics"
+    assert new_record.request.target.locations[0].city == "Lahore"
+    assert new_record.request.tenant_ref == "org_1"  # inherited, not respecified
+
+
+def test_resume_unknown_original_raises_not_found():
+    with pytest.raises(job_runner.JobNotFoundError):
+        job_runner.resume_job("no_such_original", "job_new", "cor_new")
+
+
+def test_resume_duplicate_new_job_id_raises():
+    async def scenario():
+        req = _request("job_resume_dup_orig")
+
+        async def fake_run_pipeline(query, limit=None, progress_cb=None, cancel_check=None):
+            return _success_summary()
+
+        job_runner.phase1_pipeline.run_pipeline = fake_run_pipeline
+        job_runner.submit_job(req)
+        await job_runner._JOBS["job_resume_dup_orig"].task
+
+        # A job already exists under the name we're about to reuse as the "new" id.
+        job_runner.submit_job(_request("job_resume_dup_taken"))
+        await job_runner._JOBS["job_resume_dup_taken"].task
+
+        with pytest.raises(job_runner.DuplicateJobError):
+            job_runner.resume_job("job_resume_dup_orig", "job_resume_dup_taken", "cor_x")
+
+    asyncio.run(scenario())

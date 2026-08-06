@@ -55,6 +55,18 @@
       "title": "Company",
       "type": "object"
     },
+    "DataState": {
+      "description": "Section 5's \"Null/absence\" convention: 'Distinguish absent, unknown,\nnot_attempted, not_applicable and provider_failure. Do not collapse\nthem into empty strings.' Only meaningful when the field it describes\n(e.g. Score.value) is None -- a populated value needs no state.",
+      "enum": [
+        "absent",
+        "unknown",
+        "not_attempted",
+        "not_applicable",
+        "provider_failure"
+      ],
+      "title": "DataState",
+      "type": "string"
+    },
     "ErrorClass": {
       "enum": [
         "validation",
@@ -184,6 +196,17 @@
         "model_version": {
           "title": "Model Version",
           "type": "string"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DataState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -279,6 +302,18 @@
       },
       "title": "Warnings",
       "type": "array"
+    },
+    "resumed_from": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Resumed From"
     }
   },
   "required": [

@@ -33,6 +33,7 @@ import relevance_scoring
 from job_contracts import (
     ArtifactManifestEntry,
     Company,
+    DataState,
     ErrorEnvelope,
     JobRequest,
     JobResult,
@@ -77,6 +78,7 @@ class _JobRecord:
     cancel_requested: bool = False
     result: Optional[JobResult] = None
     task: Optional["asyncio.Task"] = None
+    resumed_from: Optional[str] = None
 
 
 _JOBS: Dict[str, _JobRecord] = {}
@@ -99,16 +101,61 @@ def _pipeline_version() -> str:
 _PIPELINE_VERSION = _pipeline_version()
 
 
-def submit_job(req: JobRequest) -> None:
+def submit_job(req: JobRequest, resumed_from: Optional[str] = None) -> None:
     """Register and start a job. Raises DuplicateJobError if `req.job_id`
     was already submitted -- job_id is the caller's (Laravel's) idempotency
     boundary; silently accepting a duplicate would let a retried job
-    submission spin up a second, redundant pipeline run."""
+    submission spin up a second, redundant pipeline run.
+
+    `resumed_from` is set internally by resume_job() -- not a normal
+    caller-facing parameter, just how it threads the lineage through to
+    the eventual JobResult without a second code path."""
     if req.job_id in _JOBS:
         raise DuplicateJobError(f"job_id {req.job_id!r} already submitted.")
-    record = _JobRecord(request=req)
+    record = _JobRecord(request=req, resumed_from=resumed_from)
     _JOBS[req.job_id] = record
     record.task = asyncio.create_task(_execute(req.job_id))
+
+
+def resume_job(
+    original_job_id: str,
+    new_job_id: str,
+    new_correlation_id: str,
+    tenant_ref: Optional[str] = None,
+) -> None:
+    """Submit a NEW job (`new_job_id`) reusing `original_job_id`'s target/
+    limits/features -- the resume mechanism for Section 4.5's "Checkpoint"
+    requirement ("persist enough state to resume expensive work OR
+    clearly document which stages restart").
+
+    This deliberately does NOT replay progress from where the original
+    job stopped -- it re-runs run_pipeline() from the start with the same
+    translated query. What makes this a genuine resume rather than a
+    plain re-run: any business the original job (or any prior job/CLI run
+    against the same query) already committed to storage/<domain>/ is
+    skipped for free by the pipeline's own existing per-business cache
+    (see docs/DATA_CONTRACTS.md's re-run/idempotency section) -- so a job
+    that crashed after committing 40 of 50 requested businesses resumes
+    by only attempting the remaining ~10, not all 50 again. This is
+    coarse-grained (whole-business, not mid-scrape) resume, stated
+    honestly as such rather than oversold as a fine-grained checkpoint.
+
+    Raises JobNotFoundError if `original_job_id` was never submitted (or
+    the process restarted since -- see this module's docstring), and
+    DuplicateJobError if `new_job_id` is already in use, same as
+    submit_job().
+    """
+    original = _require(original_job_id)
+    new_request = JobRequest(
+        job_id=new_job_id,
+        tenant_ref=tenant_ref or original.request.tenant_ref,
+        correlation_id=new_correlation_id,
+        requested_at=utc_now(),
+        target=original.request.target,
+        limits=original.request.limits,
+        features=original.request.features,
+    )
+    submit_job(new_request, resumed_from=original_job_id)
 
 
 def get_status(job_id: str) -> Dict[str, object]:
@@ -202,10 +249,12 @@ async def _execute(job_id: str) -> None:
             completed_at=utc_now(),
             errors=[classify_error(str(exc), req.correlation_id, exc)],
             warnings=translation_warnings,
+            resumed_from=record.resumed_from,
         )
     else:
         record.result = _build_result(
-            job_id, req, summary, translation_warnings, record.started_at
+            job_id, req, summary, translation_warnings, record.started_at,
+            resumed_from=record.resumed_from,
         )
         record.status = record.result.status
     finally:
@@ -220,6 +269,7 @@ def _build_result(
     summary: Dict[str, object],
     translation_warnings: List[str],
     started_at: datetime,
+    resumed_from: Optional[str] = None,
 ) -> JobResult:
     correlation_id = req.correlation_id
     warnings: List[str] = list(translation_warnings)
@@ -251,18 +301,38 @@ def _build_result(
     for q in summary.get("qualified") or []:
         website_url = q.get("website_url") or ""
         domain = domain_utils.domain_key(website_url) if website_url else ""
-        source_row = results_by_website.get(website_url) or {}
-        classification = source_row.get("classification") or {}
+        source_row = results_by_website.get(website_url)
+        classification = (source_row or {}).get("classification") or {}
         raw_score = classification.get("score")
-        try:
-            score_value: Optional[int] = int(raw_score) if raw_score not in (None, "") else None
-        except (TypeError, ValueError):
-            score_value = None
+
+        # Section 5's null/absence convention: WHY a value is missing is
+        # part of the contract, not just that it's missing.
+        score_value: Optional[int] = None
+        score_state: Optional[DataState] = None
+        if source_row is None:
+            # A qualified prospect with no matching row in summary["results"]
+            # is a genuine data-consistency surprise, not an expected gap.
+            score_state = DataState.UNKNOWN
+        elif not classification or raw_score in (None, ""):
+            # relevance_scoring never attached a score for this candidate
+            # (e.g. the cached-reuse path, or scoring disabled for this run).
+            score_state = DataState.NOT_ATTEMPTED
+        else:
+            try:
+                score_value = int(raw_score)
+            except (TypeError, ValueError):
+                # Got a value, couldn't interpret it -- distinct from never
+                # having tried at all.
+                score_state = DataState.UNKNOWN
 
         prospects.append(Prospect(
             source_identity=SourceIdentity(domain=domain),
             company=Company(name=q.get("company_name") or domain or "Unknown", website=website_url or None),
-            score=Score(value=score_value, model_version=f"relevance_scoring-v{relevance_scoring.SCORING_VERSION}"),
+            score=Score(
+                value=score_value,
+                model_version=f"relevance_scoring-v{relevance_scoring.SCORING_VERSION}",
+                state=score_state,
+            ),
             evidence_refs=[f"artifact://storage/{domain}/"] if domain else [],
         ))
 
@@ -292,4 +362,5 @@ def _build_result(
         artifact_manifest=artifact_manifest,
         errors=errors,
         warnings=warnings,
+        resumed_from=resumed_from,
     )

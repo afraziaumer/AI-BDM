@@ -17,8 +17,8 @@ The job store is **in-process** (a plain Python dict in `job_runner.py`), not Re
 | 4.4 Result | `job_contracts.py` (`JobResult`, `Prospect`, `ArtifactManifestEntry`) | The versioned result shape |
 | 4.5 Progress/cancellation | `phase1_pipeline.run_pipeline()`'s optional `progress_cb`/`cancel_check` params + `job_runner.py`'s heartbeat loop | Hooks into the existing discovery round-loop; a heartbeat task ticks independently every 15s |
 | 4.6 Errors | `job_contracts.py` (`ErrorEnvelope`, `ErrorClass`, `classify_error()`) | Maps known failure signals (the same ones `docs/RUNBOOK.md`'s "Known failure modes" table already documents) onto the 8-class taxonomy |
-| Execution | `job_runner.py` | In-process job store: `submit_job()`/`get_status()`/`cancel_job()`/`get_result()`, background `asyncio` task per job |
-| HTTP surface | `api.py`, `/api/v1/jobs/*` | `POST /jobs`, `GET /jobs/{job_id}`, `GET /jobs/{job_id}/result`, `POST /jobs/{job_id}/cancel` |
+| Execution | `job_runner.py` | In-process job store: `submit_job()`/`get_status()`/`cancel_job()`/`get_result()`/`resume_job()`, background `asyncio` task per job |
+| HTTP surface | `api.py`, `/api/v1/jobs/*` | `POST /jobs`, `GET /jobs/{job_id}`, `GET /jobs/{job_id}/result`, `POST /jobs/{job_id}/cancel`, `POST /jobs/{job_id}/resume` |
 
 ## Request → query translation, honestly
 
@@ -50,14 +50,29 @@ The heartbeat is a **separate** `asyncio` task ticking `last_heartbeat_at` every
 | `failed` | Moderation blocked the query, or the intent/planning stage failed |
 | `cancelled` | `cancel_check()` returned true before the run finished |
 
+## Idempotency-Key (POST /api/v1/pipeline/run)
+
+`POST /api/v1/jobs` already had an idempotency key of its own — `job_id` (a duplicate submission is rejected with 409). The synchronous `POST /api/v1/pipeline/run` endpoint had none at all: a client retry (e.g. after a client-side timeout, with the server call having actually succeeded) would silently trigger a full second pipeline run. An optional `Idempotency-Key` header now closes that gap — a repeated call with the same key replays the exact prior outcome (same status code, same body, success **or** error) instead of re-executing. Implemented as an in-process dict in `api.py` (`_idempotency_store`), same honest limitation as the job store: **no TTL, no eviction, grows for the life of the process.**
+
+## Resume (POST /api/v1/jobs/{job_id}/resume)
+
+Section 4.5's "Checkpoint" requirement accepts either "persist enough state to resume expensive work" **or** "clearly document which stages restart" — this implements the second, honestly, rather than faking the first.
+
+`resume_job()` submits a **new** job (new `job_id`, supplied by the caller — Python never invents its own IDs) reusing the original job's `target`/`limits`/`features`. It does **not** replay progress from where the original stopped; it re-runs `run_pipeline()` from the beginning with the same translated query. What makes this a genuine resume rather than a plain re-run: any business the original job (or any prior job/CLI run against the same query) already committed to `storage/<domain>/` is skipped for free by the pipeline's own existing per-business cache (`docs/DATA_CONTRACTS.md`'s re-run/idempotency section) — a job that crashed after committing 40 of 50 requested businesses resumes by attempting only the remaining ~10, not all 50 again. This is coarse-grained (whole-business, not mid-scrape) resume — stated as such, not oversold as a fine-grained serialized checkpoint. The result's `resumed_from` field records the original `job_id` for lineage.
+
+## Null/absence: the 5-way DataState distinction
+
+Section 5's convention: *"Distinguish absent, unknown, not_attempted, not_applicable and provider_failure. Do not collapse them into empty strings."* `Prospect.score` carries an optional `state: DataState` field, populated only when `value` is `None`:
+- `not_attempted` — `relevance_scoring` never produced a score for this candidate (e.g. the cached-reuse path)
+- `unknown` — a genuine data-consistency surprise (no matching row, or an unparseable value) rather than an expected gap
+- (`absent`/`not_applicable`/`provider_failure` are defined on the enum for other fields this codebase might extend to later — `Score` currently only produces the two states above, since those are the two real gaps `job_runner._build_result()` can actually distinguish today)
+
 ## What's still not built
 
-- **No durable job store.** A process restart loses all in-flight and completed-but-unpolled job state. Acceptable for this handoff pass, not for production without a real backing store.
-- **No idempotency beyond job_id uniqueness.** Resubmitting the same `job_id` is rejected (409), but there's no broader `Idempotency-Key` mechanism per the guide's Section 5.
-- **No checkpoint/resume.** A crashed job can't resume from where it left off — it would need to be resubmitted (with a new `job_id`) and would re-run from the start (though already-committed `storage/<domain>/` businesses are still skipped via the pipeline's own existing cache — see `docs/DATA_CONTRACTS.md`).
+- **No durable job store.** A process restart loses all in-flight and completed-but-unpolled job state. Acceptable for this handoff pass, not for production without a real backing store. The same is true of the Idempotency-Key store above.
 - **No content hashing.** `ArtifactManifestEntry.sha256` is always `null` — no artifact in this codebase is hashed anywhere (see `ARTIFACTS_AND_STORAGE.md`).
-- **Stages 3–8 are out of scope entirely**, as stated above — this is the single biggest gap between what's built here and full coverage of the guide's intent.
+- **Stages 3–8 are out of scope entirely**, as stated above — this is the single biggest gap between what's built here and full coverage of the guide's intent. Resume, idempotency, and DataState all apply only within that same Stage 1–2 scope.
 
 ## Verification
 
-Manually exercised end-to-end (submit → poll progress → complete; submit → cancel mid-run; duplicate `job_id` rejection; unknown `job_id` → 404) using a faked `run_pipeline()` and a real `httpx.AsyncClient` against the FastAPI app (not `TestClient` — its threaded event-loop portal produces misleading timing for background `asyncio.create_task()` work; a real single-event-loop async client matches actual `uvicorn` behavior). See `tests/mocked/test_job_lifecycle.py` for the same scenarios as an automated, repeatable test.
+Manually exercised end-to-end (submit → poll progress → complete; submit → cancel mid-run; duplicate `job_id` rejection; unknown `job_id` → 404; resume; Idempotency-Key replay for both success and error outcomes) using faked pipeline functions and a real `httpx.AsyncClient` against the FastAPI app (not `TestClient` — its threaded event-loop portal produces misleading timing for background `asyncio.create_task()` work; a real single-event-loop async client matches actual `uvicorn` behavior). See `tests/mocked/test_job_lifecycle.py` (job_runner internals) and `tests/mocked/test_api_jobs.py` (the actual HTTP endpoints) for the same scenarios as automated, repeatable tests.

@@ -10,18 +10,16 @@ The Laravel Backend Construction Handoff Guide's header states `LLM STATUS: Not 
 
 ## The job contract (Section 4.3–4.6) — implemented, with real remaining gaps
 
-Built: `job_contracts.py` (versioned `JobRequest`/`ProgressEvent`/`JobResult`/`ErrorEnvelope`, an 8-class error taxonomy with `classify_error()`), `job_translation.py` (structured request → the natural-language query the planner actually needs, with explicit warnings for fields that can't be honestly honored), `job_runner.py` (in-process job store, async execution, heartbeat), and `POST/GET /api/v1/jobs*` in `api.py`. Full design and status-mapping detail in `JOB_EXECUTION.md`.
+Built: `job_contracts.py` (versioned `JobRequest`/`ProgressEvent`/`JobResult`/`ErrorEnvelope`, an 8-class error taxonomy with `classify_error()`, a 5-way `DataState` null/absence distinction on `Score`), `job_translation.py` (structured request → the natural-language query the planner actually needs, with explicit warnings for fields that can't be honestly honored), `job_runner.py` (in-process job store, async execution, heartbeat, `resume_job()`), an in-process `Idempotency-Key` cache for `POST /api/v1/pipeline/run`, and `POST/GET /api/v1/jobs*` (including `/resume`) in `api.py`. Full design and status-mapping detail in `JOB_EXECUTION.md`.
 
 **What's still genuinely missing, not silently papered over:**
 
-- **Job store is in-process, not durable.** A process restart loses all job state — no Redis/Celery/database backing exists.
-- **Stages 3–8 are out of this job runner's scope entirely.** It wraps `run_pipeline()` only (Stages 1–2) — the same scope the pre-existing `POST /api/v1/pipeline/run` already had. `features.maps`/`features.tech_stack` in a request produce a warning, not real Maps/tech-stack data.
-- **No checkpoint/resume.** A crashed job can't resume — it would need a fresh `job_id` and would restart (though the pipeline's own existing per-business cache still avoids re-scraping already-committed domains).
+- **Job store is in-process, not durable.** A process restart loses all job state — no Redis/Celery/database backing exists. The `Idempotency-Key` cache has the same limitation (no TTL/eviction either).
+- **Stages 3–8 are out of this job runner's scope entirely.** It wraps `run_pipeline()` only (Stages 1–2) — the same scope the pre-existing `POST /api/v1/pipeline/run` already had. `features.maps`/`features.tech_stack` in a request produce a warning, not real Maps/tech-stack data. Resume, idempotency, and `DataState` all apply only within this same scope.
+- **Resume is coarse-grained, not a serialized checkpoint.** `POST /api/v1/jobs/{job_id}/resume` re-runs from the start with the same target/limits/features under a new `job_id` — it relies on the pipeline's own existing per-business commit cache to skip already-done work, not a saved mid-run state. Satisfies Section 4.5's "clearly document which stages restart" alternative, not "persist enough state to resume."
 - **No content hashing (SHA-256)** for any artifact — `ArtifactManifestEntry.sha256` is always `null` (see `ARTIFACTS_AND_STORAGE.md`).
-- **No idempotency beyond job_id uniqueness** — resubmitting the same `job_id` is rejected (409), but there's no broader `Idempotency-Key` mechanism.
 - **Progress checkpoints are per discovery-round, not per-candidate** — a deliberate choice to avoid destabilizing the existing multi-round/query-variation discovery loop; see `JOB_EXECUTION.md` for why.
-
-~~`api.py` has no `/v1` prefix and no cursor pagination on `GET /leads`~~ — fixed: all routes now live under `/api/v1`, and `GET /api/v1/leads` returns `{items, next_cursor}` with an opaque base64 cursor instead of a plain `limit`-only listing. See `docs/INTEGRATION_NOTES.md` for the updated curl examples.
+- **`DataState` is only wired up for `Score`.** The enum has 5 values; `job_runner._build_result()` currently only ever produces 2 of them (`not_attempted`, `unknown`) because those are the only two gaps it can actually distinguish today — `absent`/`not_applicable`/`provider_failure` are defined but not yet produced anywhere.
 
 ## Patched / vendored packages
 

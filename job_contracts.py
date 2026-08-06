@@ -119,9 +119,22 @@ class Company(BaseModel):
     website: Optional[str] = None
 
 
+class DataState(str, Enum):
+    """Section 5's "Null/absence" convention: 'Distinguish absent, unknown,
+    not_attempted, not_applicable and provider_failure. Do not collapse
+    them into empty strings.' Only meaningful when the field it describes
+    (e.g. Score.value) is None -- a populated value needs no state."""
+    ABSENT = "absent"                    # genuinely checked, confirmed not present
+    UNKNOWN = "unknown"                  # an unexpected/unrecognized gap -- not one of the other 4
+    NOT_ATTEMPTED = "not_attempted"      # this run never tried to compute it
+    NOT_APPLICABLE = "not_applicable"    # doesn't apply to this prospect at all
+    PROVIDER_FAILURE = "provider_failure"  # a provider call failed while trying to get it
+
+
 class Score(BaseModel):
     value: Optional[int] = None
     model_version: str
+    state: Optional[DataState] = None
 
 
 class Prospect(BaseModel):
@@ -175,6 +188,7 @@ class JobResult(BaseModel):
     artifact_manifest: List[ArtifactManifestEntry] = Field(default_factory=list)
     errors: List[ErrorEnvelope] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+    resumed_from: Optional[str] = None
 
 
 # ===========================================================================

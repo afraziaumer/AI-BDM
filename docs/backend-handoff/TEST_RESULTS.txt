@@ -3,13 +3,14 @@ AI-BDM — Test Results
 
 Offline + mocked suite (`pytest -q`)
 -------------------------------------
-Commit:  690f939
+Commit:  PLACEHOLDER_COMMIT
 Date:    2026-08-06
 Command: pytest -q
-Result:  101 passed, 4 deselected, 2 warnings
+Result:  115 passed, 4 deselected, 2 warnings
 
 Deselected tests are the 4 live-provider tests in tests/integration/,
-excluded by default via pytest.ini's `addopts = -m "not live"`.
+excluded by default via pytest.ini's `addopts = -m "not live"`. Result
+verified stable across 3 consecutive runs (no flakiness).
 
 Suite breakdown:
   tests/smoke/       14 tests — core module imports, Stage 8 accuracy-check
@@ -20,11 +21,16 @@ Suite breakdown:
                      verification, job_translation.target_to_query(),
                      job_contracts.classify_error()'s error taxonomy.
   tests/mocked/      review-escalation logic, transient-failure-vs-genuine-
-                     empty caching, Google Maps matching hierarchy, and the
-                     full async job lifecycle (job_runner.py) — submit,
-                     progress, cancellation, duplicate/unknown job_id,
-                     unexpected-exception handling, status mapping — all
-                     with phase1_pipeline.run_pipeline replaced by a fake.
+                     empty caching, Google Maps matching hierarchy, the full
+                     async job lifecycle (job_runner.py -- submit, progress,
+                     cancellation, resume, duplicate/unknown job_id,
+                     unexpected-exception handling, status mapping,
+                     DataState on missing scores), and the actual HTTP job
+                     endpoints in api.py (test_api_jobs.py -- auth, the full
+                     submit/status/result/cancel/resume lifecycle over real
+                     HTTP, and Idempotency-Key replay for both success and
+                     error outcomes on POST /pipeline/run) -- all with
+                     phase1_pipeline.run_pipeline replaced by a fake.
   tests/contract/    9 tests — realistic request/progress/result/error
                      examples validate against job_contracts.py's Pydantic
                      models, plus a drift check that the committed
@@ -57,13 +63,14 @@ What this does NOT cover
   (RAG embedding/retrieval) have no dedicated unit/mocked test — see
   docs/backend-handoff/PIPELINE_STAGES.md for exactly what each stage's
   coverage is.
-- The job runner's tests replace phase1_pipeline.run_pipeline with a fake
-  -- they prove job_runner.py's own logic (job store, progress/cancel
-  wiring, result assembly, status mapping) is correct, not that the real
-  pipeline's progress_cb/cancel_check calls fire at exactly the right
-  moments end-to-end against a real query. That would require either a
-  live run or a much deeper mock of phase1_pipeline's internals; neither
-  exists yet.
-- No durable-job-store failure-mode test (e.g. "process restarts mid-job")
-  -- there's nothing to test, since no durable store exists (see
-  docs/backend-handoff/JOB_EXECUTION.md).
+- The job tests (both job_runner.py-direct and the real HTTP endpoints in
+  test_api_jobs.py) replace phase1_pipeline.run_pipeline with a fake --
+  they prove job_runner.py's and api.py's own logic (job store,
+  progress/cancel/resume wiring, result assembly, status mapping,
+  idempotency replay) is correct, not that the real pipeline's
+  progress_cb/cancel_check calls fire at exactly the right moments
+  end-to-end against a real query. That would require either a live run
+  or a much deeper mock of phase1_pipeline's internals; neither exists yet.
+- No durable-job-store or durable-idempotency-store failure-mode test
+  (e.g. "process restarts mid-job") -- there's nothing to test, since no
+  durable store exists for either (see docs/backend-handoff/JOB_EXECUTION.md).

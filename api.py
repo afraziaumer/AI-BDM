@@ -25,6 +25,9 @@ Endpoints:
   GET  /api/v1/jobs/{job_id}      - job status + progress (Section 4.5)
   GET  /api/v1/jobs/{job_id}/result - job result once terminal (Section 4.4)
   POST /api/v1/jobs/{job_id}/cancel - request cancellation (Section 4.5)
+  POST /api/v1/jobs/{job_id}/resume - submit a new job resuming this one's
+                                       target/limits/features (Section 4.5's
+                                       "Checkpoint" requirement)
 
 The /jobs/* routes and /pipeline/run are two INDEPENDENT ways to run the
 same underlying pipeline -- /pipeline/run blocks the HTTP request for the
@@ -41,7 +44,7 @@ import os
 import secrets
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response, Security
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Response, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -84,6 +87,17 @@ class PipelineRequest(BaseModel):
         ..., min_length=3, examples=["give me 50 marinas in Dubai with no crm"]
     )
     concurrency: int = Field(5, ge=1, le=20, description="Parallel scrape workers.")
+
+
+class ResumeRequest(BaseModel):
+    """Body for POST /api/v1/jobs/{job_id}/resume. The caller supplies a
+    NEW job_id (Laravel owns ID generation, same as job creation) --
+    Python never invents its own job identifiers."""
+    job_id: str = Field(..., min_length=1, description="New job_id for the resumed run.")
+    correlation_id: str = Field(..., min_length=1)
+    tenant_ref: Optional[str] = Field(
+        None, description="Defaults to the original job's tenant_ref if omitted."
+    )
 
 
 class LeadSummary(BaseModel):
@@ -131,6 +145,35 @@ def _decode_cursor(cursor: Optional[str]) -> int:
     if offset < 0:
         raise HTTPException(status_code=400, detail="Invalid cursor.")
     return offset
+
+
+# --- Idempotency (Laravel guide, Section 5: "Idempotency-Key for commands
+# that create jobs, approve, send, publish or perform provider actions") --
+# POST /api/v1/jobs already has an idempotency key of its own -- job_id
+# (a duplicate submission is rejected with 409, see job_runner.submit_job).
+# POST /api/v1/pipeline/run had NO such protection at all: a client retry
+# (e.g. after a client-side timeout, with the server call having actually
+# succeeded) would silently trigger a full second pipeline run. This store
+# closes that specific gap using the generic Idempotency-Key header the
+# guide names, replaying the exact prior outcome (status code + body) for
+# a repeated key instead of re-executing.
+#
+# Real, stated limitation: in-process, no TTL, no eviction -- grows for
+# the life of the process. Acceptable for this handoff pass; a production
+# deployment would want this backed by a real cache with expiry (e.g.
+# Redis), same caveat as job_runner.py's in-process job store.
+_idempotency_store: Dict[str, Dict[str, Any]] = {}
+
+
+def _idempotency_lookup(endpoint: str, key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not key:
+        return None
+    return _idempotency_store.get(f"{endpoint}:{key}")
+
+
+def _idempotency_remember(endpoint: str, key: Optional[str], status_code: int, body: Any) -> None:
+    if key:
+        _idempotency_store[f"{endpoint}:{key}"] = {"status_code": status_code, "body": body}
 
 
 def _read_leads(
@@ -184,13 +227,27 @@ def health() -> Dict[str, str]:
 
 
 @router.post("/pipeline/run", tags=["pipeline"], dependencies=[Depends(require_api_key)])
-async def run_pipeline_endpoint(req: PipelineRequest) -> Dict[str, Any]:
+async def run_pipeline_endpoint(
+    req: PipelineRequest,
+    response: Response,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+) -> Dict[str, Any]:
     """Run the full Phase 1 pipeline and return the structured summary.
 
     The summary mirrors the CLI output: the resolved plan, how many places
     were discovered, and per-lead statuses (scraped / cache_hit / failed /
     no_website). Page text is not returned here — fetch it from /leads.
+
+    An `Idempotency-Key` header is optional but recommended for any caller
+    that might retry (e.g. after a client-side timeout) -- a repeated call
+    with the same key replays the original outcome (success or error, same
+    status code) instead of running the whole pipeline a second time.
     """
+    cached = _idempotency_lookup("pipeline_run", idempotency_key)
+    if cached is not None:
+        response.status_code = cached["status_code"]
+        return cached["body"]
+
     summary = await pipeline.run_pipeline(
         req.query, concurrency=req.concurrency
     )
@@ -200,13 +257,14 @@ async def run_pipeline_endpoint(req: PipelineRequest) -> Dict[str, Any]:
         # (not 502) is the correct status. Detail is deliberately short and
         # generic -- the specific category/reason stays in the server log
         # (see moderate_user_query), not handed back to the caller.
-        raise HTTPException(
-            status_code=400,
-            detail="This request violates our usage policy and was not processed.",
-        )
+        detail = "This request violates our usage policy and was not processed."
+        _idempotency_remember("pipeline_run", idempotency_key, 400, {"detail": detail})
+        raise HTTPException(status_code=400, detail=detail)
     if summary.get("error"):
         # Intent/LLM stage failed (e.g. provider down) -> surface as 502.
+        _idempotency_remember("pipeline_run", idempotency_key, 502, {"detail": summary["error"]})
         raise HTTPException(status_code=502, detail=summary["error"])
+    _idempotency_remember("pipeline_run", idempotency_key, 200, summary)
     return summary
 
 
@@ -301,6 +359,27 @@ async def cancel_job(job_id: str) -> Dict[str, Any]:
     except job_runner.JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}") from exc
     return {"job_id": job_id, "cancelled": cancelled}
+
+
+@router.post("/jobs/{job_id}/resume", status_code=202, tags=["jobs"], dependencies=[Depends(require_api_key)])
+async def resume_job(job_id: str, req: ResumeRequest) -> Dict[str, Any]:
+    """Resume a previously failed/cancelled/partially-completed job as a
+    NEW job (`req.job_id`), reusing the original's target/limits/features.
+
+    This re-runs from the start, not from a serialized mid-run checkpoint
+    -- businesses the original job already committed are skipped for free
+    by the pipeline's own existing per-business cache, which is what makes
+    this a genuine (if coarse-grained) resume rather than a plain re-run.
+    See docs/backend-handoff/JOB_EXECUTION.md for exactly what this does
+    and doesn't guarantee.
+    """
+    try:
+        job_runner.resume_job(job_id, req.job_id, req.correlation_id, tenant_ref=req.tenant_ref)
+    except job_runner.JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}") from exc
+    except job_runner.DuplicateJobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return job_runner.get_status(req.job_id)
 
 
 app.include_router(router)
