@@ -4,10 +4,10 @@ This documents the current, real integration boundary — not a target design. W
 
 ## Current state, honestly
 
-**An API already exists (`api.py`), but it's partial.** It's a FastAPI wrapper exposing only:
-- `POST /pipeline/run` → runs Stage 1 (planning) + Stage 2 (discovery/scraping) and returns `phase1_pipeline.run_pipeline()`'s structured summary dict directly.
-- `GET /leads` / `GET /leads/count` → read-only access to whatever is currently persisted in `crawl_index.csv`.
-- `GET /health` → liveness probe, also reports which provider keys are configured.
+**An API already exists (`api.py`), but it's partial.** It's a FastAPI wrapper, versioned under `/api/v1` (Laravel guide, Section 5), exposing only:
+- `POST /api/v1/pipeline/run` → runs Stage 1 (planning) + Stage 2 (discovery/scraping) and returns `phase1_pipeline.run_pipeline()`'s structured summary dict directly.
+- `GET /api/v1/leads` → cursor-paginated (`items` + opaque `next_cursor`) read-only access to whatever is currently persisted in `crawl_index.csv`. `GET /api/v1/leads/count` returns the total.
+- `GET /api/v1/health` → liveness probe, also reports which provider keys are configured.
 
 **Stages 3–8 (routing, final reasoning, tech-stack detection, evidence retrieval, Maps enrichment, accuracy audit) are not exposed by this API today.** They only run as part of `main.py`'s `run()` function, which is a **print-based CLI orchestrator with no structured return value** (`async def run(...) -> None`) — it writes results to files (`leads_clean.csv`, `leads_with_maps.csv`, `accuracy_report.txt`) and prints progress to stdout, but does not currently return a JSON-serializable result object the way `api.py`'s Stage 1–2 endpoint does.
 
@@ -63,10 +63,17 @@ python -m uvicorn api:app --reload --port 8000
 ```
 
 ```bash
-curl -X POST http://127.0.0.1:8000/pipeline/run \
+curl -X POST http://127.0.0.1:8000/api/v1/pipeline/run \
   -H "X-API-Key: $AIBDM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query": "find 3 dental clinics in Islamabad", "concurrency": 5}'
 ```
 
 Returns `phase1_pipeline.run_pipeline()`'s summary dict directly (Stages 1–2 only — see the gap above for what's missing).
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/leads?limit=50" -H "X-API-Key: $AIBDM_API_KEY"
+# {"items": [...], "next_cursor": "NTA="}
+curl "http://127.0.0.1:8000/api/v1/leads?limit=50&cursor=NTA=" -H "X-API-Key: $AIBDM_API_KEY"
+# next page; next_cursor is null once there are no more rows
+```

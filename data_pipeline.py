@@ -43,7 +43,7 @@ import re
 import sys
 import textwrap
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from time_utils import utc_now_iso
 from typing import Any, Dict, List, Optional, Tuple
 
 import phase1_pipeline as pp
@@ -483,7 +483,7 @@ def write_report(prof: Dict[str, Any], stats: Dict[str, Any],
     lines: List[str] = []
     lines.append("=" * 70)
     lines.append("AI BDM — DATA QUALITY REPORT")
-    lines.append(f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    lines.append(f"Generated: {utc_now_iso()}")
     if last_run.get("query"):
         lines.append(f"Query    : {last_run['query']}")
         lines.append(f"Scope    : latest query only "

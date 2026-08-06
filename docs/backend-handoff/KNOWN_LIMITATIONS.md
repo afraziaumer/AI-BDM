@@ -19,7 +19,7 @@ By explicit decision of the Python team lead, the following is **out of scope fo
 - No error taxonomy exists (Section 4.6). Failures surface as log lines and free-text strings (e.g. `summary["error"] = "intent_failed: ..."`, generic `HTTPException` details), not the canonical `{code, retryable, retry_after_seconds, correlation_id}` envelope.
 - Consequently, the four schema files (`schemas/request.schema.json`, `progress.schema.json`, `result.schema.json`, `error.schema.json`) required by Section 7's folder structure are **not present in this folder** — they describe a contract that hasn't been designed yet. `JOB_EXECUTION.md` is likewise not present for the same reason.
 - No content hashing (SHA-256) exists for any artifact (see `ARTIFACTS_AND_STORAGE.md`).
-- `api.py` has no `/v1` prefix and no cursor pagination on `GET /leads` (Section 5's versioning/pagination conventions).
+- ~~`api.py` has no `/v1` prefix and no cursor pagination on `GET /leads`~~ — fixed: all routes now live under `/api/v1`, and `GET /api/v1/leads` returns `{items, next_cursor}` with an opaque base64 cursor instead of a plain `limit`-only listing. See `docs/INTEGRATION_NOTES.md` for the updated curl examples.
 
 ## Patched / vendored packages
 

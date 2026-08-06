@@ -39,7 +39,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from time_utils import utc_now_iso
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -101,7 +101,7 @@ def make_result(
         "decision_makers": decision_makers,
         "contacts": contacts,
         "metadata": metadata,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": utc_now_iso(),
     }
 
 

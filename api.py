@@ -10,20 +10,26 @@ Run:
   ./env/bin/python -m uvicorn api:app --reload --port 8000
   # interactive docs at http://127.0.0.1:8000/docs
 
+All routes are versioned under /api/v1 (Laravel Backend Construction
+Handoff Guide, Section 5: "Use /api/v1 ... changes remain backward-
+compatible within v1"). There is no unversioned alias -- this is the
+initial version, so there's nothing to stay compatible with yet.
+
 Endpoints:
-  GET  /health            - liveness probe
-  POST /pipeline/run      - run the full Phase 1 pipeline for a query
-  GET  /leads             - list stored leads (HTML omitted unless requested)
-  GET  /leads/count       - number of stored leads
+  GET  /api/v1/health            - liveness probe
+  POST /api/v1/pipeline/run      - run the full Phase 1 pipeline for a query
+  GET  /api/v1/leads             - cursor-paginated list of stored leads
+  GET  /api/v1/leads/count       - number of stored leads
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import secrets
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -34,6 +40,7 @@ app = FastAPI(
     version="1.0.0",
     description="Natural-language lead query -> Maps discovery -> tiered scrape -> store.",
 )
+router = APIRouter(prefix="/api/v1")
 
 
 # --- Auth ------------------------------------------------------------------
@@ -79,14 +86,56 @@ class LeadSummary(BaseModel):
     page_text: Optional[str] = None
 
 
+class LeadsPage(BaseModel):
+    """Cursor-paginated response for GET /api/v1/leads.
+
+    `next_cursor` is an opaque token -- never a raw row index a client
+    could infer meaning from or reconstruct out of band (Laravel guide,
+    Section 5: "Identifiers: opaque string IDs; never expose sequential
+    database IDs as a cross-system contract"). `None` means there is no
+    next page.
+    """
+    items: List[LeadSummary]
+    next_cursor: Optional[str] = None
+
+
 # --- Helpers ---------------------------------------------------------------
-def _read_leads(include_text: bool, limit: Optional[int]) -> List[Dict[str, Any]]:
+def _encode_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(str(offset).encode()).decode()
+
+
+def _decode_cursor(cursor: Optional[str]) -> int:
+    """Opaque cursor -> row offset. Invalid/tampered cursors fail closed
+    with a 400, never silently fall back to offset 0 (which would look
+    like a valid empty/first page instead of a client error)."""
+    if not cursor:
+        return 0
+    try:
+        offset = int(base64.urlsafe_b64decode(cursor.encode()).decode())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid cursor.") from exc
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="Invalid cursor.")
+    return offset
+
+
+def _read_leads(
+    include_text: bool, limit: Optional[int], offset: int = 0
+) -> List[Dict[str, Any]]:
     """Read persisted leads from the crawl index (metadata) via the storage
-    layer; page text is loaded from storage/<domain>/*.txt only when asked."""
+    layer; page text is loaded from storage/<domain>/*.txt only when asked.
+
+    Row order is `crawl_index.csv`'s own file order, which is append-only
+    and stable across calls -- the deterministic sort order cursor
+    pagination requires (Laravel guide, Section 5), as long as no row is
+    reordered or deleted mid-pagination.
+    """
     from storage import get_store
     store = get_store()
     leads: List[Dict[str, Any]] = []
-    for row in store.read_index():
+    for i, row in enumerate(store.read_index()):
+        if i < offset:
+            continue
         text_length = int(row.get("content_length") or 0)
         leads.append(
             {
@@ -110,7 +159,7 @@ def _read_leads(include_text: bool, limit: Optional[int]) -> List[Dict[str, Any]
 
 
 # --- Routes ----------------------------------------------------------------
-@app.get("/health", tags=["system"])
+@router.get("/health", tags=["system"])
 def health() -> Dict[str, str]:
     """Liveness probe; also reports which provider keys are configured."""
     return {
@@ -120,7 +169,7 @@ def health() -> Dict[str, str]:
     }
 
 
-@app.post("/pipeline/run", tags=["pipeline"], dependencies=[Depends(require_api_key)])
+@router.post("/pipeline/run", tags=["pipeline"], dependencies=[Depends(require_api_key)])
 async def run_pipeline_endpoint(req: PipelineRequest) -> Dict[str, Any]:
     """Run the full Phase 1 pipeline and return the structured summary.
 
@@ -147,20 +196,36 @@ async def run_pipeline_endpoint(req: PipelineRequest) -> Dict[str, Any]:
     return summary
 
 
-@app.get("/leads", response_model=List[LeadSummary], tags=["leads"],
-         dependencies=[Depends(require_api_key)])
+@router.get("/leads", response_model=LeadsPage, tags=["leads"],
+            dependencies=[Depends(require_api_key)])
 def list_leads(
     include_text: bool = Query(False, description="Include page text (large)."),
-    limit: Optional[int] = Query(None, ge=1, le=1000),
-) -> List[Dict[str, Any]]:
-    """List persisted leads from the store (page text omitted by default)."""
-    return _read_leads(include_text=include_text, limit=limit)
+    limit: int = Query(50, ge=1, le=1000, description="Page size."),
+    cursor: Optional[str] = Query(
+        None, description="Opaque cursor from a previous response's next_cursor."
+    ),
+) -> LeadsPage:
+    """Cursor-paginated list of persisted leads (page text omitted by default).
+
+    Fetches one extra row past `limit` to determine whether a next page
+    exists, without returning it -- the standard cursor-pagination
+    lookahead trick, avoiding a separate count query.
+    """
+    offset = _decode_cursor(cursor)
+    rows = _read_leads(include_text=include_text, limit=limit + 1, offset=offset)
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = _encode_cursor(offset + limit) if has_more else None
+    return LeadsPage(items=items, next_cursor=next_cursor)
 
 
-@app.get("/leads/count", tags=["leads"], dependencies=[Depends(require_api_key)])
+@router.get("/leads/count", tags=["leads"], dependencies=[Depends(require_api_key)])
 def leads_count() -> Dict[str, int]:
     """Return the number of leads currently persisted."""
     return {"count": len(_read_leads(include_text=False, limit=None))}
+
+
+app.include_router(router)
 
 
 @app.on_event("startup")

@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -23,6 +22,7 @@ from phase3.config import (APIFY_API_TOKEN, APIFY_MAX_REVIEWS_ATTEMPT, APIFY_RED
     APIFY_REDDIT_TIMEOUT_S, APIFY_RUN_SYNC_URL, APIFY_TIMEOUT_S, DEFAULT_CONCURRENCY,
     MAX_REVIEWS_PER_PLATFORM, REVIEW_CACHE_DAYS, REVIEW_MAX_PAGES, SERPER_API_KEY,
     SERPER_SEARCH_URL, SERPER_TIMEOUT_S, ZENROWS_API_KEY)
+from time_utils import utc_now_iso
 
 logger = logging.getLogger("Phase3ReviewHarvester")
 
@@ -499,7 +499,7 @@ async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str
         record = {
             "platform": platform, "business_name": name, "matched": bool(mentions),
             "listing_url": "", "reviews": mentions, "review_count_extracted": len(mentions),
-            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "checked_at": utc_now_iso(),
         }
         if mentions:
             record["fetch_method"] = "apify"
@@ -521,7 +521,7 @@ async def enrich_platform(session: aiohttp.ClientSession, domain: str, name: str
         listing = await _discover(session, name, hosts, geo)
         extra_fields = {}
     transient_failure = extra_fields.pop("transient_failure", False)
-    record: Dict[str, Any] = {"platform": platform, "business_name": name, "matched": bool(listing), "listing_url": listing or "", "reviews": [], "review_count_extracted": 0, "checked_at": datetime.now(timezone.utc).isoformat()}
+    record: Dict[str, Any] = {"platform": platform, "business_name": name, "matched": bool(listing), "listing_url": listing or "", "reviews": [], "review_count_extracted": 0, "checked_at": utc_now_iso()}
     record.update(extra_fields)
     if not listing:
         record["reason"] = "no confident public listing found"

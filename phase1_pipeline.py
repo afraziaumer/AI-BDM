@@ -59,7 +59,6 @@ import re
 import socket
 import sys
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote, urljoin
@@ -381,6 +380,7 @@ CONTACT_SEP = " | "
 from domain_utils import (
     TRACKING_PARAMS, _TLD, domain_key as _domain_key, strip_tracking as _strip_tracking,
 )
+from time_utils import utc_now_iso
 # File extensions that are assets, not readable pages — never crawled.
 SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".bmp",
@@ -675,7 +675,7 @@ def _save_last_run(
         return
     payload = {
         "query": query,
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "timestamp": utc_now_iso(),
         "industry": industry,
         "geo": geo,
         "domains": domains,
@@ -1664,7 +1664,7 @@ async def crawl_site(
     # standalone/test caller that doesn't pass one in.
     if scraper_cache is None:
         scraper_cache = {}
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now_iso = utc_now_iso()
 
     pages_kept = 0
     emails: List[str] = []

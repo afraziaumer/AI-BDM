@@ -58,7 +58,7 @@ One row per **business** (not per page), produced by `data_pipeline.to_business_
     {"text": "...", "rating": "5", "author": "...", "date": "2026-01-01T00:00:00Z"}
   ],
   "review_count_extracted": 2,
-  "checked_at": "2026-08-05T00:00:00+00:00",
+  "checked_at": "2026-08-05T00:00:00Z",
   "reason": "present only on a miss, e.g. 'no confident public listing found'"
 }
 ```

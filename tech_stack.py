@@ -62,6 +62,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from time_utils import utc_now_iso
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlsplit
@@ -857,7 +859,7 @@ def build_website_profile(
             "fetch_method": fetch_method,
             "technology_count": len(raw),
         },
-        "last_scanned": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "last_scanned": utc_now_iso(),
         "scan_version": TECH_PROFILE_SCHEMA_VERSION,
     }
 

@@ -49,7 +49,7 @@ This is safe — nothing in this codebase imports either package directly.
 |---|---|
 | `python main.py --query "..."` | The full 8-step CLI pipeline (see below). This is the primary, supported entry point. |
 | `python accuracy_check.py --geo "..."` | Re-runs Step 8 (accuracy audit) standalone against whatever was last committed, without re-scraping. Runs automatically as part of `main.py` already — this is for re-checking without a new query. |
-| `python -m uvicorn api:app --reload --port 8000` | Optional FastAPI wrapper. **Partial** — exposes only Steps 1–2 (`POST /pipeline/run`) plus read-only `/leads` endpoints. Does not expose Steps 3–8. See [`docs/INTEGRATION_NOTES.md`](docs/INTEGRATION_NOTES.md). |
+| `python -m uvicorn api:app --reload --port 8000` | Optional FastAPI wrapper, versioned under `/api/v1`. **Partial** — exposes only Steps 1–2 (`POST /api/v1/pipeline/run`) plus read-only, cursor-paginated `/api/v1/leads` endpoints. Does not expose Steps 3–8. See [`docs/INTEGRATION_NOTES.md`](docs/INTEGRATION_NOTES.md). |
 
 ```powershell
 python main.py --query "find 3 dental clinics in Islamabad with no online booking"
