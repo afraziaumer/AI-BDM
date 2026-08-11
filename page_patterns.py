@@ -94,27 +94,47 @@ def detect_patterns(
     pages (boat-001, boat-002, ...) becomes ONE UrlPattern instead of N
     candidate rows. Top-level single-segment pages (/about, /contact) are
     never grouped — there's no shared parent to group them under.
+
+    Tries prefix depths from MOST specific (all-but-last-segment, the
+    original single-level behavior) down to LEAST specific (just the first
+    segment), stopping at the first depth where a group of un-grouped
+    candidates reaches PATTERN_MIN_CHILDREN. Real gap found live: a listing
+    page whose URL varies in the last TWO segments together (e.g. an OTA's
+    "/hotel-deals/en-us/<region-id>/hotels-in-<city>.ssp", where BOTH the
+    id and the slug differ per link) got a unique "parent" per URL under
+    the single-level version -- 10 obviously-repeating links, zero
+    detected patterns, directory-likeness score far too low to flag it.
+    Falling back to shallower prefixes (here, "/hotel-deals/en-us", 2
+    segments) catches this without weakening the original single-level
+    case, which is always tried first since it's the deepest/most specific.
     """
-    by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_depth: Dict[int, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    max_depth = 0
     for c in candidates:
         segments = [s for s in urlsplit(c["url"]).path.rstrip("/").split("/") if s]
-        if len(segments) < 2:
-            by_parent[""].append(c)     # top-level page, never pattern-grouped
-        else:
-            parent = "/" + "/".join(segments[:-1])
-            by_parent[parent].append(c)
+        c["_segments"] = segments
+        for depth in range(1, len(segments)):  # depth = how many leading segments form the prefix
+            prefix = "/" + "/".join(segments[:depth])
+            by_depth[depth][prefix].append(c)
+            max_depth = max(max_depth, depth)
 
-    individual: List[Dict[str, Any]] = []
+    remaining = {id(c): c for c in candidates}
     patterns: List[UrlPattern] = []
-    for parent, items in by_parent.items():
-        if parent and len(items) >= PATTERN_MIN_CHILDREN:
-            anchors = [i["anchor"] for i in items[:3] if i.get("anchor")]
-            patterns.append(UrlPattern(
-                pattern=f"{parent}/*", count=len(items),
-                example_urls=[i["url"] for i in items[:3]],
-                anchor_examples=anchors,
-                location=items[0].get("location", "body"),
-            ))
-        else:
-            individual.extend(items)
+    for depth in range(max_depth, 0, -1):  # most specific first
+        for prefix, items in by_depth[depth].items():
+            group = [c for c in items if id(c) in remaining]
+            if len(group) >= PATTERN_MIN_CHILDREN:
+                anchors = [i["anchor"] for i in group[:3] if i.get("anchor")]
+                patterns.append(UrlPattern(
+                    pattern=f"{prefix}/*", count=len(group),
+                    example_urls=[i["url"] for i in group[:3]],
+                    anchor_examples=anchors,
+                    location=group[0].get("location", "body"),
+                ))
+                for c in group:
+                    remaining.pop(id(c), None)
+
+    individual = list(remaining.values())
+    for c in candidates:
+        c.pop("_segments", None)
     return individual, patterns

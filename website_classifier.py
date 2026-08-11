@@ -108,6 +108,12 @@ DIRECTORY_PHRASES = (
     "list your business", "add a listing", "explore categories",
 )
 
+# A single repeating URL pattern with at least this many children is a
+# strong enough directory signal on its own, even when pattern_count (the
+# number of DISTINCT patterns) never reaches its own ">= 3" threshold —
+# see rule_based_score's pattern_max_size branch.
+PATTERN_SIZE_STRONG_SIGNAL = 8
+
 SCHEMA_DIRECTORY_TYPES = {"itemlist", "collectionpage", "searchresultspage"}
 SCHEMA_OFFICIAL_TYPES = {
     "localbusiness", "organization", "restaurant", "store", "hotel",
@@ -183,6 +189,7 @@ class HomepageSignals:
     directory_tech: List[str] = field(default_factory=list)
     pattern_count: int = 0
     pattern_names: List[str] = field(default_factory=list)
+    pattern_max_size: int = 0
     html_lang: str = ""
 
 
@@ -268,6 +275,7 @@ def extract_homepage_signals(
         outbound_domains=outbound_domains, schema_types=schema_types,
         matched_phrases=matched_phrases, directory_tech=directory_tech,
         pattern_count=len(patterns), pattern_names=[p.pattern for p in patterns],
+        pattern_max_size=max((p.count for p in patterns), default=0),
         html_lang=html_lang,
     )
 
@@ -296,6 +304,20 @@ def rule_based_score(signals: HomepageSignals) -> Tuple[int, List[str]]:
     if signals.pattern_count >= 3:
         score += 20
         reasons.append(f"{signals.pattern_count} distinct repeating URL-listing patterns on homepage")
+    elif signals.pattern_max_size >= PATTERN_SIZE_STRONG_SIGNAL:
+        # Real gap found live: an OTA-style homepage (e.g. "/hotel-deals/
+        # en-us/<region-id>/hotels-in-<city>.ssp") can have just ONE
+        # repeating pattern that absorbs ALL its listing links (varying id
+        # + slug together, not distinct sub-sections) -- pattern_count
+        # alone stayed at 1, never reaching the ">= 3 distinct patterns"
+        # bar, even with 10 obviously-templated listing links. A single
+        # pattern with many children is just as strong a directory signal
+        # as several smaller ones.
+        score += 20
+        reasons.append(
+            f"one repeating URL-listing pattern with {signals.pattern_max_size} "
+            "children on homepage"
+        )
     title_meta = f"{signals.title} {signals.meta_description}"
     if LISTICLE_TITLE_RE.search(title_meta):
         score += 15
