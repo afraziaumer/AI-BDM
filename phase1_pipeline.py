@@ -3460,6 +3460,33 @@ def resolve_effective_limit(plan: Dict[str, Any], limit: Optional[int]) -> Tuple
     return effective_limit, aggressive_discovery
 
 
+_CLARIFICATION_HISTORY_RE = re.compile(
+    r'\n\n\(Previously asked: ".*?" -- answer: ".*?"\)', re.DOTALL,
+)
+
+
+def _strip_clarification_history(query: str) -> str:
+    """Drop main.py's `_plan_interactively()`-appended "(Previously asked:
+    ... -- answer: ...)" blocks, returning just the original user query.
+
+    Real defect found live: run_pipeline() correctly needs the FULL
+    history-appended string for its own deconstruct_intent() call below (a
+    fresh LLM call has no memory of a prior round's question, so restating
+    it is what lets the answer resolve correctly -- see
+    _plan_interactively's docstring). But that same full string was then
+    stored VERBATIM as summary["query"] and in last_run.json -- which
+    rag/top_matches.py's focus-concept extraction also reads as if it were
+    the user's actual search intent. Words like "previously" and "asked"
+    became part of the significant-word pool and could outrank the real
+    focus concept (e.g. "reservation") for which chunk-word is chosen as
+    the ranking's focus_word, weakening the very mechanism meant to surface
+    concept-relevant chunks to the top. Only the RECORDED/DOWNSTREAM query
+    (summary["query"], last_run.json) is cleaned; the actual planning call
+    still gets the full history it needs.
+    """
+    return _CLARIFICATION_HISTORY_RE.sub("", query).strip()
+
+
 async def run_pipeline(
     user_query: str,
     limit: Optional[int] = None,
@@ -3515,7 +3542,7 @@ async def run_pipeline(
     logger.info("Loaded %d previously-analyzed leads from the crawl index.", len(cache))
 
     summary: Dict[str, Any] = {
-        "query": user_query,
+        "query": _strip_clarification_history(user_query),
         "plan": None,
         "limit": None,
         "discovered": 0,
@@ -4031,8 +4058,11 @@ async def run_pipeline(
         len(qualified), len(results), CRAWL_INDEX_FILE,
     )
     # Record this query's scope so the data-quality report covers only the
-    # latest query, not the whole cumulative store.
-    _save_last_run(user_query, results, industry=industry, geo=geo)
+    # latest query, not the whole cumulative store. Cleaned of clarification
+    # history (see _strip_clarification_history) -- rag/ingest_and_answer.py
+    # reads this file's "query" as the literal search intent for chunk
+    # ranking, not as LLM re-planning context.
+    _save_last_run(_strip_clarification_history(user_query), results, industry=industry, geo=geo)
     _progress(
         "finalizing", len(qualified), max(effective_limit, 1), "pipeline_complete"
     )
