@@ -1,0 +1,105 @@
+2026-08-11 14:32:55,141 [INFO] Loaded 45 previously-analyzed leads from the crawl index.
+2026-08-11 14:32:56,231 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:32:56,259 [INFO] [llm_call] task=json_extraction model=openai/gpt-oss-20b reasoning_effort=low cache=n/a prompt_tokens=653 completion_tokens=29 reasoning_tokens=6 time=0.72s cost_estimate=$0.000068 fallback_triggered=False
+2026-08-11 14:32:56,259 [INFO] Deconstructing intent for query: 'find 3 dental clinics in Islamabad using WordPress with online booking'
+2026-08-11 14:33:01,967 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:33:01,974 [INFO] [llm_call] task=intent_planning model=openai/gpt-oss-120b reasoning_effort=medium cache=n/a prompt_tokens=3004 completion_tokens=2325 reasoning_tokens=1964 time=5.45s cost_estimate=$0.002665 fallback_triggered=False
+2026-08-11 14:33:01,981 [INFO] Intent blueprint: {"geo_location": "Islamabad, Pakistan", "broad_industry": "dental clinic", "search_query": "dental clinics in Islamabad, Pakistan", "result_limit": 3, "count_explicit": true, "search_type": "general", "target_domain": "", "intent": "find_and_filter", "country_code": "PK", "phone_regex": "(?:(?:\\+92|0092|0)[\\s.\\-]?)?(?<!\\d)(?:\\d{2,4}[\\s.\\-]?\\d{7,8})(?!\\d)", "needs_tech_stack": false, "needs_clarification": true, "clarification_questions": ["Do you prefer independent dental clinics only, or are chain locations acceptable?"], "exclude_keywords": [], "include_keywords": ["wordpress", "wp", "wordpress cms", "wordpress powered", "wordpress website", "wordpress theme", "wordpress plugin", "wordpress based", "wordpress platform", "wordpress site", "wordpress framework", "online booking", "online appointment scheduling", "digital booking", "appointment booking system", "online reservation", "web booking", "e-booking", "online scheduler", "book online", "schedule online", "online appointment system", "patient portal booking", "online booking portal", "online booking feature"], "reasoning": "User wants 3 dental clinics in Islamabad that use WordPress and provide online booking. The count is explicit, so result_limit is set to 3. The search query targets the specific city and country. Include keywords are expanded to capture the many ways WordPress and online booking are described on clinic websites, ensuring accurate filtering. No exclusion criteria are given. Technology‑stack analysis is not required because WordPress is only a filter, not a request to audit a site. Clarification is needed about whether chain clinics are acceptable, as this could affect which businesses are returned."}
+2026-08-11 14:33:02,002 [INFO] Loaded 45 previously-analyzed leads from the crawl index.
+2026-08-11 14:33:02,384 [INFO] [llm_call] task=json_extraction model=openai/gpt-oss-20b cache=hit (no API call made)
+2026-08-11 14:33:02,384 [INFO] Deconstructing intent for query: 'find 3 dental clinics in Islamabad using WordPress with online booking'
+2026-08-11 14:33:02,733 [INFO] [llm_call] task=intent_planning model=openai/gpt-oss-120b cache=hit (no API call made)
+2026-08-11 14:33:02,733 [INFO] Intent blueprint: {"geo_location": "Islamabad, Pakistan", "broad_industry": "dental clinic", "search_query": "dental clinics in Islamabad, Pakistan", "result_limit": 3, "count_explicit": true, "search_type": "general", "target_domain": "", "intent": "find_and_filter", "country_code": "PK", "phone_regex": "(?:(?:\\+92|0092|0)[\\s.\\-]?)?(?<!\\d)(?:\\d{2,4}[\\s.\\-]?\\d{7,8})(?!\\d)", "needs_tech_stack": false, "needs_clarification": true, "clarification_questions": ["Do you prefer independent dental clinics only, or are chain locations acceptable?"], "exclude_keywords": [], "include_keywords": ["wordpress", "wp", "wordpress cms", "wordpress powered", "wordpress website", "wordpress theme", "wordpress plugin", "wordpress based", "wordpress platform", "wordpress site", "wordpress framework", "online booking", "online appointment scheduling", "digital booking", "appointment booking system", "online reservation", "web booking", "e-booking", "online scheduler", "book online", "schedule online", "online appointment system", "patient portal booking", "online booking portal", "online booking feature"], "reasoning": "User wants 3 dental clinics in Islamabad that use WordPress and provide online booking. The count is explicit, so result_limit is set to 3. The search query targets the specific city and country. Include keywords are expanded to capture the many ways WordPress and online booking are described on clinic websites, ensuring accurate filtering. No exclusion criteria are given. Technology‑stack analysis is not required because WordPress is only a filter, not a request to audit a site. Clarification is needed about whether chain clinics are acceptable, as this could affect which businesses are returned."}
+2026-08-11 14:33:02,733 [INFO] Phone regex for PK: (?:(?:\+92|0092|0)[\s.\-]?)?(?<!\d)(?:\d{2,4}[\s.\-]?\d{7,8})(?!\d)
+2026-08-11 14:33:02,810 [INFO] General search — resuming from Serper page 3.
+2026-08-11 14:33:02,810 [INFO] Discovery query: 'dental clinics in Islamabad, Pakistan' | pages 3+ | target 3 new | 45 known excluded
+2026-08-11 14:33:03,440 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:03,440 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 3-3
+2026-08-11 14:33:03,440 [INFO] Discovery exhausted at round 1 for query 'dental clinics in Islamabad, Pakistan' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:04,307 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:33:04,307 [INFO] [llm_call] task=query_rewrite model=openai/gpt-oss-20b reasoning_effort=low cache=n/a prompt_tokens=330 completion_tokens=64 reasoning_tokens=4 time=0.52s cost_estimate=$0.000039 fallback_triggered=False
+2026-08-11 14:33:04,307 [INFO] Query 'dental clinics in Islamabad, Pakistan' exhausted (0/3 qualified so far) — expanding discovery with 5 same-intent variation(s): ['Islamabad dental clinic WordPress booking', 'Islamabad dental clinic online booking WordPress', 'WordPress dental clinic Islamabad Pakistan booking', 'Islamabad dental clinic with online booking site:wordpress.com', 'Islamabad dental clinic WordPress booking system']
+2026-08-11 14:33:04,307 [INFO] Discovery query: 'Islamabad dental clinic WordPress booking' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:04,602 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:04,602 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:04,602 [INFO] Discovery exhausted at round 2 for query 'Islamabad dental clinic WordPress booking' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:04,602 [INFO] Discovery query: 'Islamabad dental clinic online booking WordPress' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:04,884 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:04,884 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:04,884 [INFO] Discovery exhausted at round 3 for query 'Islamabad dental clinic online booking WordPress' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:04,884 [INFO] Discovery query: 'WordPress dental clinic Islamabad Pakistan booking' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:05,176 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:05,176 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:05,176 [INFO] Discovery exhausted at round 4 for query 'WordPress dental clinic Islamabad Pakistan booking' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:05,176 [INFO] Discovery query: 'Islamabad dental clinic with online booking site:wordpress.com' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:05,460 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:05,460 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:05,460 [INFO] Discovery exhausted at round 5 for query 'Islamabad dental clinic with online booking site:wordpress.com' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:05,460 [INFO] Discovery query: 'Islamabad dental clinic WordPress booking system' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:05,752 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:05,752 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:05,752 [INFO] Discovery exhausted at round 6 for query 'Islamabad dental clinic WordPress booking system' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:06,620 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:33:06,620 [INFO] [llm_call] task=query_rewrite model=openai/gpt-oss-20b reasoning_effort=low cache=n/a prompt_tokens=381 completion_tokens=68 reasoning_tokens=4 time=0.55s cost_estimate=$0.000045 fallback_triggered=False
+2026-08-11 14:33:06,620 [INFO] Query 'Islamabad dental clinic WordPress booking system' exhausted (0/3 qualified so far) — expanding discovery with 2 same-intent variation(s): ['Islamabad dental clinic WordPress online booking', 'Islamabad dental clinic WordPress booking site:wordpress.com']
+2026-08-11 14:33:06,627 [INFO] Discovery query: 'Islamabad dental clinic WordPress online booking' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:06,912 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:06,914 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:06,914 [INFO] Discovery exhausted at round 7 for query 'Islamabad dental clinic WordPress online booking' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:06,914 [INFO] Discovery query: 'Islamabad dental clinic WordPress booking site:wordpress.com' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:07,203 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:07,203 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:07,203 [INFO] Discovery exhausted at round 8 for query 'Islamabad dental clinic WordPress booking site:wordpress.com' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:08,009 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:33:08,009 [INFO] [llm_call] task=query_rewrite model=openai/gpt-oss-20b reasoning_effort=low cache=n/a prompt_tokens=404 completion_tokens=67 reasoning_tokens=4 time=0.48s cost_estimate=$0.000047 fallback_triggered=False
+2026-08-11 14:33:08,016 [INFO] Query 'Islamabad dental clinic WordPress booking site:wordpress.com' exhausted (0/3 qualified so far) — expanding discovery with 4 same-intent variation(s): ['Islamabad dental clinic online booking WordPress site:wordpress.com', 'Islamabad dental clinic WordPress booking plugin', 'Islamabad dental clinic WordPress appointment booking', 'Islamabad dental clinic WordPress online scheduling']
+2026-08-11 14:33:08,016 [INFO] Discovery query: 'Islamabad dental clinic online booking WordPress site:wordpress.com' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:08,307 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:08,307 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:08,307 [INFO] Discovery exhausted at round 9 for query 'Islamabad dental clinic online booking WordPress site:wordpress.com' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:08,307 [INFO] Discovery query: 'Islamabad dental clinic WordPress booking plugin' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:08,594 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:08,594 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:08,594 [INFO] Discovery exhausted at round 10 for query 'Islamabad dental clinic WordPress booking plugin' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:08,594 [INFO] Discovery query: 'Islamabad dental clinic WordPress appointment booking' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:08,879 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:08,879 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:08,879 [INFO] Discovery exhausted at round 11 for query 'Islamabad dental clinic WordPress appointment booking' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:08,879 [INFO] Discovery query: 'Islamabad dental clinic WordPress online scheduling' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:33:09,165 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:33:09,169 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:33:09,169 [INFO] Discovery exhausted at round 12 for query 'Islamabad dental clinic WordPress online scheduling' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:33:09,169 [INFO] All discovery strategies exhausted for 'find 3 dental clinics in Islamabad using WordPress with online booking' — no more query variations available (collected 0/3 qualified leads; 12 distinct query/queries tried).
+2026-08-11 14:33:09,171 [CRITICAL] No NEW businesses found from page 3 onwards.
+
+================================================================
+A bit more detail would help before I search:
+  1. Do you prefer independent dental clinics only, or are chain locations acceptable?
+================================================================
+(No answer given -- proceeding with my best guess.)
+
+================================================================
+PHASE 1 OUTPUT RETURN
+================================================================
+Query      : find 3 dental clinics in Islamabad using WordPress with online booking
+Search type: general
+Serper pages used : 3-4  | Next run starts at page 4
+Plan       : {"geo_location": "Islamabad, Pakistan", "broad_industry": "dental clinic", "search_query": "dental clinics in Islamabad, Pakistan", "result_limit": 3, "count_explicit": true, "search_type": "general", "target_domain": "", "intent": "find_and_filter", "country_code": "PK", "phone_regex": "(?:(?:\\+92|0092|0)[\\s.\\-]?)?(?<!\\d)(?:\\d{2,4}[\\s.\\-]?\\d{7,8})(?!\\d)", "needs_tech_stack": false, "needs_clarification": true, "clarification_questions": ["Do you prefer independent dental clinics only, or are chain locations acceptable?"], "exclude_keywords": [], "include_keywords": ["wordpress", "wp", "wordpress cms", "wordpress powered", "wordpress website", "wordpress theme", "wordpress plugin", "wordpress based", "wordpress platform", "wordpress site", "wordpress framework", "online booking", "online appointment scheduling", "digital booking", "appointment booking system", "online reservation", "web booking", "e-booking", "online scheduler", "book online", "schedule online", "online appointment system", "patient portal booking", "online booking portal", "online booking feature"], "reasoning": "User wants 3 dental clinics in Islamabad that use WordPress and provide online booking. The count is explicit, so result_limit is set to 3. The search query targets the specific city and country. Include keywords are expanded to capture the many ways WordPress and online booking are described on clinic websites, ensuring accurate filtering. No exclusion criteria are given. Technology‑stack analysis is not required because WordPress is only a filter, not a request to audit a site. Clarification is needed about whether chain clinics are acceptable, as this could affect which businesses are returned."}
+Target leads: 3 (aggressive)  |  Discovered : 0  |  Processed : 0
+Counts     : {}
+----------------------------------------------------------------
+----------------------------------------------------------------
+QUALIFIED LEADS (0 of 3 requested):
+----------------------------------------------------------------
+ℹ  last_run.json was NOT updated by this run (0 qualified leads found) — it still holds the scope from a PREVIOUS run:
+   query: 'find 3 marinas in Miami'  (saved 2026-08-11T09:28:39Z)
+   3 domain(s): miamigov.com, miamiriversidemarina.com, northbeachmarina.com
+   Any RAG/data-quality output printed after this is reading THAT scope, not this run's (empty) result.
+================================================================
+Crawl index: crawl_index.csv  |  Cleaned pages: storage/<domain>/*.txt
+
+
+####################################################################
+STEP 3 — LLM ROUTE PLANNER  (0 business(es))
+####################################################################
+No businesses discovered — nothing to route.

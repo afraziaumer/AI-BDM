@@ -18,11 +18,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from domain_utils import safe_domain_component
 from phase3.config import REVIEWS_SUBDIR, STORAGE_ROOT
 
 
 def _path(domain: str, platform: str) -> Path:
-    return Path(STORAGE_ROOT) / domain / REVIEWS_SUBDIR / f"{platform}.json"
+    return Path(STORAGE_ROOT) / safe_domain_component(domain) / REVIEWS_SUBDIR / f"{platform}.json"
 
 
 def load(domain: str, platform: str, max_age_days: Optional[float] = 7) -> Optional[Dict[str, Any]]:

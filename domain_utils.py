@@ -48,6 +48,25 @@ def domain_key(url_or_host: str) -> str:
     return (domain or "").lower()
 
 
+def safe_domain_component(domain: str) -> str:
+    """Neutralize a domain string for use as a single filesystem path segment.
+
+    Real bug found while executing a professional QA test suite (SEC-003):
+    domain_key() only strips slashes/traversal when its input is a proper
+    URL -- a raw non-URL string like '..\\..\\windows\\system32' (or a
+    LLM-planned `target_domain` value, which skips domain_key() entirely and
+    is only strip/lower'd) passes straight through. On Windows,
+    Path('storage') / '\\windows\\system32' resolves to C:\\Windows\\System32
+    because a leading path separator makes pathlib treat it as rooted,
+    escaping the intended storage directory entirely. Stripping every path
+    separator and '..' segment guarantees the result is always a single
+    plain segment.
+    """
+    domain = (domain or "").replace("\\", "/")
+    parts = [p for p in domain.split("/") if p not in ("", ".", "..")]
+    return "_".join(parts) or "_"
+
+
 def strip_tracking(url: str) -> str:
     """Drop volatile tracking query params (srsltid, utm_*, gclid...) and the
     fragment, giving one stable URL for the same page across runs. Without this

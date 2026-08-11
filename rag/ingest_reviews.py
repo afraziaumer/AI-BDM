@@ -26,10 +26,11 @@ def iter_source_docs_from_reviews(domains: List[str]) -> Iterator[SourceDoc]:
     contributes a doc — an unmatched listing or a matched-but-empty one
     (see review_harvester.py's `reason` field) has nothing to embed.
     """
+    from domain_utils import safe_domain_component
     from phase3.config import REVIEWS_SUBDIR, STORAGE_ROOT
 
     for domain in domains:
-        reviews_dir = Path(STORAGE_ROOT) / domain / REVIEWS_SUBDIR
+        reviews_dir = Path(STORAGE_ROOT) / safe_domain_component(domain) / REVIEWS_SUBDIR
         if not reviews_dir.is_dir():
             continue
         for platform_file in sorted(reviews_dir.glob("*.json")):

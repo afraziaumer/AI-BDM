@@ -75,6 +75,8 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
+from domain_utils import safe_domain_component
+
 # Per-page metadata columns for the crawl index. Deliberately excludes page TEXT
 # and raw HTML — the cleaned text lives only in the .txt files. Contacts and
 # title/meta ARE metadata (and the footer text they come from is stripped from
@@ -427,10 +429,10 @@ class LocalPageStore(PageStore):
 
     # -- paths --
     def _staging_dir(self, domain: str) -> Path:
-        return self.staging_root / domain
+        return self.staging_root / safe_domain_component(domain)
 
     def _final_dir(self, domain: str) -> Path:
-        return self.root / domain
+        return self.root / safe_domain_component(domain)
 
     def _unique_name(self, domain: str, page_name: str) -> str:
         """Avoid collisions when two URLs map to the same base name."""

@@ -28,6 +28,7 @@ from typing import Any, Dict, List
 
 from phase1_pipeline import CONTACT_SEP, _valid_email
 from data_pipeline import _email_is_own
+from domain_utils import safe_domain_component
 from phase3.config import REVIEWS_SUBDIR, STORAGE_ROOT
 from phase3.review_harvester import _tokens
 
@@ -120,7 +121,7 @@ def _iter_review_records(domain: str):
     has both "platform" and "reviews" keys (even when empty), which those
     two files never do -- that's what distinguishes them here.
     """
-    reviews_dir = Path(STORAGE_ROOT) / domain / REVIEWS_SUBDIR
+    reviews_dir = Path(STORAGE_ROOT) / safe_domain_component(domain) / REVIEWS_SUBDIR
     if not reviews_dir.is_dir():
         return
     for platform_file in sorted(reviews_dir.glob("*.json")):

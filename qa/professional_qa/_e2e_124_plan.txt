@@ -1,0 +1,24 @@
+{
+  "geo_location": "Miami, Florida, USA",
+  "broad_industry": "marina",
+  "search_query": "marinas in Miami",
+  "result_limit": 3,
+  "count_explicit": true,
+  "search_type": "general",
+  "target_domain": "",
+  "intent": "find",
+  "country_code": "US",
+  "phone_regex": "(?:(?:\\+1|1)[\\s.\\-]?)?(?<!\\d)(?:\\([2-9]\\d{2}\\)|[2-9]\\d{2})[\\s.\\-]?[2-9]\\d{2}[\\s.\\-]?\\d{4}(?!\\d)",
+  "needs_tech_stack": false,
+  "needs_clarification": true,
+  "clarification_questions": [
+    "What specific problem, gap, or signal are you targeting with these marinas?"
+  ],
+  "exclude_keywords": [],
+  "include_keywords": [],
+  "reasoning": "User explicitly requests 3 marinas in Miami with no additional filters. The request provides a clear city and count, so we set result_limit to 3 and count_explicit true. No include or exclude constraints, so intent is a simple find. Because the request gives no indication of the underlying goal, we flag needs_clarification and ask for the specific problem or opportunity driving the search."
+}
+
+needs_clarification: True
+discovered: 0
+qualified: 0

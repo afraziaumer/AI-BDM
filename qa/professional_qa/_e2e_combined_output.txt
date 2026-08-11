@@ -1,0 +1,87 @@
+2026-08-11 14:31:10,819 [INFO] Loaded 45 previously-analyzed leads from the crawl index.
+2026-08-11 14:31:12,199 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:31:12,255 [INFO] [llm_call] task=json_extraction model=openai/gpt-oss-20b reasoning_effort=low cache=n/a prompt_tokens=654 completion_tokens=26 reasoning_tokens=3 time=0.78s cost_estimate=$0.000068 fallback_triggered=False
+2026-08-11 14:31:12,255 [INFO] Deconstructing intent for query: 'find 3 marinas in Miami with no online booking using WordPress'
+2026-08-11 14:31:16,178 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:31:16,185 [INFO] [llm_call] task=intent_planning model=openai/gpt-oss-120b reasoning_effort=medium cache=n/a prompt_tokens=3005 completion_tokens=1403 reasoning_tokens=1055 time=3.55s cost_estimate=$0.002204 fallback_triggered=False
+2026-08-11 14:31:16,185 [INFO] Intent blueprint: {"geo_location": "Miami, Florida, USA", "broad_industry": "marina", "search_query": "marinas in Miami", "result_limit": 3, "count_explicit": true, "search_type": "general", "target_domain": "", "intent": "find_and_filter", "country_code": "US", "phone_regex": "(?:(?:\\+1|1)[\\s.\\-]?)?(?<!\\d)(?:\\([2-9]\\d{2}\\)|[2-9]\\d{2})[\\s.\\-]?[2-9]\\d{2}[\\s.\\-]?\\d{4}(?!\\d)", "needs_tech_stack": false, "needs_clarification": false, "clarification_questions": [], "exclude_keywords": ["online booking", "online reservation", "digital booking", "web booking", "online reservation system", "booking engine", "online booking platform", "e‑booking", "internet booking", "online appointment scheduling", "online reservation portal", "online booking feature"], "include_keywords": ["wordpress", "wp", "wordpress.com", "wordpress.org", "powered by wordpress", "built on wordpress", "wordpress cms", "wordpress website", "wp theme", "wp plugin", "wordpress powered site", "wordpress based", "wordpress platform"], "reasoning": "User explicitly wants 3 marinas in Miami that do NOT offer online booking and that are built on WordPress. Count is explicit, so result_limit is 3 and count_explicit true. Exclude keywords are expanded variants of online booking to reliably detect its absence. Include keywords cover WordPress and common phrasing on sites. No tech‑stack analysis request beyond the filter, so needs_tech_stack is false. All other fields follow the defined schema."}
+2026-08-11 14:31:16,185 [INFO] Phone regex for US: (?:(?:\+1|1)[\s.\-]?)?(?<!\d)(?:\([2-9]\d{2}\)|[2-9]\d{2})[\s.\-]?[2-9]\d{2}[\s.\-]?\d{4}(?!\d)
+2026-08-11 14:31:16,291 [INFO] General search — resuming from Serper page 5.
+2026-08-11 14:31:16,291 [INFO] Discovery query: 'marinas in Miami' | pages 5+ | target 3 new | 45 known excluded
+2026-08-11 14:31:17,108 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:17,108 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 5-5
+2026-08-11 14:31:17,108 [INFO] Discovery exhausted at round 1 for query 'marinas in Miami' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:18,039 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:31:18,043 [INFO] [llm_call] task=query_rewrite model=openai/gpt-oss-20b reasoning_effort=low cache=n/a prompt_tokens=329 completion_tokens=55 reasoning_tokens=6 time=0.48s cost_estimate=$0.000038 fallback_triggered=False
+2026-08-11 14:31:18,046 [INFO] Query 'marinas in Miami' exhausted (0/3 qualified so far) — expanding discovery with 5 same-intent variation(s): ['marina Miami Florida USA', 'Miami Florida marina business', 'marina Miami FL USA', 'marina Miami Florida site:.com', 'marina Miami Florida "no online booking"']
+2026-08-11 14:31:18,046 [INFO] Discovery query: 'marina Miami Florida USA' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:18,334 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:18,334 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:18,334 [INFO] Discovery exhausted at round 2 for query 'marina Miami Florida USA' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:18,339 [INFO] Discovery query: 'Miami Florida marina business' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:18,622 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:18,629 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:18,629 [INFO] Discovery exhausted at round 3 for query 'Miami Florida marina business' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:18,629 [INFO] Discovery query: 'marina Miami FL USA' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:18,923 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:18,923 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:18,923 [INFO] Discovery exhausted at round 4 for query 'marina Miami FL USA' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:18,923 [INFO] Discovery query: 'marina Miami Florida site:.com' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:19,213 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:19,213 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:19,213 [INFO] Discovery exhausted at round 5 for query 'marina Miami Florida site:.com' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:19,213 [INFO] Discovery query: 'marina Miami Florida "no online booking"' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:19,527 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:19,527 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:19,527 [INFO] Discovery exhausted at round 6 for query 'marina Miami Florida "no online booking"' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:20,509 [INFO] HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-11 14:31:20,511 [INFO] [llm_call] task=query_rewrite model=openai/gpt-oss-20b reasoning_effort=low cache=n/a prompt_tokens=369 completion_tokens=78 reasoning_tokens=6 time=0.59s cost_estimate=$0.000045 fallback_triggered=False
+2026-08-11 14:31:20,512 [INFO] Query 'marina Miami Florida "no online booking"' exhausted (0/3 qualified so far) — expanding discovery with 5 same-intent variation(s): ['marina Miami Florida "no booking"', 'marina Miami FL "no online reservation"', 'marina Miami Florida "no online booking" site:.com', 'marina Miami FL "no online booking" site:.org', 'marina Miami Florida "no online booking" site:.net']
+2026-08-11 14:31:20,512 [INFO] Discovery query: 'marina Miami Florida "no booking"' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:20,810 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:20,810 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:20,810 [INFO] Discovery exhausted at round 7 for query 'marina Miami Florida "no booking"' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:20,811 [INFO] Discovery query: 'marina Miami FL "no online reservation"' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:21,099 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:21,099 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:21,099 [INFO] Discovery exhausted at round 8 for query 'marina Miami FL "no online reservation"' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:21,099 [INFO] Discovery query: 'marina Miami Florida "no online booking" site:.com' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:21,383 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:21,383 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:21,383 [INFO] Discovery exhausted at round 9 for query 'marina Miami Florida "no online booking" site:.com' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:21,385 [INFO] Discovery query: 'marina Miami FL "no online booking" site:.org' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:21,738 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:21,738 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:21,738 [INFO] Discovery exhausted at round 10 for query 'marina Miami FL "no online booking" site:.org' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:21,738 [INFO] Discovery query: 'marina Miami Florida "no online booking" site:.net' | pages 1+ | target 3 new | 45 known excluded
+2026-08-11 14:31:22,022 [ERROR] Serper search failed (status=400): {"message":"Not enough credits","statusCode":400}
+2026-08-11 14:31:22,022 [INFO] Discovery: 0 sites (0 direct, 0 mined from 0/0 discovery source(s)) | 0 noise rejected | pages 1-1
+2026-08-11 14:31:22,022 [INFO] Discovery exhausted at round 11 for query 'marina Miami Florida "no online booking" site:.net' — no more candidates yet (collected 0/3 qualified leads).
+2026-08-11 14:31:22,022 [INFO] All discovery strategies exhausted for 'find 3 marinas in Miami with no online booking using WordPress' — no more query variations available (collected 0/3 qualified leads; 11 distinct query/queries tried).
+2026-08-11 14:31:22,025 [CRITICAL] No NEW businesses found from page 5 onwards.
+
+================================================================
+PHASE 1 OUTPUT RETURN
+================================================================
+Query      : find 3 marinas in Miami with no online booking using WordPress
+Search type: general
+Serper pages used : 5-6  | Next run starts at page 6
+Plan       : {"geo_location": "Miami, Florida, USA", "broad_industry": "marina", "search_query": "marinas in Miami", "result_limit": 3, "count_explicit": true, "search_type": "general", "target_domain": "", "intent": "find_and_filter", "country_code": "US", "phone_regex": "(?:(?:\\+1|1)[\\s.\\-]?)?(?<!\\d)(?:\\([2-9]\\d{2}\\)|[2-9]\\d{2})[\\s.\\-]?[2-9]\\d{2}[\\s.\\-]?\\d{4}(?!\\d)", "needs_tech_stack": false, "needs_clarification": false, "clarification_questions": [], "exclude_keywords": ["online booking", "online reservation", "digital booking", "web booking", "online reservation system", "booking engine", "online booking platform", "e‑booking", "internet booking", "online appointment scheduling", "online reservation portal", "online booking feature"], "include_keywords": ["wordpress", "wp", "wordpress.com", "wordpress.org", "powered by wordpress", "built on wordpress", "wordpress cms", "wordpress website", "wp theme", "wp plugin", "wordpress powered site", "wordpress based", "wordpress platform"], "reasoning": "User explicitly wants 3 marinas in Miami that do NOT offer online booking and that are built on WordPress. Count is explicit, so result_limit is 3 and count_explicit true. Exclude keywords are expanded variants of online booking to reliably detect its absence. Include keywords cover WordPress and common phrasing on sites. No tech‑stack analysis request beyond the filter, so needs_tech_stack is false. All other fields follow the defined schema."}
+Target leads: 3 (aggressive)  |  Discovered : 0  |  Processed : 0
+Counts     : {}
+----------------------------------------------------------------
+----------------------------------------------------------------
+QUALIFIED LEADS (0 of 3 requested):
+----------------------------------------------------------------
+ℹ  last_run.json was NOT updated by this run (0 qualified leads found) — it still holds the scope from a PREVIOUS run:
+   query: 'find 3 marinas in Miami'  (saved 2026-08-11T09:28:39Z)
+   3 domain(s): miamigov.com, miamiriversidemarina.com, northbeachmarina.com
+   Any RAG/data-quality output printed after this is reading THAT scope, not this run's (empty) result.
+================================================================
+Crawl index: crawl_index.csv  |  Cleaned pages: storage/<domain>/*.txt
+
+
+####################################################################
+STEP 3 — LLM ROUTE PLANNER  (0 business(es))
+####################################################################
+No businesses discovered — nothing to route.
