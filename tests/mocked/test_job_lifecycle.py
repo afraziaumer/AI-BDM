@@ -295,14 +295,21 @@ def test_resume_unknown_original_raises_not_found():
         job_runner.resume_job("no_such_original", "job_new", "cor_new")
 
 
-def test_resume_duplicate_new_job_id_raises():
+def test_resume_duplicate_new_job_id_raises(monkeypatch):
     async def scenario():
         req = _request("job_resume_dup_orig")
 
         async def fake_run_pipeline(query, limit=None, progress_cb=None, cancel_check=None):
             return _success_summary()
 
-        job_runner.phase1_pipeline.run_pipeline = fake_run_pipeline
+        # monkeypatch.setattr (not a raw attribute assignment) so this reverts
+        # automatically after the test -- a raw `phase1_pipeline.run_pipeline =
+        # ...` here previously leaked into every later test in the same pytest
+        # process (real bug, found while running the professional QA suite:
+        # tests/unit/test_query_input.py's new guard tests failed only when
+        # run as part of the full suite, never in isolation, because this
+        # test's fake had permanently replaced the real run_pipeline).
+        monkeypatch.setattr(job_runner.phase1_pipeline, "run_pipeline", fake_run_pipeline)
         job_runner.submit_job(req)
         await job_runner._JOBS["job_resume_dup_orig"].task
 

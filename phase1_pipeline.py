@@ -3429,11 +3429,29 @@ async def run_pipeline(
         "clarification_questions": [],
     }
 
+    # Step -1: empty/near-empty query guard — runs before even moderation,
+    # since there's nothing to moderate or plan for a blank/whitespace-only
+    # string. Confirmed live (QA suite AI-BDM-009/010): without this check,
+    # an empty query still reached the LLM planner, which had nothing to
+    # ground a plan in and fabricated an arbitrary industry ("marina") out
+    # of thin air rather than asking for clarification -- real research
+    # would have started from a hallucinated interpretation of nothing.
+    # Same 3-character threshold as api.py's PipelineRequest.query
+    # (min_length=3) for consistency across every entry point (CLI, sync
+    # API, async jobs), not just the ones that happen to go through Pydantic.
+    _progress("planning", None, None, "pipeline_started")
+    if len((user_query or "").strip()) < 3:
+        summary["needs_clarification"] = True
+        summary["clarification_questions"] = [
+            "Your request is empty or too short for me to work with — "
+            "what kind of business, and where, are you looking for?"
+        ]
+        return summary
+
     # Step 0: moderation gate — runs before ANY other resource (Serper, the
     # premium scraper, the intent/route-planner LLM calls, storage) is touched,
     # so a policy-violating query costs at most this one small check, not a
     # full discovery+scrape+classify run.
-    _progress("planning", None, None, "pipeline_started")
     moderation = await moderate_user_query(user_query)
     if not moderation["safe"]:
         summary["blocked"] = True
