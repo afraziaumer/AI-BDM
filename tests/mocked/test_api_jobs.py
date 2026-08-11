@@ -244,3 +244,30 @@ def test_pipeline_run_idempotency_key_replays_error_outcome_too(client, monkeypa
     assert r1.status_code == 502
     assert r2.status_code == 502
     assert r1.json() == r2.json()
+
+
+def test_pipeline_run_idempotency_key_reused_with_different_payload_returns_409(client, monkeypatch):
+    """Real bug found while executing a professional QA test suite
+    (AI-BDM-115): reusing the same Idempotency-Key with a DIFFERENT request
+    body used to silently replay the FIRST request's cached result for the
+    second, unrelated query -- exactly the "system silently mixes requests"
+    failure mode the spec warns against. Fixed by fingerprinting the
+    request body alongside the cached response and failing closed (409) on
+    a mismatch, instead of either mixing requests or silently letting the
+    new one through under someone else's key."""
+    async def fake_run_pipeline(query, concurrency=5):
+        return {"query": query, "discovered": 1, "qualified": [], "results": [], "error": None, "blocked": False}
+    monkeypatch.setattr(api.pipeline, "run_pipeline", fake_run_pipeline)
+
+    async def scenario():
+        async with client as c:
+            headers = {**HEADERS, "Idempotency-Key": "idem-reused-key"}
+            r1 = await c.post("/api/v1/pipeline/run", json={"query": "find 3 dental clinics"}, headers=headers)
+            r2 = await c.post("/api/v1/pipeline/run", json={"query": "find 5 hair salons"}, headers=headers)
+            r3 = await c.post("/api/v1/pipeline/run", json={"query": "find 3 dental clinics"}, headers=headers)
+            return r1, r2, r3
+
+    r1, r2, r3 = asyncio.run(scenario())
+    assert r1.status_code == 200
+    assert r2.status_code == 409  # different payload, same key -- rejected, not silently mixed
+    assert r3.status_code == 200 and r3.json() == r1.json()  # original payload still replays cleanly

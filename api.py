@@ -40,6 +40,8 @@ rule. Both exist; neither is deprecated by the other.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 import secrets
 from typing import Any, Dict, List, Optional
@@ -165,15 +167,44 @@ def _decode_cursor(cursor: Optional[str]) -> int:
 _idempotency_store: Dict[str, Dict[str, Any]] = {}
 
 
-def _idempotency_lookup(endpoint: str, key: Optional[str]) -> Optional[Dict[str, Any]]:
+def _fingerprint_request(payload: Dict[str, Any]) -> str:
+    """A stable hash of the request body, used to detect the same
+    Idempotency-Key being reused with a DIFFERENT payload (QA suite
+    AI-BDM-115). Confirmed live before this fix existed: reusing a key with
+    a different query silently replayed the FIRST request's cached result
+    for the second, unrelated query -- exactly the "silently mix requests"
+    failure mode the spec calls out. json.dumps with sort_keys gives a
+    stable ordering regardless of dict insertion order."""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _idempotency_lookup(
+    endpoint: str, key: Optional[str], request_fingerprint: str
+) -> Optional[Dict[str, Any]]:
     if not key:
         return None
-    return _idempotency_store.get(f"{endpoint}:{key}")
+    entry = _idempotency_store.get(f"{endpoint}:{key}")
+    if entry is None:
+        return None
+    if entry["fingerprint"] != request_fingerprint:
+        # Same key, different request body -- fail closed (never silently
+        # replay a cached result for a request that isn't actually the one
+        # that produced it) rather than either mixing requests or quietly
+        # re-running the new one under someone else's idempotency key.
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used with a different request body.",
+        )
+    return entry
 
 
-def _idempotency_remember(endpoint: str, key: Optional[str], status_code: int, body: Any) -> None:
+def _idempotency_remember(
+    endpoint: str, key: Optional[str], request_fingerprint: str, status_code: int, body: Any
+) -> None:
     if key:
-        _idempotency_store[f"{endpoint}:{key}"] = {"status_code": status_code, "body": body}
+        _idempotency_store[f"{endpoint}:{key}"] = {
+            "status_code": status_code, "body": body, "fingerprint": request_fingerprint,
+        }
 
 
 def _read_leads(
@@ -243,7 +274,8 @@ async def run_pipeline_endpoint(
     with the same key replays the original outcome (success or error, same
     status code) instead of running the whole pipeline a second time.
     """
-    cached = _idempotency_lookup("pipeline_run", idempotency_key)
+    fingerprint = _fingerprint_request(req.model_dump())
+    cached = _idempotency_lookup("pipeline_run", idempotency_key, fingerprint)
     if cached is not None:
         response.status_code = cached["status_code"]
         return cached["body"]
@@ -258,13 +290,13 @@ async def run_pipeline_endpoint(
         # generic -- the specific category/reason stays in the server log
         # (see moderate_user_query), not handed back to the caller.
         detail = "This request violates our usage policy and was not processed."
-        _idempotency_remember("pipeline_run", idempotency_key, 400, {"detail": detail})
+        _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 400, {"detail": detail})
         raise HTTPException(status_code=400, detail=detail)
     if summary.get("error"):
         # Intent/LLM stage failed (e.g. provider down) -> surface as 502.
-        _idempotency_remember("pipeline_run", idempotency_key, 502, {"detail": summary["error"]})
+        _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 502, {"detail": summary["error"]})
         raise HTTPException(status_code=502, detail=summary["error"])
-    _idempotency_remember("pipeline_run", idempotency_key, 200, summary)
+    _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 200, summary)
     return summary
 
 
