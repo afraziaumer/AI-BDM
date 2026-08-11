@@ -304,7 +304,24 @@ def _is_noise_path(path: str) -> bool:
 def _looks_like_listicle(title: str, path: str) -> bool:
     if any(hint in path.lower() for hint in LISTICLE_PATH_HINTS):
         return True
-    return bool(title and LISTICLE_TITLE_RE.search(title))
+    if title and LISTICLE_TITLE_RE.search(title):
+        return True
+    # Real defect found live (GAP-FUNC discovery): a "hidden gem" clickbait
+    # content-farm article ("11 Texas Comfort Food Restaurants Only Locals
+    # Seem to Know About") slipped through as OFFICIAL -- its title doesn't
+    # match any "N best/top X" or "X in Y" phrasing above, but its URL slug
+    # is unmistakably an article: long and hyphen-heavy. Same signal already
+    # proven for filtering blog posts during internal-link crawling (see
+    # phase1_pipeline.py's _is_internal_crawl_noise) -- reused here so a
+    # content site publishing many such articles isn't committed as if each
+    # article were its own qualifying business, drowning out the real
+    # businesses in downstream ranking (a domain with dozens of loosely
+    # on-topic article chunks can crowd out businesses with fewer, more
+    # specific chunks).
+    last_segment = path.rstrip("/").rsplit("/", 1)[-1]
+    if last_segment.count("-") >= 5:
+        return True
+    return False
 
 
 # ===========================================================================
