@@ -75,6 +75,7 @@ from email_extractor import EmailExtractor
 
 # Reuse the already-tested Step-1 planner instead of duplicating LLM logic.
 from LLM_planner import plan_query, generate_query_variations, moderate_query
+import learned_directories
 import relevance_scoring
 
 # Generic, reusable per-page semantic summary (page type, meta, structure,
@@ -914,6 +915,38 @@ async def discover_places(
     return targets
 
 
+def _append_directory_exclusions(query: str) -> str:
+    """Add "-site:domain" terms for every known directory/OTA/aggregator
+    brand -- both the hand-curated DISCOVERY_SOURCE_REGISTRY (instant
+    recognition for brands we already know) and learned_directories.py's
+    auto-growing list (domains website_classifier.classify_homepage()
+    has already confidently identified as a directory on some earlier
+    run). Google/Serper then never returns these domains as results at
+    all -- zero fetches, zero classification calls, not even a moment
+    spent on them, versus discovering-then-rejecting them after the fact.
+
+    The two sources need different handling: DISCOVERY_SOURCE_REGISTRY's
+    keys are bare brand names with no TLD (tldextract's ".domain" part,
+    e.g. "booking" for Booking.com) -- ".com" is assumed, which covers the
+    vast majority of these, but misses a brand's non-.com regional site
+    (e.g. the real "expedia.ca" seen live in this project's own logs).
+    learned_directories' entries are the ACTUAL domain that was crawled
+    and classified, TLD and all, so they're used as-is -- meaning the
+    learned half of this list is strictly more precise than the hardcoded
+    half, and gets more accurate the more the pipeline runs.
+
+    Capped (see learned_directories.MAX_EXCLUSIONS_PER_QUERY) to keep the
+    query itself well-formed rather than unbounded.
+    """
+    registry_exclusions = {f"{brand}.com" for brand in dc.DISCOVERY_SOURCE_REGISTRY}
+    learned_exclusions = learned_directories.load_for_exclusion()
+    domains = registry_exclusions | learned_exclusions
+    if not domains:
+        return query
+    exclusions = " ".join(f"-site:{d}" for d in sorted(domains))
+    return f"{query} {exclusions}"
+
+
 async def discover_targets(
     session: aiohttp.ClientSession,
     query: str,
@@ -955,11 +988,18 @@ async def discover_targets(
     seen_hosts: Set[str] = set(exclude_domains or ())
     page = start_page
     last_page = start_page
+    search_query = _append_directory_exclusions(query)
+    if search_query != query:
+        logger.debug(
+            "Excluding %d known directory/OTA domain(s) from this search "
+            "(hardcoded + learned) so they never appear as results.",
+            search_query.count("-site:"),
+        )
 
     while len(targets) < limit and page <= start_page + max_pages - 1:
         # "num" is the per-page count (Serper allows up to 100), so each page
         # returns up to `per_page` businesses; we sweep `max_pages` pages.
-        payload: Dict[str, Any] = {"q": query, "num": max(1, min(per_page, 100)), "page": page}
+        payload: Dict[str, Any] = {"q": search_query, "num": max(1, min(per_page, 100)), "page": page}
         if country_code:
             payload["gl"] = country_code.lower()
         if location:
@@ -2040,6 +2080,16 @@ async def crawl_site(
         # stored as a business. Mine its homepage for real business links
         # instead and hand them back so the caller can queue each as its OWN
         # crawl job (own storage, own crawl planner, own tech profile).
+        #
+        # Learn it: deep_crawl=False only ever comes from a genuine
+        # rule_based (score >= DIRECTORY_SCORE_HIGH) or llm-confirmed
+        # verdict -- the fail-open fallback paths always set deep_crawl=True
+        # -- so this is always a real, confident signal, never a guess.
+        # Recording it here means every future query excludes this domain
+        # directly at Serper search time (see learned_directories.py),
+        # instead of re-discovering, re-fetching, and re-classifying the
+        # same directory/OTA from scratch on every single run.
+        learned_directories.record_learned_directory(domain, reason=classification.reasoning)
         discovered_businesses = await asyncio.to_thread(
             website_classifier.mine_homepage_businesses,
             root_html, root_url, domain, classification,
