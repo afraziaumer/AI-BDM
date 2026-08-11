@@ -77,6 +77,25 @@ import numpy as np
 
 from domain_utils import safe_domain_component
 
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: Any) -> Any:
+    """Neutralize CSV/formula injection (OWASP-standard mitigation): a field
+    value starting with =, +, -, @, tab, or CR is executed as a formula by
+    Excel/Sheets when the exported CSV is opened -- CSV-level quoting alone
+    does NOT prevent this, since Excel evaluates the cell's leading
+    character regardless of surrounding quotes. Real vulnerability found
+    while executing the proposed gap coverage (GAP-SEC-001): a scraped
+    business name/field is attacker-controlled (comes from someone else's
+    website) and flowed straight into crawl_index.csv unescaped. Prefixing
+    a leading apostrophe forces spreadsheet apps to treat it as literal text.
+    """
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_TRIGGERS):
+        return "'" + value
+    return value
+
+
 # Per-page metadata columns for the crawl index. Deliberately excludes page TEXT
 # and raw HTML — the cleaned text lives only in the .txt files. Contacts and
 # title/meta ARE metadata (and the footer text they come from is stripped from
@@ -634,7 +653,7 @@ class LocalPageStore(PageStore):
                 writer = csv.DictWriter(f, fieldnames=INDEX_COLUMNS, extrasaction="ignore")
                 writer.writeheader()
                 for row in kept:
-                    writer.writerow({c: row.get(c, "") for c in INDEX_COLUMNS})
+                    writer.writerow({c: _csv_safe(row.get(c, "")) for c in INDEX_COLUMNS})
 
     # -- index i/o --
     def _append_index(self, rows: List[Dict[str, str]]) -> None:
@@ -647,7 +666,7 @@ class LocalPageStore(PageStore):
                 if new_file:
                     writer.writeheader()
                 for row in rows:
-                    writer.writerow({c: row.get(c, "") for c in INDEX_COLUMNS})
+                    writer.writerow({c: _csv_safe(row.get(c, "")) for c in INDEX_COLUMNS})
 
     # -- reads --
     def has_domain(self, domain: str) -> bool:

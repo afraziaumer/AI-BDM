@@ -982,5 +982,23 @@
     "status": "Pass",
     "defect_id": "",
     "remarks": "Cross-referenced from the AI-BDM-115 idempotency fingerprinting fix/verification pass; see also tests/mocked/test_api_jobs.py."
+  },
+  "GAP-SEC-001": {
+    "actual": "REAL DEFECT FOUND AND FIXED. Live-tested a malicious field value (\"=cmd|... !A1\") through the actual storage.py CSV write path -- confirmed the leading = survived unescaped as the first character of the quoted CSV field (CSV quoting does not stop Excel/Sheets from evaluating a formula-trigger leading character). FIX: added storage._csv_safe() (OWASP-standard mitigation: prefix a leading apostrophe on any value starting with =, +, -, @, tab, or CR) applied at both crawl_index.csv write sites (_append_index, retire_domain). Live-verified after fix: all 5 payload variants (=, +, -, @, leading-tab) now get a leading apostrophe; a normal business name is completely unaffected. Added 7 regression tests (tests/unit/test_csv_injection_safety.py).",
+    "status": "Pass",
+    "defect_id": "GAP-SEC-001-CSVINJ",
+    "remarks": "Confirmed real via live CSV write + read-back, fixed, re-verified live, full suite green."
+  },
+  "GAP-SEC-002": {
+    "actual": "REAL DEFECT FOUND AND FIXED (high severity). Live-tested 5 internal/private address variants (169.254.169.254 cloud metadata, 127.0.0.1:22, localhost:445, ::1, 10.0.0.5) directly through the real fetch functions (_native_get and execute_scavenger_scrape) -- BEFORE the fix, every one of them was actually attempted (real outbound connection attempt, no pre-flight block at all). On a real cloud VM, the 169.254.169.254 case would have returned genuine IAM credentials. FIX: added phase1_pipeline._resolves_to_blocked_address() (checks literal IPs AND DNS-resolved addresses against private/loopback/link-local/reserved/multicast ranges via the ipaddress module) applied at the single shared entry point (execute_scavenger_scrape, covering both native and premium tiers so a blocked URL is dropped outright rather than escalated to a different tier) and at the standalone _native_get(). Live-verified after fix: all 5 malicious variants are now blocked (FAILED/blocked_internal_address, neither tier attempted), while a real external site (example.com) still fetches normally. Added 8 regression tests (tests/unit/test_ssrf_guard.py).",
+    "status": "Pass",
+    "defect_id": "GAP-SEC-002-SSRF",
+    "remarks": "Confirmed real via live connection-attempt testing (not just code review), fixed, re-verified live, full suite green (150 passed, up from 135)."
+  },
+  "GAP-SEC-003": {
+    "actual": "REAL DEFECT FOUND AND FIXED. Live-tested the real extract_contacts() function with a short (12-char) pathological phone_regex (\"(?:\\d+)+\\+\", well under MAX_PHONE_REGEX_LEN=200) against a 40-character crafted input -- confirmed it hung for 10+ seconds (process had to be killed), proving the existing length caps do NOT bound execution time. FIRST FIX ATTEMPT FAILED: wrapping stdlib re in a ThreadPoolExecutor with future.result(timeout=2.0) did not work -- stdlib re holds the GIL for the entire backtracking search, so the waiting thread never got scheduled to notice the timeout; confirmed live, it still hung indefinitely and left an unkillable process. ACTUAL FIX: switched phone-regex compilation from stdlib re to the third-party  module (already an installed dependency, now added explicitly to requirements.txt), whose timeout= parameter genuinely works. Live-verified after fix: the exact same pathological input now completes in 0.02s (was 10s+ hang); a harder case ((a+)+b against 200 non-matching chars, classic exponential-backtracking pattern) completes in ~15ms; normal, real LLM-style phone regexes still correctly extract real phone numbers. Added 4 regression tests (tests/unit/test_phone_regex_redos.py).",
+    "status": "Pass",
+    "defect_id": "GAP-SEC-003-REDOS",
+    "remarks": "Two-attempt fix, both attempts and their outcomes verified live (not assumed) -- worth noting for anyone maintaining this: naive thread-timeout does NOT protect against stdlib re ReDoS in CPython due to the GIL. Full suite 154 passed (up from 150)."
   }
 }

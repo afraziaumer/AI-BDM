@@ -53,6 +53,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -65,6 +66,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote, ur
 
 import aiohttp
 import phonenumbers
+import regex
 import tldextract
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -405,12 +407,47 @@ EMAIL_RE = re.compile(
 # Fallback phone RE used ONLY when the planner provides no phone_regex.
 # Very loose on purpose — it is just a candidate collector; _clean_phone
 # and phonenumbers.parse do the real validation.
-_PHONE_RE_FALLBACK = re.compile(r"\+?\d[\d\s().\-]{7,}\d")
+_PHONE_RE_FALLBACK = regex.compile(r"\+?\d[\d\s().\-]{7,}\d")
 # ReDoS guards for the LLM-generated phone regex: reject an over-long pattern
 # (fall back to the safe fixed one) and never scan more than a bounded slice of
 # page text, so a pathological regex can't hang a worker on a big page.
+# NEITHER bound actually prevents catastrophic backtracking on its own — a
+# pattern as short as `(?:\d+)+\+` (12 chars, well under MAX_PHONE_REGEX_LEN)
+# hung real extraction for 10+ seconds on a 40-character input, confirmed
+# live while executing the proposed gap coverage (GAP-SEC-003).
+#
+# First fix attempt (running stdlib re in a ThreadPoolExecutor + a
+# future.result(timeout=...)) does NOT work: stdlib re's C matcher holds the
+# GIL for the entire backtracking search without releasing it, so the
+# "main" thread waiting on the future can't even get scheduled to notice
+# the timeout -- the whole process stays frozen. Confirmed live: that
+# version still hung indefinitely on the exact same input.
+#
+# Actual fix: the third-party `regex` module (already an installed
+# dependency), used in place of stdlib re for this one compile. It has a
+# genuine timeout= parameter honored during matching, and its engine
+# handles classic catastrophic-backtracking patterns like (a+)+b against
+# 100 non-matching characters in ~15ms where stdlib re would take
+# exponential time -- confirmed live both ways.
 MAX_PHONE_REGEX_LEN = 200
 MAX_PHONE_SCAN_CHARS = 20000
+PHONE_REGEX_TIMEOUT_S = 2.0
+
+
+def _safe_regex_findall(pattern: "regex.Pattern", text: str, timeout: float = PHONE_REGEX_TIMEOUT_S) -> list:
+    """pattern.findall(text, timeout=...) using the `regex` module (not
+    stdlib re) so an untrusted LLM-generated phone_regex can never hang
+    extraction — falls back to the known-safe fixed pattern if it
+    genuinely times out."""
+    try:
+        return pattern.findall(text, timeout=timeout)
+    except TimeoutError:
+        logger.warning(
+            "Phone regex exceeded %.1fs (likely catastrophic backtracking) — "
+            "falling back to the safe fixed pattern for this page.",
+            timeout,
+        )
+        return _PHONE_RE_FALLBACK.findall(text)
 # Substrings that mark a regex 'email' match as junk.
 JUNK_EMAIL_HINTS = (
     "example.", "yourdomain", "domain.com", "email@", "sentry", "wixpress",
@@ -613,9 +650,55 @@ async def _read_html(resp: aiohttp.ClientResponse) -> str:
         return raw.decode(resp.charset or "latin-1", errors="replace")
 
 
+def _is_blocked_ip(ip: "ipaddress._BaseAddress") -> bool:
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+async def _resolves_to_blocked_address(url: str) -> bool:
+    """SSRF guard: True if `url`'s host is a literal IP in a private/
+    loopback/link-local/reserved/multicast range, OR resolves via DNS to
+    one (catches DNS-rebinding, not just a literal internal IP typed into
+    a search result).
+
+    Real vulnerability found while executing the proposed gap coverage
+    (GAP-SEC-002): every discovered/crawled URL was fetched with no
+    pre-flight check at all -- a malicious search result or on-page link
+    pointing at http://169.254.169.254/ (cloud metadata) or a
+    localhost/private-range address was simply requested like any other
+    URL. On a cloud VM this would have returned real instance credentials.
+    """
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return True
+    if not host:
+        return True
+    try:
+        return _is_blocked_ip(ipaddress.ip_address(host))
+    except ValueError:
+        pass  # not a literal IP -- resolve it and check every result
+    try:
+        infos = await asyncio.get_event_loop().getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False  # unresolvable -- let the normal fetch fail naturally
+    for info in infos:
+        try:
+            if _is_blocked_ip(ipaddress.ip_address(info[4][0])):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 async def _native_get(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     """Cheap, best-effort native GET (no premium scraper). Returns HTML or None."""
     try:
+        if await _resolves_to_blocked_address(url):
+            logger.warning("Blocked native GET to internal/private address: %s", url)
+            return None
         async with session.get(
             url, headers=BROWSER_HEADERS,
             timeout=aiohttp.ClientTimeout(total=NATIVE_FETCH_TIMEOUT_S),
@@ -1236,6 +1319,14 @@ async def execute_scavenger_scrape(
     `dict(resp.headers)` collapses multiple same-named headers to just the
     last one, silently dropping every cookie but one.
     """
+    if await _resolves_to_blocked_address(target_url):
+        # SSRF guard applied ONCE here, before either tier, so a blocked
+        # URL is never escalated to the premium scraper either -- it must
+        # be dropped outright, not fetched by a different tier.
+        logger.warning("Blocked scrape of internal/private address: %s", target_url)
+        return {"html": "", "method": "FAILED", "headers": {}, "status_code": None,
+                "cookies": [], "failure_reason": "blocked_internal_address"}
+
     cache = scraper_cache if scraper_cache is not None else {}
     path_key = urlparse(target_url).path or "/"
     cached_tier = cache.get(path_key)
@@ -2478,8 +2569,10 @@ def extract_contacts(
     # falls back to the safe fixed pattern.
     if phone_regex and len(phone_regex) <= MAX_PHONE_REGEX_LEN:
         try:
-            active_re = re.compile(phone_regex, re.IGNORECASE | re.MULTILINE)
-        except re.error:
+            # `regex`, not stdlib `re`: this pattern is LLM-generated (untrusted)
+            # and needs the real timeout= support _safe_regex_findall relies on.
+            active_re = regex.compile(phone_regex, regex.IGNORECASE | regex.MULTILINE)
+        except (re.error, regex.error):
             active_re = _PHONE_RE_FALLBACK
     else:
         active_re = _PHONE_RE_FALLBACK
@@ -2504,7 +2597,7 @@ def extract_contacts(
             _add_phone(unquote(href[len("tel:"):]).strip())
     # Then every number matched in the visible text. Scan only a bounded slice
     # so a pathological regex can't run away on a huge page (ReDoS guard).
-    for m in active_re.findall((text or "")[:MAX_PHONE_SCAN_CHARS]):
+    for m in _safe_regex_findall(active_re, (text or "")[:MAX_PHONE_SCAN_CHARS]):
         raw = m if isinstance(m, str) else m[0]
         _add_phone(raw)
 
