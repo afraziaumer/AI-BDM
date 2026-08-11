@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -87,8 +88,11 @@ def _print_ranked_chunks(label: str, source_type: str, query: str, k: int,
     if not domains:
         print(f"\n{label}: nothing ingested for this run — skipped.")
         return
+    print(f"[rag] Ranking {label.lower()}...")
+    _t0 = time.time()
     matches = top_matches(query, k=k, business=domains,
                          embedder=embedder, source_type=source_type)
+    print(f"[rag] {label} ranked in {time.time() - _t0:.1f}s.")
     print(f"\n{'=' * 70}\n{label} — top {len(matches)} chunk(s), hybrid score "
           f"(semantic + keyword bonus)\n{'=' * 70}")
     for rank, m in enumerate(matches, 1):
@@ -128,6 +132,7 @@ def run(query: str, discovered_domains: List[str],
     # (discovered-but-rejected, or Step 3 found nothing) yield zero docs here
     # and are naturally skipped.
     print("[rag] Ingesting high-intent website pages...")
+    _t0 = time.time()
     website_domains: List[str] = []
     ingested_website_pages = 0
     for domain in discovered_domains:
@@ -140,12 +145,14 @@ def run(query: str, discovered_domains: List[str],
             pipe.ingest(doc)
         ingested_website_pages += len(docs)
         website_domains.append(domain)
+    print(f"[rag] Website ingestion done in {time.time() - _t0:.1f}s.")
 
     # Review category: every domain with at least one platform that actually
     # yielded review text (phase3.review_harvester's cached output). A domain
     # can appear here even if it had no high-intent website pages, and vice
     # versa — the two categories are independent.
     print("[rag] Ingesting harvested review documents...")
+    _t0 = time.time()
     review_domains: List[str] = []
     ingested_review_docs = 0
     for doc in iter_source_docs_from_reviews(discovered_domains):
@@ -153,9 +160,10 @@ def run(query: str, discovered_domains: List[str],
         ingested_review_docs += 1
         if doc.domain not in review_domains:
             review_domains.append(doc.domain)
+    print(f"[rag] Review ingestion done in {time.time() - _t0:.1f}s.")
 
     committed_domains = sorted(set(website_domains) | set(review_domains))
-    print("[rag] Ingestion complete. Ranking chunks against the query...")
+    print("[rag] Ingestion complete.")
 
     print("\n" + "=" * 70)
     print("Query (reused from the scrape):", query)
@@ -185,8 +193,11 @@ def run(query: str, discovered_domains: List[str],
     # outside the top-k chunks is still a real, useful answer to a BDM.
     # Distinguishes an explicit statement (present/absent) from silence,
     # since silence is not proof of absence.
+    print("[rag] Ranking the combined per-business evidence summary...")
+    _t0 = time.time()
     all_matches = top_matches(query, k=len(committed_domains) * 10_000,
                               business=committed_domains, embedder=pipe.embedder)
+    print(f"[rag] Evidence summary ranked in {time.time() - _t0:.1f}s.")
     focus_word = all_matches[0]["focus_word"] if all_matches else ""
     focus_phrase = all_matches[0].get("focus_phrase") or focus_word if all_matches else ""
     focus_partner = all_matches[0].get("focus_partner", "") if all_matches else ""

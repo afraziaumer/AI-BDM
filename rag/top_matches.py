@@ -90,6 +90,7 @@ Run (from the project root):
 from __future__ import annotations
 
 import argparse
+import functools
 import itertools
 import json
 import re
@@ -106,10 +107,22 @@ def _get_spellchecker():
     global _spellchecker
     if _spellchecker is None:
         from spellchecker import SpellChecker
-        _spellchecker = SpellChecker()
+        # distance=1, not the library default of 2: confirmed live this is
+        # the actual dominant cost of a real RAG run getting stuck for 60+
+        # seconds -- correction() at distance=2 took ~1.37s PER out-of-
+        # dictionary word (business names, addresses -- exactly what real
+        # scraped website text is full of), vs ~1ms/word at distance=1, a
+        # ~1300x difference. distance=1 still correctly fixes the vast
+        # majority of realistic single-edit typos ("appoinment" ->
+        # "appointment", "recieve" -> "receive", etc.); a rare
+        # transposition-heavy typo needing 2 edits just passes through
+        # uncorrected, same as any other word the checker can't confidently
+        # fix already does (see _normalize_for_embedding's docstring).
+        _spellchecker = SpellChecker(distance=1)
     return _spellchecker
 
 
+@functools.lru_cache(maxsize=50_000)
 def _normalize_for_embedding(word: str) -> str:
     """Correct obvious typos before a chunk word is embedded for fuzzy
     matching. Rare/misspelled words (e.g. "appoinment" for "appointment") can
@@ -120,6 +133,17 @@ def _normalize_for_embedding(word: str) -> str:
     touches unknown/misspelled words with a confident correction; real words
     (including brand names/jargon the checker doesn't recognize but also
     can't confidently "fix") pass through unchanged.
+
+    Cached: pyspellchecker's correction() is a pure-Python edit-distance
+    search that is genuinely slow (confirmed live via a stack-trace capture
+    -- a real RAG run got stuck here for 60+ real seconds, correcting the
+    same out-of-dictionary words -- business names, addresses, jargon --
+    over and over). top_matches() is called up to 3 times per run (website
+    chunks, review chunks, and the combined evidence-summary pass) against
+    heavily overlapping chunk vocabulary, so an uncached call redoes the
+    same expensive correction repeatedly within a single run. lru_cache
+    makes each distinct word's correction pay this cost exactly once per
+    process, not once per top_matches() call.
     """
     checker = _get_spellchecker()
     if word in checker:
