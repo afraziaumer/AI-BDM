@@ -120,12 +120,14 @@ def run(query: str, discovered_domains: List[str],
     """
     from .ingest_reviews import iter_source_docs_from_reviews
     from .pipeline import RagPipeline
-    pipe = RagPipeline()
+    print(f"[rag] Starting Step 6 for {len(discovered_domains)} discovered domain(s)...")
+    pipe = RagPipeline()  # loads the embedding model — see embedder.py's own progress line
 
     # Website category: only domains with HIGH-INTENT pages (leads_clean.json)
     # — not every committed page. Domains with nothing high-intent
     # (discovered-but-rejected, or Step 3 found nothing) yield zero docs here
     # and are naturally skipped.
+    print("[rag] Ingesting high-intent website pages...")
     website_domains: List[str] = []
     ingested_website_pages = 0
     for domain in discovered_domains:
@@ -143,6 +145,7 @@ def run(query: str, discovered_domains: List[str],
     # yielded review text (phase3.review_harvester's cached output). A domain
     # can appear here even if it had no high-intent website pages, and vice
     # versa — the two categories are independent.
+    print("[rag] Ingesting harvested review documents...")
     review_domains: List[str] = []
     ingested_review_docs = 0
     for doc in iter_source_docs_from_reviews(discovered_domains):
@@ -152,6 +155,7 @@ def run(query: str, discovered_domains: List[str],
             review_domains.append(doc.domain)
 
     committed_domains = sorted(set(website_domains) | set(review_domains))
+    print("[rag] Ingestion complete. Ranking chunks against the query...")
 
     print("\n" + "=" * 70)
     print("Query (reused from the scrape):", query)

@@ -1000,5 +1000,59 @@
     "status": "Pass",
     "defect_id": "GAP-SEC-003-REDOS",
     "remarks": "Two-attempt fix, both attempts and their outcomes verified live (not assumed) -- worth noting for anyone maintaining this: naive thread-timeout does NOT protect against stdlib re ReDoS in CPython due to the GIL. Full suite 154 passed (up from 150)."
+  },
+  "GAP-SEC-004": {
+    "actual": "Live-tested via FastAPI TestClient against the real api.py app: (1) POST /api/v1/pipeline/run with no X-API-Key header -> 401, no pipeline work executed. (2) Same endpoint with an invalid key -> 401. (3) A protected GET endpoint (/api/v1/leads/count) with an invalid key -> 401. (4) /api/v1/health (intentionally unauthenticated) -> 200. Verified the implementation (api.py require_api_key): fails CLOSED with 503 if the server key env var is unset (rather than running open), and uses secrets.compare_digest() for constant-time comparison against timing attacks. All expected behavior confirmed live, already correctly implemented.",
+    "status": "Pass",
+    "defect_id": "",
+    "remarks": "No defect found -- API key enforcement was already correctly implemented (fail-closed + constant-time compare). Confirmed via live request, not just code reading."
+  },
+  "GAP-SEC-005": {
+    "actual": "Verified via code: no explicit dollar/token cost ceiling exists per run or per tenant. HOWEVER, several hard structural bounds already prevent literally unbounded spend on a SINGLE request: Limits.max_prospects is Pydantic-capped at le=500 (job_contracts.py:59), MAX_TOTAL_SEARCH_PAGES_PER_RUN=30 and MAX_QUERY_VARIATIONS_TOTAL=10 bound discovery, MAX_PAGES_PER_SITE=40 bounds crawl depth per business (all in phase1_pipeline.py). Combined with mandatory API-key auth (GAP-SEC-004), an anonymous attacker cannot trigger spend at all. The real residual gap: nothing stops an AUTHENTICATED client from submitting many large (max_prospects=500) jobs concurrently -- no per-tenant concurrent-job cap or aggregate spend quota exists.",
+    "status": "Pending",
+    "defect_id": "",
+    "remarks": "Not a pure security hole (requires a valid API key) but a real product gap: recommend a per-tenant concurrent-job or daily-spend quota if this API is exposed to multiple untrusted tenants. Left unfixed -- this is a product/billing-system decision, not a code defect to patch silently."
+  },
+  "GAP-PERF-RAG-HANG": {
+    "actual": "REAL DEFECT FOUND AND FIXED (found live via a real user run, not synthetic testing). A live run of \"find 10 restaurants in Texas with no online reservation system\" hung for 5+ minutes at Step 6 (RAG chunk ingestion + retrieval), right after ingestion completed and the summary was printed. Traceback (via Ctrl+C) confirmed execution was stuck inside rag.ingest_and_answer.run() -> _print_ranked_chunks() -> top_matches(), running in an asyncio.to_thread worker (so no exact line was visible, only the containing function). Root cause identified: none of the 3 chromadb.PersistentClient(...) call sites in the codebase (rag/store.py, rag/top_matches.py, rag/eval.py) disabled Chroma anonymized telemetry -- a PostHog network ping fires on every client creation by default, and top_matches() creates a FRESH client on every call (unlike the embedder, which is reused). On a slow/restricted network this is a well-documented cause of multi-minute Chroma hangs; the same log showed other network calls (ScrapingBee retries) taking far longer in real time than their own logged backoff windows, consistent with degraded network conditions in that session. FIX: added settings=chromadb.Settings(anonymized_telemetry=False) to all 3 PersistentClient() call sites -- a private local vector store of scraped business data has no reason to phone home at all. Verified: telemetry-disabled client creation still works correctly (0.96s, collection created fine); full suite still 154 passed after the change.",
+    "status": "Pass",
+    "defect_id": "PERF-CHROMA-TELEMETRY-HANG",
+    "remarks": "Could not force-reproduce the exact multi-minute hang locally (my own network reached PostHog fine, 0.6s) -- root cause identified via code audit + traceback location + known ChromaDB behavior, not a controlled repro. Recommend the user re-run the same query now that telemetry is disabled to confirm the hang is actually gone in their environment."
+  },
+  "GAP-SEC-006": {
+    "actual": "Live-tested via FastAPI TestClient: submitted a job with tenant_ref=tenant-a, then queried GET /api/v1/jobs/{job_id} presenting only the single global X-API-Key (no tenant-specific identity at all, since this API has exactly ONE shared key, not per-tenant keys) -- request succeeded (200), full job status returned. Confirmed via code (api.py job_status/job_result/cancel_job): none of these endpoints filter or check tenant_ref against the caller in any way -- any holder of the single API key can query/cancel ANY job_id regardless of which tenant_ref it was submitted under. tenant_ref is stored as a label on the JobRequest/JobResult but is NOT an access-control boundary at this layer.",
+    "status": "Pending",
+    "defect_id": "",
+    "remarks": "This is architecturally consistent with a single-trusted-caller design (the Laravel backend integration is the sole intended API consumer per the existing job-contract docs, and would be expected to enforce tenant boundaries on ITS side before calling this API with the shared key) -- NOT a bug if that trust model holds. Flagged, not silently changed: if this API is ever exposed to multiple independently-trusted callers, tenant_ref must be upgraded to a real enforcement boundary (e.g. per-tenant API keys) first."
+  },
+  "GAP-FUNC-001": {
+    "actual": "Live-tested a Roman Urdu query (\"Islamabad mein 3 dental clinics dhoondo\") against the real query-planning LLM call. Correctly parsed: broad_industry=dental clinic, geo_location=Islamabad Pakistan, result_limit=3/count_explicit=true, country_code=PK with a correct Pakistani phone_regex (mobile 3xx + Islamabad landline 51 patterns). needs_clarification correctly set true since only a bare count was given with no qualifying signal -- same honest behavior as an equivalent English query would get, not a language-specific failure.",
+    "status": "Pass",
+    "defect_id": "",
+    "remarks": "Testing note, not a new defect: printing this LLM response via a raw python -c script (bypassing main.py) crashed on a Unicode non-breaking hyphen in the clarification text -- but this exact class of bug was ALREADY found and fixed previously in main.py (lines 55-66, explicitly documented with the same U+2011 example) via a stdout/stderr UTF-8 reconfigure at import time, before phase1_pipeline is even imported. Re-verified through the real entry point with the same reconfigure applied: works correctly, no crash."
+  },
+  "GAP-FUNC-002": {
+    "actual": "Live-tested an 8735-character query (heavily repetitive padded text simulating pasted document content). Planner handled it without crashing or hanging, correctly extracted the real signal (dental clinic, Islamabad, count=3, correct PK phone regex) and correctly derived a relevant include_keywords list from the repeated quality-related phrasing, without needs_clarification firing spuriously. No truncation-induced garbage output.",
+    "status": "Pass",
+    "defect_id": "",
+    "remarks": ""
+  },
+  "GAP-FUNC-003": {
+    "actual": "Live-tested total planner failure by monkeypatching plan_query to always raise (simulating both primary and fallback LLM tiers being unavailable). Confirmed: run_pipeline() catches the exception at the intent-deconstruction step and returns a clean, honest error response ({\"error\": \"intent_failed: ...\", \"discovered\": 0}) -- no uncaught crash propagates to the caller, and no fabricated plan/results are returned.",
+    "status": "Pass",
+    "defect_id": "",
+    "remarks": ""
+  },
+  "GAP-FUNC-004": {
+    "actual": "Live-tested \"find 3 dentists in Islamabad or Lahore\". Plan correctly preserved BOTH cities in geo_location (\"Islamabad or Lahore, Pakistan\") and search_query -- neither location was silently dropped. needs_clarification correctly fired (though the specific questions asked were about goal/purpose and chain-vs-independent scope, not the multi-city angle specifically) -- a defensible interpretation per the expected result (clarify OR pick a defensible interpretation, never silently drop a location).",
+    "status": "Pass",
+    "defect_id": "",
+    "remarks": ""
+  },
+  "GAP-FUNC-005": {
+    "actual": "Live-tested a real 20-hop redirect chain (httpbin.org/redirect/20) through the actual fetch functions. _native_get correctly failed after 5.63s (aiohttp default max_redirects=10 caught it, no explicit config needed) -- returned None, not a hang. execute_scavenger_scrape correctly escalated through both tiers and failed cleanly with method=FAILED/failure_reason=all_tiers_exhausted. Bounded, no hang, no crash.",
+    "status": "Pass",
+    "defect_id": "",
+    "remarks": ""
   }
 }

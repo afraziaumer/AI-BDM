@@ -393,7 +393,11 @@ def _isolated_ingest() -> None:
     embedder.warmup()  # torch before chromadb — see top_matches.py's note
 
     import chromadb
-    client = chromadb.PersistentClient(path=EVAL_CHROMA_DIR)
+    # anonymized_telemetry=False: see rag/store.py's ChromaStore.__init__.
+    client = chromadb.PersistentClient(
+        path=EVAL_CHROMA_DIR,
+        settings=chromadb.Settings(anonymized_telemetry=False),
+    )
     col = client.get_or_create_collection(
         name=EVAL_COLLECTION, metadata={"hnsw:space": "cosine"}
     )

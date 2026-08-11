@@ -746,7 +746,14 @@ def top_matches(query: str, k: int = 10,
     query_vector = embedder.embed_one(query)
 
     import chromadb
-    client = chromadb.PersistentClient(path=chroma_dir or config.CHROMA_DIR)
+    # anonymized_telemetry=False: see rag/store.py's ChromaStore.__init__ for
+    # why -- this call site creates a FRESH client on every top_matches()
+    # call (unlike the embedder, which callers reuse), so it pays this
+    # network round-trip every single time if left on.
+    client = chromadb.PersistentClient(
+        path=chroma_dir or config.CHROMA_DIR,
+        settings=chromadb.Settings(anonymized_telemetry=False),
+    )
     col = client.get_or_create_collection(
         name=collection_name or config.CHROMA_COLLECTION,
         metadata={"hnsw:space": "cosine"},

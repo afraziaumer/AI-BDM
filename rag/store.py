@@ -39,7 +39,15 @@ class ChromaStore(VectorStore):
 
     def __init__(self) -> None:
         import chromadb
-        self._client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+        # anonymized_telemetry=False: Chroma pings PostHog on every client
+        # creation by default -- pure unnecessary network dependency for a
+        # local vector store of private scraped business data, and a real
+        # source of multi-minute hangs on a slow/restricted network (found
+        # while diagnosing a live RAG-stage hang).
+        self._client = chromadb.PersistentClient(
+            path=config.CHROMA_DIR,
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
         # cosine space to match our normalized embeddings.
         self._col = self._client.get_or_create_collection(
             name=config.CHROMA_COLLECTION,
