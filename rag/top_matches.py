@@ -712,6 +712,7 @@ def top_matches(query: str, k: int = 10,
                 collection_name: Optional[str] = None,
                 embedder: Optional[Any] = None,
                 source_type: Optional[str] = None,
+                unique_pages: bool = False,
                 ) -> List[Dict[str, Any]]:
     """Return the top-k chunks closest to `query`, ranked together in ONE
     combined list — never split into per-business sections, so a strong match
@@ -751,6 +752,20 @@ def top_matches(query: str, k: int = 10,
     the store is configured for cosine space and embeddings are normalized).
     Set keyword_boost=0 for pure semantic ranking (the old behavior) — this
     also disables the tiering, since it relies on the same match data.
+
+    `unique_pages` (default False): when True, at most ONE chunk per
+    distinct page URL survives into the top-k -- the single highest-scoring
+    chunk from that page, per the tiered sort above. Off by default because
+    the "scan every chunk" per-business evidence summary caller (see
+    ingest_and_answer.py) deliberately wants every matching chunk, not a
+    deduped top-k. Real gap found live: a single content-farm domain with
+    dozens of loosely on-topic articles could take ALL 15 top-website-chunk
+    slots (sometimes several chunks from the very same article), leaving
+    zero room for the other 8 real businesses in that run's results even
+    though they had their own, more specific matches. `_print_ranked_chunks`
+    (the actual "top 15" display) passes unique_pages=True so each slot
+    represents a distinct page, giving a genuinely diverse top-k instead of
+    one dominant source's chunks crowding everything else out.
     """
     # Reuse a caller-supplied, already-loaded embedder when given (e.g.
     # ingest_and_answer.py's single RagPipeline instance) instead of
@@ -1105,7 +1120,27 @@ def top_matches(query: str, k: int = 10,
         ),
         reverse=True,
     )
-    return results[:k]
+    if not unique_pages:
+        return results[:k]
+    return _dedup_by_page(results, k)
+
+
+def _dedup_by_page(sorted_results: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
+    """One chunk per distinct page: walk an already-sorted (best-first) list
+    and keep only the FIRST (i.e. highest-scoring) chunk seen for each url,
+    stopping once k distinct pages have been collected. Pulled out as its
+    own function so it's testable without a live Chroma store/embedder."""
+    seen_urls: Set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for r in sorted_results:
+        url = r["url"]
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        deduped.append(r)
+        if len(deduped) >= k:
+            break
+    return deduped
 
 
 def main() -> None:

@@ -84,14 +84,20 @@ def _load_last_run(path: str) -> Dict[str, Any]:
 
 def _print_ranked_chunks(label: str, source_type: str, query: str, k: int,
                           domains: List[str], embedder: Any) -> None:
-    """Print the top-k chunks (one category only, via source_type) for `domains`."""
+    """Print the top-k chunks (one category only, via source_type) for `domains`.
+
+    unique_pages=True: at most one chunk per distinct page survives into
+    this top-k, so a single domain with many loosely on-topic pages can't
+    fill every slot and crowd out the run's other businesses (real gap
+    found live -- see top_matches()'s unique_pages docstring)."""
     if not domains:
         print(f"\n{label}: nothing ingested for this run — skipped.")
         return
     print(f"[rag] Ranking {label.lower()}...")
     _t0 = time.time()
     matches = top_matches(query, k=k, business=domains,
-                         embedder=embedder, source_type=source_type)
+                         embedder=embedder, source_type=source_type,
+                         unique_pages=True)
     print(f"[rag] {label} ranked in {time.time() - _t0:.1f}s.")
     print(f"\n{'=' * 70}\n{label} — top {len(matches)} chunk(s), hybrid score "
           f"(semantic + keyword bonus)\n{'=' * 70}")
