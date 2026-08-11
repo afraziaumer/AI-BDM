@@ -87,13 +87,16 @@ async def _plan_interactively(query: str, concurrency: int) -> Dict:
 
     Capped at MAX_CLARIFICATION_ROUNDS so a model that keeps finding more to
     ask can't loop forever -- after the cap (or if the user just presses
-    enter with no answer), proceeds with that round's plan regardless. Every
-    field is always filled in with a best guess even when needs_clarification
-    is true (see LLM_planner.py's step K), so forcing it through never
-    leaves the plan unusable.
+    enter with no answer), re-runs run_pipeline() ONE more time with
+    bypass_clarification=True so discovery genuinely executes against the
+    plan's best-guess fields (see LLM_planner.py's step K -- every field is
+    always filled in even when needs_clarification is true). Real bug fixed
+    here: an earlier version just flipped needs_clarification to False on
+    the SAME summary object run_pipeline() had already returned early with
+    (before any discovery ever ran) -- "proceeding with my best guess"
+    silently did nothing, returning zero results while claiming success.
     """
     current_query = query
-    summary: Dict = {}
     for round_num in range(1, MAX_CLARIFICATION_ROUNDS + 1):
         summary = await p1.run_pipeline(current_query, concurrency=concurrency)
         if not summary.get("needs_clarification"):
@@ -108,12 +111,16 @@ async def _plan_interactively(query: str, concurrency: int) -> Dict:
 
         if round_num == MAX_CLARIFICATION_ROUNDS:
             print("(That's enough back-and-forth -- proceeding with my best guess.)")
-            break
+            return await p1.run_pipeline(
+                current_query, concurrency=concurrency, bypass_clarification=True,
+            )
 
         answer = input("Your answer: ").strip()
         if not answer:
             print("(No answer given -- proceeding with my best guess.)")
-            break
+            return await p1.run_pipeline(
+                current_query, concurrency=concurrency, bypass_clarification=True,
+            )
         # Ties the answer back to the exact question(s) it's answering,
         # instead of just tacking it onto the end of the query as a bare
         # sentence. Confirmed live this matters: a query like "3 salons in
@@ -130,8 +137,10 @@ async def _plan_interactively(query: str, concurrency: int) -> Dict:
             f"(Previously asked: \"{questions_text}\" -- answer: \"{answer}\")"
         )
 
-    summary["needs_clarification"] = False
-    return summary
+    # Unreachable: the loop's final iteration (round_num == MAX_CLARIFICATION_ROUNDS)
+    # always returns explicitly above. Kept only so the function has an
+    # unconditional return for type-checking purposes.
+    raise AssertionError("unreachable: every loop path returns explicitly")
 
 
 async def run(query: str, concurrency: int = 10,

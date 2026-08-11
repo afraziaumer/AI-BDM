@@ -3366,6 +3366,7 @@ async def run_pipeline(
     concurrency: int = 5,
     progress_cb: Optional[Callable[[str, Optional[int], Optional[int], str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    bypass_clarification: bool = False,
 ) -> Dict[str, Any]:
     """Run the full Phase 1 pipeline end to end and return a result summary.
 
@@ -3473,7 +3474,18 @@ async def run_pipeline(
     # request too unresolved to run confidently (see LLM_planner's step K).
     # The user re-runs with more detail added; this never blocks a request
     # that was already specific enough, which is still the common case.
-    if plan.get("needs_clarification"):
+    #
+    # bypass_clarification=True skips this stop even when the plan still
+    # wants to ask something -- used by main.py's _plan_interactively() once
+    # its round cap/no-answer fallback decides to "proceed with its best
+    # guess" (every plan field is always filled in with a real value even
+    # when needs_clarification is true -- see LLM_planner.py step K -- so
+    # there's a genuine, usable plan to run discovery with here). Confirmed
+    # live (QA suite AI-BDM-124/129): without this bypass, the caller's
+    # "proceed with my best guess" fallback just relabeled THIS early-return
+    # stub summary (discovered=0, qualified=[]) as resolved instead of ever
+    # actually running discovery -- a real bug, not a hypothetical one.
+    if plan.get("needs_clarification") and not bypass_clarification:
         summary["needs_clarification"] = True
         summary["clarification_questions"] = plan.get("clarification_questions") or []
         return summary
