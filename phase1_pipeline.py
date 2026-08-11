@@ -2542,8 +2542,15 @@ _STREET_SUFFIX = (
 # conventions were previously unmatched entirely: a letter-suffixed plot/house
 # number ("17-E G-10 Markaz"), and a number followed directly by a comma
 # ("Office No 14, Ground Floor") rather than whitespace.
+#
+# The middle filler group is `{0,45}?`, not `{1,45}?`/`{2,45}?` -- confirmed
+# live (QA suite REG-008) that requiring at least one filler character
+# rejected a real, valid, common South Asian pattern where the street-suffix
+# word is the VERY NEXT token after the house number with nothing else in
+# between ("8 Markaz, Islamabad 44000" -- house #8 in "Markaz" itself, not
+# "8 [some street] Markaz"). Zero filler characters must be allowed too.
 _ADDRESS_RE = re.compile(
-    r"\d{1,6}(?:-[A-Za-z])?[\s,]+[A-Za-z0-9.\-'#, ]{2,45}?\b" + _STREET_SUFFIX +
+    r"\d{1,6}(?:-[A-Za-z])?[\s,]+[A-Za-z0-9.\-'#, ]{0,45}?\b" + _STREET_SUFFIX +
     r"\b\.?[A-Za-z0-9.,\-#/'’ ]{0,70}",
     re.IGNORECASE,
 )
