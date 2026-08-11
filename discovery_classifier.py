@@ -185,6 +185,16 @@ for _b, _n in (
     ("resy", "Resy"), ("squaremeal", "SquareMeal"), ("restaurantguru", "RestaurantGuru"),
     ("sirved", "Sirved"), ("menupix", "MenuPix"), ("wanderlog", "Wanderlog"),
     ("allmenus", "Allmenus"), ("timeout", "Time Out"), ("eater", "Eater"),
+    # hotel/travel booking OTAs — same shape again: many businesses, real
+    # outbound listing pages per property. Found live: priceline.com got
+    # deep-crawled as if IT were a single Colorado hotel, following its own
+    # internal navigation across dozens of unrelated cities/countries
+    # (Toronto, Florence, Phoenix, Memphis...) as "high-intent pages" of
+    # that one committed "business."
+    ("priceline", "Priceline"), ("expedia", "Expedia"), ("booking", "Booking.com"),
+    ("kayak", "Kayak"), ("trivago", "Trivago"), ("agoda", "Agoda"),
+    ("orbitz", "Orbitz"), ("travelocity", "Travelocity"), ("hotwire", "Hotwire"),
+    ("hotels", "Hotels.com"), ("hoteltonight", "HotelTonight"),
 ):
     _register(_b, _n, Confidence.MEDIUM)
 
@@ -193,7 +203,9 @@ for _b, _n in (
     ("cylex", "Cylex"), ("brownbook", "Brownbook"), ("n49", "N49"),
     ("cybo", "Cybo"), ("citypass", "CityPass"), ("sulekha", "Sulekha"),
     ("sitejabber", "Sitejabber"), ("vitals", "Vitals"), ("ratemds", "RateMDs"),
-    ("hotels", "Hotels directory"),
+    # "hotels" moved to the MEDIUM tier above as "Hotels.com" (a duplicate
+    # key here would have silently overwritten it, since this loop runs
+    # after and DISCOVERY_SOURCE_REGISTRY is a plain dict).
 ):
     _register(_b, _n, Confidence.LOW)
 

@@ -73,6 +73,25 @@ def test_five_hyphen_slug_is_the_exact_threshold():
     assert result.category == dc.ResultCategory.DISCOVERY_SOURCE
 
 
+def test_priceline_hotel_listing_page_is_a_discovery_source():
+    """Real gap found live: priceline.com (a global hotel-booking OTA, same
+    category as Expedia/Booking.com/Kayak) was missing from
+    DISCOVERY_SOURCE_REGISTRY entirely, so it got deep-crawled as if it
+    were a single Colorado hotel business -- following its own internal
+    navigation across dozens of unrelated cities/countries (Toronto,
+    Florence, Phoenix, Memphis) as "high-intent pages" of that one
+    committed lead."""
+    url = "https://www.priceline.com/hotel-deals/en-us/P3000033452/H65567/hilton-toronto.ssp"
+    result = dc.classify_search_result(url, "Hilton Toronto - Priceline")
+    assert result.category == dc.ResultCategory.DISCOVERY_SOURCE
+    assert result.source_name == "Priceline"
+
+
+def test_real_hotel_homepage_stays_official():
+    result = dc.classify_search_result("https://www.stanleyhotel.com/", "The Stanley Hotel")
+    assert result.category == dc.ResultCategory.OFFICIAL
+
+
 def test_allpages_category_listing_page_is_a_discovery_source():
     """Real gap found live in the SAME run as the takemetotn.com bug:
     allpages.com (a general business directory, same category as Yellow
