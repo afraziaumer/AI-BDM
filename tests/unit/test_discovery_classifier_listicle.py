@@ -71,3 +71,16 @@ def test_five_hyphen_slug_is_the_exact_threshold():
     assert url.count("-") == 5
     result = dc.classify_search_result(url, "")
     assert result.category == dc.ResultCategory.DISCOVERY_SOURCE
+
+
+def test_allpages_category_listing_page_is_a_discovery_source():
+    """Real gap found live in the SAME run as the takemetotn.com bug:
+    allpages.com (a general business directory, same category as Yellow
+    Pages/Manta/Hotfrog which are already registered) was missing from
+    DISCOVERY_SOURCE_REGISTRY entirely, so its category-listing page
+    ("restaurants-food-dining/north-american-restaurants/texas.html") got
+    committed as if the LISTING PAGE itself were a restaurant business."""
+    url = "https://www.allpages.com/restaurants-food-dining/north-american-restaurants/texas.html"
+    result = dc.classify_search_result(url, "North American Restaurants, Texas (TX)")
+    assert result.category == dc.ResultCategory.DISCOVERY_SOURCE
+    assert result.source_name == "AllPages"

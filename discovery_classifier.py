@@ -172,6 +172,10 @@ for _b, _n in (
     ("yellowpages", "Yellow Pages"), ("yelp", "Yelp"), ("tripadvisor", "TripAdvisor"),
     ("clutch", "Clutch"), ("foursquare", "Foursquare"), ("mapquest", "MapQuest"),
     ("manta", "Manta"), ("hotfrog", "Hotfrog"), ("bbb", "Better Business Bureau"),
+    # allpages.com was previously missing here (found live: its category-
+    # listing page "restaurants-food-dining/north-american-restaurants/
+    # texas.html" got committed as if IT were a restaurant business).
+    ("allpages", "AllPages"),
     ("crunchbase", "Crunchbase"), ("trustpilot", "Trustpilot"),
     ("justdial", "Justdial"), ("healthgrades", "Healthgrades"),
     ("zocdoc", "Zocdoc"), ("opencare", "Opencare"), ("citysearch", "Citysearch"),
