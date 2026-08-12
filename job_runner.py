@@ -152,6 +152,7 @@ def resume_job(
         correlation_id=new_correlation_id,
         requested_at=utc_now(),
         target=original.request.target,
+        raw_query=original.request.raw_query,
         limits=original.request.limits,
         features=original.request.features,
     )

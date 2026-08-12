@@ -19,10 +19,13 @@ The job store is **in-process** (a plain Python dict in `job_runner.py`), not Re
 | 4.6 Errors | `job_contracts.py` (`ErrorEnvelope`, `ErrorClass`, `classify_error()`) | Maps known failure signals (the same ones `docs/RUNBOOK.md`'s "Known failure modes" table already documents) onto the 8-class taxonomy |
 | Execution | `job_runner.py` | In-process job store: `submit_job()`/`get_status()`/`cancel_job()`/`get_result()`/`resume_job()`, background `asyncio` task per job |
 | HTTP surface | `api.py`, `/api/v1/jobs/*` | `POST /jobs`, `GET /jobs/{job_id}`, `GET /jobs/{job_id}/result`, `POST /jobs/{job_id}/cancel`, `POST /jobs/{job_id}/resume` |
+| HTTP surface (raw-query) | `api.py`, `/api/v1/run-ai-bdm`, `/api/v1/ai-bdm/{job_id}` | Thin envelope over the same `job_runner.py` for a caller with one sentence instead of a structured `target` — see `LARAVEL_QUICKSTART.md` |
 
 ## Request → query translation, honestly
 
-`target_to_query()` builds a sentence like `"find 25 commercial cleaning businesses in Philadelphia, PA, US"` from the structured request. Three fields cannot be honestly represented and are surfaced as warnings on the eventual `JobResult`, never silently dropped or faked as working:
+`target_to_query()` builds a sentence like `"find 25 commercial cleaning businesses in Philadelphia, PA, US"` from the structured request. `JobRequest.raw_query` bypasses this templating entirely — set it (instead of `target`) when the caller already has one natural-language sentence, and it's passed to the planner verbatim. `POST /api/v1/run-ai-bdm` (`LARAVEL_QUICKSTART.md`) always uses this path; forcing a raw sentence through `target.industry` instead would mangle it (the sentence would get wrapped inside the `"find {count} {industry} businesses"` template a second time). Exactly one of `target`/`raw_query` must be set — the request is rejected otherwise.
+
+For the structured `target` path, three fields cannot be honestly represented and are surfaced as warnings on the eventual `JobResult`, never silently dropped or faked as working:
 
 - **`target.company_size`** — no employee-count signal exists anywhere in this pipeline's scrape/enrichment/scoring path. Ignored, flagged.
 - **`features.tech_stack`** — `needs_tech_stack` is an LLM-inferred field on the plan, not a directly settable parameter. The query is phrased to make the planner likely to set it (`"...including their website technology stack"`), but this is a nudge, not a guarantee.
@@ -53,6 +56,8 @@ The heartbeat is a **separate** `asyncio` task ticking `last_heartbeat_at` every
 ## Idempotency-Key (POST /api/v1/pipeline/run)
 
 `POST /api/v1/jobs` already had an idempotency key of its own — `job_id` (a duplicate submission is rejected with 409). The synchronous `POST /api/v1/pipeline/run` endpoint had none at all: a client retry (e.g. after a client-side timeout, with the server call having actually succeeded) would silently trigger a full second pipeline run. An optional `Idempotency-Key` header now closes that gap — a repeated call with the same key replays the exact prior outcome (same status code, same body, success **or** error) instead of re-executing. Implemented as an in-process dict in `api.py` (`_idempotency_store`), same honest limitation as the job store: **no TTL, no eviction, grows for the life of the process.**
+
+**Concurrent (not just sequential) same-key requests**: a real gap found live — the store above only ever holds a *completed* result, so two requests with the same key arriving truly concurrently (both before either finishes) both passed the "nothing cached yet" check and both ran the full pipeline. Fixed with a second, separate in-process set (`_idempotency_inflight`) that reserves a key for the duration of an in-flight request; a concurrent duplicate now gets `409` instead of triggering a second run. Checked/set synchronously (no `await` between the check and the reservation), so it can't itself race within one process — but like the result cache, it's process-local, not a cross-process lock.
 
 ## Resume (POST /api/v1/jobs/{job_id}/resume)
 

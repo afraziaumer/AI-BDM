@@ -177,12 +177,20 @@ def _extract_fields(place: Dict[str, Any]) -> Dict[str, Any]:
     """Pull the fields we care about out of one Serper place result,
     defensively — Serper's field names have shifted before, so every read
     falls back to an alternate key rather than raising."""
-    rating_count = (
-        place.get("ratingCount")
-        or place.get("reviewsCount")
-        or place.get("reviews")
-        or 0
-    )
+    # Real bug found live (professional QA suite, AI-BDM-196 "zero reviews
+    # -> 0 accepted as valid, not negative"): `or`-chaining falls through on
+    # ANY falsy value, not just a missing key -- a business with a genuine
+    # 0 in "ratingCount" got silently overridden by whatever the next key
+    # in the chain happened to hold, instead of the explicit 0 being
+    # respected. Checking `is not None` per key preserves the same
+    # alternate-key fallback behavior for a genuinely MISSING field while
+    # trusting an explicit 0 in the first field that's actually present.
+    rating_count = 0
+    for key in ("ratingCount", "reviewsCount", "reviews"):
+        value = place.get(key)
+        if value is not None:
+            rating_count = value
+            break
     return {
         "title": place.get("title", ""),
         "address": place.get("address", ""),
@@ -225,21 +233,44 @@ async def find_place(session: aiohttp.ClientSession, name: str,
     if not results:
         return {"matched": False, "reason": "no Serper results"}
 
-    for place in results:
-        fields = _extract_fields(place)
-        if _looks_like_match(fields["address"], address):
-            fields["matched"] = True
-            fields["match_basis"] = "address"
-            fields["query"] = query
-            return fields
-        if _phone_matches(fields["phone"], phone):
-            fields["matched"] = True
-            fields["match_basis"] = "phone"
-            fields["query"] = query
-            return fields
+    all_fields = [_extract_fields(p) for p in results]
+    address_candidates = [f for f in all_fields if _looks_like_match(f["address"], address)]
+    phone_candidates = [f for f in all_fields if _phone_matches(f["phone"], phone)]
+
+    if len(address_candidates) == 1:
+        fields = address_candidates[0]
+        fields["matched"] = True
+        fields["match_basis"] = "address"
+        fields["query"] = query
+        return fields
+
+    if len(address_candidates) > 1:
+        # More than one candidate shares the address (a strip mall, a shared
+        # building -- a real, common case) -- address alone can no longer
+        # tell them apart. Real bug found live: without this branch, the
+        # loop below would have silently returned the FIRST address-sharing
+        # result in whatever order Serper happened to list them, even when
+        # a LATER candidate's phone number actually matched the known
+        # business. Phone (independently trusted evidence) or a full
+        # name-containment match now disambiguates among the co-located
+        # candidates; if none of them corroborates, this falls through to
+        # "no confident match" rather than guessing which one is right.
+        for fields in address_candidates:
+            if _phone_matches(fields["phone"], phone) or _name_only_match(fields["title"], name):
+                fields["matched"] = True
+                fields["match_basis"] = "address+corroborated"
+                fields["query"] = query
+                return fields
+
+    if phone_candidates:
+        fields = phone_candidates[0]
+        fields["matched"] = True
+        fields["match_basis"] = "phone"
+        fields["query"] = query
+        return fields
 
     if len(results) == 1:
-        fields = _extract_fields(results[0])
+        fields = all_fields[0]
         if _name_only_match(fields["title"], name):
             fields["matched"] = True
             fields["match_basis"] = "name_only"
@@ -249,7 +280,7 @@ async def find_place(session: aiohttp.ClientSession, name: str,
 
     # Nothing matched confidently -> report the top candidate for visibility
     # but do NOT mark it matched (no address/phone/exact-name-alone match).
-    top = _extract_fields(results[0])
+    top = all_fields[0]
     top["matched"] = False
     top["reason"] = "no address/phone/exact-name match with known business details"
     top["query"] = query

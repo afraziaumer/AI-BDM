@@ -369,8 +369,21 @@ def analyze_raw_html(
     """
     from wappalyzer import WebPage
     url = domain if domain.startswith(("http://", "https://")) else f"https://{domain}/"
-    webpage = WebPage(url, html=html, headers=headers or {})
-    raw = _run_wappalyzer_on_webpage(webpage)
+    # Real gap found live (professional QA suite, AI-BDM-153 "one engine
+    # failure -> other detection engines still contribute"): unlike the
+    # three engines below, this call was NOT individually guarded -- a
+    # legacy-engine exception propagated out of analyze_raw_html() entirely,
+    # so the caller's single outer try/except (phase1_pipeline.py) discarded
+    # the WHOLE detection pass, including extended/DNS/robots signals that
+    # don't depend on the legacy engine's output at all. Isolated the same
+    # way as the other three so one engine's failure only means one fewer
+    # signal source, matching this function's own documented contract.
+    try:
+        webpage = WebPage(url, html=html, headers=headers or {})
+        raw = _run_wappalyzer_on_webpage(webpage)
+    except Exception as exc:  # noqa: BLE001 - one engine is best-effort
+        logger.warning("Legacy Wappalyzer detection failed for %s: %s", domain, exc)
+        raw = {}
 
     cookie_dict = _parse_set_cookie_headers(cookies)
     try:

@@ -271,3 +271,61 @@ def test_pipeline_run_idempotency_key_reused_with_different_payload_returns_409(
     assert r1.status_code == 200
     assert r2.status_code == 409  # different payload, same key -- rejected, not silently mixed
     assert r3.status_code == 200 and r3.json() == r1.json()  # original payload still replays cleanly
+
+
+def test_pipeline_run_truly_concurrent_same_key_requests_run_the_pipeline_only_once(client, monkeypatch):
+    """Real bug found live (professional QA suite, AI-BDM-334 "concurrent
+    same-key requests -- only one underlying operation should execute"):
+    the idempotency store only ever held a COMPLETED result, so two
+    requests with the SAME Idempotency-Key arriving truly concurrently
+    (not sequentially) both passed the "nothing cached yet" check and both
+    ran the full pipeline -- reproduced live, call count 2 for 2 concurrent
+    requests sharing one key. Fixed with an in-flight reservation set,
+    checked/set synchronously before the pipeline call; a concurrent
+    duplicate is now rejected with 409 instead of triggering a second run."""
+    call_count = {"n": 0}
+
+    async def slow_pipeline(query, concurrency=5):
+        call_count["n"] += 1
+        await asyncio.sleep(0.05)  # give the second request room to slip through pre-fix
+        return {"query": query, "discovered": 1, "qualified": [], "results": [], "error": None, "blocked": False}
+    monkeypatch.setattr(api.pipeline, "run_pipeline", slow_pipeline)
+
+    async def scenario():
+        async with client as c:
+            headers = {**HEADERS, "Idempotency-Key": "idem-concurrent-key"}
+            body = {"query": "find 3 dental clinics"}
+            r1, r2 = await asyncio.gather(
+                c.post("/api/v1/pipeline/run", json=body, headers=headers),
+                c.post("/api/v1/pipeline/run", json=body, headers=headers),
+            )
+            return r1, r2
+
+    r1, r2 = asyncio.run(scenario())
+    statuses = sorted([r1.status_code, r2.status_code])
+    assert statuses == [200, 409]  # one succeeds, one rejected -- never both 200
+    assert call_count["n"] == 1  # the underlying pipeline ran exactly once
+
+
+def test_pipeline_run_inflight_reservation_is_released_even_on_a_blocked_response(client, monkeypatch):
+    """The in-flight reservation must be released in a finally block -- an
+    HTTPException raised mid-request (moderation block / upstream error)
+    must not leave the key permanently stuck as "in progress"."""
+    async def blocked_pipeline(query, concurrency=5):
+        return {"blocked": True, "error": "policy"}
+    monkeypatch.setattr(api.pipeline, "run_pipeline", blocked_pipeline)
+
+    async def scenario():
+        async with client as c:
+            headers = {**HEADERS, "Idempotency-Key": "idem-release-key"}
+            body = {"query": "find 3 dental clinics"}
+            r1 = await c.post("/api/v1/pipeline/run", json=body, headers=headers)
+            # A second call with the SAME key, after the first fully completed,
+            # must replay the cached blocked outcome -- not hang or 409 forever.
+            r2 = await c.post("/api/v1/pipeline/run", json=body, headers=headers)
+            return r1, r2
+
+    r1, r2 = asyncio.run(scenario())
+    assert r1.status_code == 400
+    assert r2.status_code == 400
+    assert r1.json() == r2.json()

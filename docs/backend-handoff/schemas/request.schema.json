@@ -55,11 +55,18 @@
     "Limits": {
       "properties": {
         "max_prospects": {
+          "anyOf": [
+            {
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": 20,
-          "maximum": 500,
-          "minimum": 1,
-          "title": "Max Prospects",
-          "type": "integer"
+          "title": "Max Prospects"
         },
         "max_pages_per_domain": {
           "default": 20,
@@ -169,7 +176,29 @@
       "type": "string"
     },
     "target": {
-      "$ref": "#/$defs/Target"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Target"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "raw_query": {
+      "anyOf": [
+        {
+          "minLength": 3,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Natural-language query passed to the planner verbatim, bypassing target->query templating entirely.",
+      "title": "Raw Query"
     },
     "limits": {
       "$ref": "#/$defs/Limits"
@@ -182,8 +211,7 @@
     "job_id",
     "tenant_ref",
     "correlation_id",
-    "requested_at",
-    "target"
+    "requested_at"
   ],
   "title": "JobRequest",
   "type": "object",

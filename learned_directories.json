@@ -14,5 +14,9 @@
   "sba.gov": {
     "reason": "The site is the U.S. Small Business Administration, a federal government agency providing resources and information. It is not a single business, nor a directory or marketplace of businesses. Therefore it should be rejected for deep crawling.",
     "learned_at": 1786515079.217628
+  },
+  "oladoc.com": {
+    "reason": "The page is a listing for a single dental clinic on oladoc.com, which is a medical professional directory. It contains many outbound links to other cities and specialties, indicating a directory structure rather than an official business website. Therefore, the crawler should extract business URLs f",
+    "learned_at": 1786527913.0192559
   }
 }

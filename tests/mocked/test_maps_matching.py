@@ -125,7 +125,68 @@ def test_name_only_fallback_disabled_with_multiple_candidates(monkeypatch):
     assert result["matched"] is False
 
 
+def test_extract_fields_treats_explicit_zero_rating_count_as_valid():
+    """Real bug found live (professional QA suite, AI-BDM-196 "zero reviews
+    -> 0 accepted as valid, not negative"): the old `or`-chain
+    (place.get("ratingCount") or place.get("reviewsCount") or ...) falls
+    through on ANY falsy value, so a place with a genuine ratingCount=0 got
+    silently overridden by whatever the NEXT key in the chain held instead
+    of the explicit 0 being respected."""
+    from phase3.google_maps import _extract_fields
+    place = {"title": "X", "address": "", "rating": 4.5,
+             "ratingCount": 0, "reviewsCount": 15, "phoneNumber": ""}
+    assert _extract_fields(place)["rating_count"] == 0
+
+
+def test_extract_fields_falls_back_to_the_next_key_when_the_first_is_absent():
+    from phase3.google_maps import _extract_fields
+    place = {"title": "Y", "address": "", "reviewsCount": 8, "phoneNumber": ""}
+    assert _extract_fields(place)["rating_count"] == 8
+
+
+def test_extract_fields_defaults_to_zero_when_no_count_key_is_present():
+    from phase3.google_maps import _extract_fields
+    place = {"title": "Z", "address": "", "phoneNumber": ""}
+    assert _extract_fields(place)["rating_count"] == 0
+
+
 def test_no_results_returns_unmatched(monkeypatch):
     result = _run_find_place(monkeypatch, [], name="Example Co")
     assert result["matched"] is False
     assert result["reason"] == "no Serper results"
+
+
+def test_shared_address_disambiguated_by_phone(monkeypatch):
+    """Real bug found live (professional QA suite, DATA-012 "two businesses
+    same address"): two unrelated businesses share a building, both share a
+    token with the known address. The OLD code returned whichever candidate
+    Serper happened to list first, even when a later candidate's phone
+    number actually matched -- silently attaching a competitor's rating/
+    category/reviews to the wrong business. Phone must disambiguate."""
+    places = [
+        _place(title="Jones Dental", address="123 Main St, Plaza", phone="555-2222", cid="wrong"),
+        _place(title="Smith Dental", address="123 Main St, Plaza", phone="555-1111", cid="right"),
+    ]
+    result = _run_find_place(
+        monkeypatch, places, name="Smith Dental",
+        address="123 Main St, Plaza", phone="555-1111",
+    )
+    assert result["matched"] is True
+    assert result["cid"] == "right"
+    assert result["match_basis"] == "address+corroborated"
+
+
+def test_shared_address_with_no_corroboration_does_not_guess(monkeypatch):
+    """Same shared-address scenario, but this time neither candidate's phone
+    (nor a full name match) confirms which one is right -- must NOT guess
+    by picking the first one, same 'never guess' principle as every other
+    tier in this hierarchy."""
+    places = [
+        _place(title="Jones Dental", address="123 Main St, Plaza", phone="555-2222", cid="a"),
+        _place(title="Other Dental", address="123 Main St, Plaza", phone="555-3333", cid="b"),
+    ]
+    result = _run_find_place(
+        monkeypatch, places, name="Smith Dental Group",
+        address="123 Main St, Plaza", phone="555-1111",
+    )
+    assert result["matched"] is False

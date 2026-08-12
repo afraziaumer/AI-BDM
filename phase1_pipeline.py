@@ -250,6 +250,11 @@ MAX_SOFT_FAIL_RETRIES = 2
 USE_PLACES_DISCOVERY = False
 SERPER_TIMEOUT_S = 15            # discovery requests
 NATIVE_FETCH_TIMEOUT_S = 10      # Tier-1 free request (fail fast, escalate/skip)
+MAX_PAGE_BYTES = 20 * 1024 * 1024  # 20 MB cap on a single fetched page body -- see
+                                    # _read_html(); a malicious/misbehaving server could
+                                    # otherwise stream an arbitrarily large body well
+                                    # within NATIVE_FETCH_TIMEOUT_S/PREMIUM_TIMEOUT_S,
+                                    # which bound time but not bytes
 # NOTE: intra-site fetch batching was removed on purpose. The streaming crawl
 # processes strictly ONE page at a time (fetch → clean → stage → free) so at
 # most one page's raw HTML is ever in RAM per business being crawled.
@@ -643,8 +648,24 @@ async def _read_html(resp: aiohttp.ClientResponse) -> str:
     """Decode a response body as UTF-8 first (most sites), falling back to the
     declared charset only if that fails. Avoids the mojibake (â€™, Ã©) you get
     when aiohttp trusts a wrong/missing charset header on a UTF-8 page.
+
+    Reads in bounded chunks up to MAX_PAGE_BYTES rather than resp.read()'s
+    unbounded single buffer -- real gap found live (professional QA suite,
+    SEC-008): NATIVE_FETCH_TIMEOUT_S/PREMIUM_TIMEOUT_S bound how long a fetch
+    may run, but nothing bounded how many bytes a server could stream within
+    that window. A page that hits the cap is truncated (decoded as far as it
+    was read, on a UTF-8 boundary) rather than the whole fetch failing --
+    every caller already treats "some real HTML came back" as usable, and
+    truncated HTML is still real evidence, not fabricated.
     """
-    raw = await resp.read()
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(65536):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= MAX_PAGE_BYTES:
+            break
+    raw = b"".join(chunks)
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:

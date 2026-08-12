@@ -101,6 +101,40 @@ def test_field_validity_catches_out_of_range_rating(fixture_row):
     assert any("maps_rating" in f for f in flags)
 
 
+def test_field_validity_catches_malformed_phone(fixture_row):
+    import accuracy_check
+    bad_row = dict(fixture_row)
+    bad_row["phone_number"] = "123"
+    flags = accuracy_check.check_field_validity(bad_row)
+    assert any("phone" in f for f in flags)
+
+
+def test_field_validity_accepts_a_valid_phone(fixture_row):
+    import accuracy_check
+    row = dict(fixture_row)
+    row["phone_number"] = "+1 555 234 5678"
+    flags = accuracy_check.check_field_validity(row)
+    assert not any("phone" in f for f in flags)
+
+
+def test_field_validity_catches_negative_review_count(fixture_row):
+    import accuracy_check
+    bad_row = dict(fixture_row)
+    bad_row["maps_rating_count"] = "-5"
+    flags = accuracy_check.check_field_validity(bad_row)
+    assert any("maps_rating_count" in f for f in flags)
+
+
+def test_field_validity_accepts_zero_review_count_as_valid(fixture_row):
+    """Zero reviews is a genuine, valid state -- must not be flagged as if
+    it were negative/invalid data."""
+    import accuracy_check
+    row = dict(fixture_row)
+    row["maps_rating_count"] = "0"
+    flags = accuracy_check.check_field_validity(row)
+    assert not any("maps_rating_count" in f for f in flags)
+
+
 def test_identity_consistency_passes_matching_fixture(fixture_row):
     """The fixture's company_name ("Example Dental Clinic") and page_title
     ("Example Dental Clinic - Home") share real word overlap, and the

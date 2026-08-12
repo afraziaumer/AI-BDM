@@ -64,10 +64,12 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import re
 import shutil
 import threading
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -587,11 +589,44 @@ class LocalPageStore(PageStore):
         staged = self._staging_dir(domain)
         final = self._final_dir(domain)
         # Move staged text files into final storage (replace any prior copy).
+        #
+        # Real bug found live (professional QA suite, SEC-013 "concurrent
+        # same business"): the old sequence was check-then-act --
+        # `if final.exists(): shutil.rmtree(final)` followed by a separate
+        # `shutil.move(staged, final)`. Reproduced directly: if a second
+        # commit_domain() call for the SAME domain (e.g. two overlapping
+        # runs, or a multi-worker API deployment) lands its move while
+        # `final` still exists from the first, shutil.move() does NOT
+        # replace an existing directory -- it moves the source INSIDE it,
+        # producing a corrupted nested layout (storage/<domain>/<domain>/...)
+        # rather than either a clean overwrite or a clean failure. This is
+        # safe from same-process asyncio-task interleaving (this method has
+        # no `await` inside it, so one process's own concurrent tasks can
+        # never interleave here) but NOT safe across separate processes
+        # (multiple uvicorn workers, or two overlapping CLI runs) -- see
+        # docs/KNOWN_LIMITATIONS.md.
+        #
+        # Fixed by never moving INTO a path that might still exist: rename
+        # any prior `final` out of the way first (atomic on both POSIX and
+        # Windows for an os.rename of an existing directory), then rename
+        # the new content in. This eliminates the nesting-corruption failure
+        # mode entirely and narrows the unsafe window from "however long
+        # rmtree+move take" to two back-to-back atomic renames -- it does
+        # NOT add a cross-process lock (this codebase has none), so it is a
+        # real improvement, not a complete guarantee under true concurrent
+        # multi-process writes to the same domain.
         if staged.exists():
-            if final.exists():
-                shutil.rmtree(final)
             final.parent.mkdir(parents=True, exist_ok=True)
+            stale = None
+            if final.exists():
+                stale = final.with_name(f"{final.name}.stale-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+                try:
+                    os.rename(final, stale)
+                except OSError:
+                    stale = None  # another process already moved it out -- fine, proceed
             shutil.move(str(staged), str(final))
+            if stale is not None:
+                shutil.rmtree(stale, ignore_errors=True)
         with self._lock:
             links = self._link_buffers.pop(domain, {})
             rows = self._index_buffers.pop(domain, [])
@@ -680,8 +715,25 @@ class LocalPageStore(PageStore):
     def read_index(self) -> List[Dict[str, str]]:
         if not self.index_path.exists():
             return []
-        with open(self.index_path, newline="", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
+        # Real gap found live (professional QA suite, AI-BDM-268 "corrupt
+        # CSV -> system handles corrupted data gracefully"): a genuinely
+        # corrupted crawl_index.csv (e.g. invalid UTF-8 bytes from a
+        # truncated/interrupted write) raised an uncaught UnicodeDecodeError
+        # here, propagating to every caller (api.py's /leads, main.py,
+        # accuracy_check.py, final_reasoning.py) -- inconsistent with
+        # read_page_text() two methods below, which already catches this
+        # exact failure mode on the same kind of file read. An empty index
+        # (same as "file doesn't exist") is the safe degrade -- it never
+        # fabricates rows, it just means nothing is currently readable.
+        try:
+            with open(self.index_path, newline="", encoding="utf-8") as f:
+                return list(csv.DictReader(f))
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            logging.getLogger("ai_bdm.storage").warning(
+                "crawl_index.csv is unreadable/corrupted (%s) -- returning an "
+                "empty index rather than crashing the caller.", exc,
+            )
+            return []
 
     def read_page_text(self, txt_path: str) -> str:
         try:

@@ -123,6 +123,43 @@ def test_contact_union_across_pages():
     assert "+15559876543" in businesses[0]["phone_number"]
 
 
+def test_KNOWN_DEFECT_two_different_businesses_on_one_domain_are_merged():
+    """Characterizes a REAL, CURRENTLY UNFIXED defect found live (professional
+    QA suite, AI-BDM-278/279), documented in docs/KNOWN_LIMITATIONS.md --
+    NOT an assertion that this is correct behavior. to_business_level()
+    groups by _domain only, with no company_name component, so two
+    genuinely different businesses sharing one institutional domain collapse
+    into a single record: the minority business disappears entirely and its
+    contact info gets unioned onto the survivor. This test pins today's
+    actual (wrong) behavior so a real identity-model fix (tracked as a
+    known limitation, not attempted in this pass -- see KNOWN_LIMITATIONS.md
+    for why it's architecturally deeper than this one function) shows up
+    here as an intentional, reviewed change rather than a silent regression
+    either direction."""
+    from data_pipeline import to_business_level
+
+    pages = [
+        _row(
+            _domain="hudsonriverpark.org",
+            page_url="https://hudsonriverpark.org/pier-25-marina/",
+            company_name="Pier 25 Marina",
+            page_title="Pier 25 Marina",
+            email="marina@hudsonriverpark.org",
+        ),
+        _row(
+            _domain="hudsonriverpark.org",
+            page_url="https://hudsonriverpark.org/pier-30-cafe/",
+            company_name="Pier 30 Cafe",
+            page_title="Pier 30 Cafe",
+            email="cafe@hudsonriverpark.org",
+        ),
+    ]
+    businesses = to_business_level(pages)
+    # KNOWN DEFECT: this should be 2 (two distinct businesses); it is 1.
+    assert len(businesses) == 1
+    assert "cafe@hudsonriverpark.org" in businesses[0]["email"]  # leaked onto the other business
+
+
 def test_off_domain_email_dropped_when_own_domain_email_exists():
     """A genuinely unrelated, off-domain, non-free-webmail email (e.g. a
     mis-parsed leak from unrelated body text) is dropped in favor of the

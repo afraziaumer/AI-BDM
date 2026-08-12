@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 SCHEMA_VERSION = "1.0"
 
@@ -56,7 +56,13 @@ class Target(BaseModel):
 
 
 class Limits(BaseModel):
-    max_prospects: int = Field(20, ge=1, le=500)
+    # None means "no override -- let the planner's own count stand" (see
+    # run_pipeline()'s `limit` docstring). Default stays 20 (not None) so
+    # every EXISTING caller that doesn't touch this field keeps behaving
+    # exactly as before; only a caller that explicitly sets it to None
+    # (POST /api/v1/run-ai-bdm, when the caller didn't pass `count`) opts
+    # into "trust the query's own wording" instead.
+    max_prospects: Optional[int] = Field(20, ge=1, le=500)
     max_pages_per_domain: int = Field(20, ge=1, le=100)
 
 
@@ -72,9 +78,26 @@ class JobRequest(BaseModel):
     tenant_ref: str = Field(..., min_length=1)
     correlation_id: str = Field(..., min_length=1)
     requested_at: datetime
-    target: Target
+    # Exactly one of these two is required (see _exactly_one_of_target_or_
+    # raw_query below). `target` is the original Section 4.3 structured
+    # shape. `raw_query` is an additive bypass for callers that already
+    # have one natural-language sentence (e.g. POST /api/v1/run-ai-bdm)
+    # and would otherwise have it destructively re-templated by
+    # target_to_query() if forced through target.industry.
+    target: Optional[Target] = None
+    raw_query: Optional[str] = Field(
+        None, min_length=3,
+        description="Natural-language query passed to the planner verbatim, "
+                     "bypassing target->query templating entirely.",
+    )
     limits: Limits = Field(default_factory=Limits)
     features: Features = Field(default_factory=Features)
+
+    @model_validator(mode="after")
+    def _exactly_one_of_target_or_raw_query(self) -> "JobRequest":
+        if (self.target is None) == (self.raw_query is None):
+            raise ValueError("Exactly one of `target` or `raw_query` must be provided.")
+        return self
 
 
 # ===========================================================================

@@ -29,7 +29,10 @@ from typing import Any, Dict, List
 from phase1_pipeline import CONTACT_SEP, _valid_email
 from data_pipeline import _email_is_own
 from domain_utils import safe_domain_component
+from phase3 import store
 from phase3.config import REVIEWS_SUBDIR, STORAGE_ROOT
+from phase3.google_maps import PLATFORM as MAPS_PLATFORM
+from phase3.google_maps import _looks_like_match as _maps_address_overlaps
 from phase3.review_harvester import _tokens
 
 LEADS_WITH_MAPS = "leads_with_maps.csv"
@@ -133,7 +136,9 @@ def _iter_review_records(domain: str):
             yield record
 
 
-def check_identity_consistency(domain: str, company_name: str, page_title: str) -> List[str]:
+def check_identity_consistency(
+    domain: str, company_name: str, page_title: str, physical_address: str = "",
+) -> List[str]:
     flags: List[str] = []
 
     if page_title and page_title != "N/A":
@@ -142,6 +147,39 @@ def check_identity_consistency(domain: str, company_name: str, page_title: str) 
             flags.append(
                 f"the website's own page title barely matches the company name "
                 f"({overlap:.0%} word overlap) -- title was {page_title!r}"
+            )
+
+    # google_maps.json is deliberately excluded from _iter_review_records
+    # (it's keyed "title", not "business_name" -- see that function's
+    # docstring), which meant a Maps listing matched via address or phone
+    # (not name) never got its NAME cross-checked against company_name at
+    # all here -- a business matched by address/phone can legitimately have
+    # a materially different name (rebrand, chain listing, wrong nearby
+    # business at a shared address) and nothing flagged it. Checked
+    # separately here instead of folding into _iter_review_records, since
+    # it isn't a platform review record and needs its own field names.
+    maps_record = store.load(domain, MAPS_PLATFORM)
+    if maps_record and maps_record.get("matched"):
+        maps_title = maps_record.get("title") or ""
+        if maps_title:
+            overlap = _name_overlap(company_name, maps_title)
+            if overlap < NAME_OVERLAP_MIN:
+                flags.append(
+                    f"google_maps listing name barely matches the company name "
+                    f"({overlap:.0%} word overlap) -- listing was {maps_title!r}, "
+                    f"possibly a different business (matched via "
+                    f"{maps_record.get('match_basis', '?')})"
+                )
+        maps_address = maps_record.get("address") or ""
+        if (
+            maps_address and physical_address and physical_address != "N/A"
+            and not _maps_address_overlaps(maps_address, physical_address)
+        ):
+            flags.append(
+                f"google_maps listing address shares no distinctive word with "
+                f"the website's own address -- website: {physical_address!r}, "
+                f"maps: {maps_address!r} (matched via "
+                f"{maps_record.get('match_basis', '?')})"
             )
 
     for record in _iter_review_records(domain):
@@ -266,7 +304,9 @@ def run(geo: str = "", path: str = "") -> None:
 
         flags: List[str] = []
         flags += [f"[field]    {f}" for f in check_field_validity(row)]
-        flags += [f"[identity] {f}" for f in check_identity_consistency(domain, company_name, page_title)]
+        flags += [f"[identity] {f}" for f in check_identity_consistency(
+            domain, company_name, page_title, row.get("physical_address", ""),
+        )]
         flags += [f"[review]   {f}" for f in check_review_relevance(domain, company_name, geo)]
 
         if flags:

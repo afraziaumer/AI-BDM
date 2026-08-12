@@ -17,6 +17,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+import pytest  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
 import job_contracts as jc  # noqa: E402
 from job_translation import target_to_query  # noqa: E402
 
@@ -113,3 +116,48 @@ def test_no_warnings_for_a_fully_honorable_request():
     )
     _, warnings = target_to_query(req)
     assert warnings == []
+
+
+def test_raw_query_bypasses_templating_entirely():
+    """The gap found for the Laravel POST /api/v1/run-ai-bdm integration:
+    forcing a natural-language sentence through target.industry would
+    mangle it (e.g. "5 marinas in Dubai with no CRM" becoming industry text
+    inside "find {count} {industry} businesses..."). raw_query must be
+    passed to the planner completely verbatim, with no warnings."""
+    req = jc.JobRequest(
+        job_id="job_raw", tenant_ref="run-ai-bdm", correlation_id="job_raw",
+        requested_at=jc.utc_now(),
+        raw_query="5 marinas in Dubai with no CRM",
+    )
+    query, warnings = target_to_query(req)
+    assert query == "5 marinas in Dubai with no CRM"
+    assert warnings == []
+
+
+def test_target_and_raw_query_both_set_is_rejected():
+    with pytest.raises(ValidationError):
+        jc.JobRequest(
+            job_id="job_bad", tenant_ref="t", correlation_id="job_bad",
+            requested_at=jc.utc_now(),
+            target=jc.Target(industry="marinas"),
+            raw_query="5 marinas in Dubai",
+        )
+
+
+def test_neither_target_nor_raw_query_is_rejected():
+    with pytest.raises(ValidationError):
+        jc.JobRequest(
+            job_id="job_bad2", tenant_ref="t", correlation_id="job_bad2",
+            requested_at=jc.utc_now(),
+        )
+
+
+def test_none_max_prospects_omits_count_instead_of_rendering_none():
+    """Limits.max_prospects became Optional so /run-ai-bdm can opt out of
+    the hard default-20 cap and let the query's own wording ("find 50
+    marinas...") govern -- confirm the None case renders a clean sentence,
+    not the literal string "find None dental clinics businesses"."""
+    req = _minimal_request(limits=jc.Limits(max_prospects=None))
+    query, _ = target_to_query(req)
+    assert query == "find dental clinics businesses"
+    assert "None" not in query

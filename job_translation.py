@@ -31,6 +31,12 @@ def target_to_query(req: JobRequest) -> Tuple[str, List[str]]:
     top-level `warnings` list rather than pretend the request was fully
     satisfied.
     """
+    if req.raw_query is not None:
+        # Caller already supplied one natural-language sentence (e.g.
+        # POST /api/v1/run-ai-bdm) -- pass it straight to the planner
+        # instead of destructively re-templating it through target.industry.
+        return req.raw_query, []
+
     warnings: List[str] = []
 
     industry = req.target.industry.strip()
@@ -105,5 +111,9 @@ def target_to_query(req: JobRequest) -> Tuple[str, List[str]]:
             "is not yet honored per-job."
         )
 
-    query = f"find {count} {industry} businesses{location_phrase}{tech_stack_hint}".strip()
+    # count can be None here (Limits.max_prospects now accepts None -- see
+    # job_contracts.py) if a structured-target caller explicitly opts out
+    # of a hard cap; omit the number rather than render "find None ...".
+    count_phrase = f"{count} " if count is not None else ""
+    query = f"find {count_phrase}{industry} businesses{location_phrase}{tech_stack_hint}".strip()
     return query, warnings

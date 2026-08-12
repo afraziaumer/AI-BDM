@@ -28,6 +28,11 @@ Endpoints:
   POST /api/v1/jobs/{job_id}/resume - submit a new job resuming this one's
                                        target/limits/features (Section 4.5's
                                        "Checkpoint" requirement)
+  POST /api/v1/run-ai-bdm         - submit {"query": "..."} as an async job
+                                     (thin wrapper over /jobs for a caller
+                                     that has one sentence, not a structured
+                                     target -- see LARAVEL_QUICKSTART.md)
+  GET  /api/v1/ai-bdm/{job_id}    - progress while running, results once done
 
 The /jobs/* routes and /pipeline/run are two INDEPENDENT ways to run the
 same underlying pipeline -- /pipeline/run blocks the HTTP request for the
@@ -35,6 +40,11 @@ whole run (fine for a quick manual call); /jobs/* returns immediately with
 a job_id and is meant for a caller that queues work and polls, per the
 guide's "long work must not be performed inside a public HTTP request"
 rule. Both exist; neither is deprecated by the other.
+
+run-ai-bdm/ai-bdm are NOT a third pipeline path -- they're a thin envelope
+over the exact same job_runner.py machinery /jobs already uses, for a
+caller with one natural-language sentence instead of a structured target.
+See docs/backend-handoff/LARAVEL_QUICKSTART.md for the full contract.
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ import hashlib
 import json
 import os
 import secrets
+import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Response, Security
@@ -52,7 +63,7 @@ from pydantic import BaseModel, Field
 
 import job_runner
 import phase1_pipeline as pipeline
-from job_contracts import JobRequest
+from job_contracts import JobRequest, Limits, utc_now
 
 app = FastAPI(
     title="AI BDM Platform - Phase 1 API",
@@ -89,6 +100,23 @@ class PipelineRequest(BaseModel):
         ..., min_length=3, examples=["give me 50 marinas in Dubai with no crm"]
     )
     concurrency: int = Field(5, ge=1, le=20, description="Parallel scrape workers.")
+
+
+class RunAiBdmRequest(BaseModel):
+    """Body for POST /api/v1/run-ai-bdm -- the thin, Laravel-facing entry
+    point. Deliberately just `query` (+ optional `count`), not the full
+    structured JobRequest shape /jobs expects: this exists specifically for
+    a caller that has one natural-language sentence (same shape
+    /pipeline/run already takes) and wants it run asynchronously instead
+    of holding the HTTP connection open for the whole scrape."""
+    query: str = Field(
+        ..., min_length=3, examples=["5 marinas in Dubai with no CRM"]
+    )
+    count: Optional[int] = Field(
+        None, ge=1, le=500,
+        description="Overrides how many businesses to find. Omit to let the "
+                     "query itself decide (e.g. 'find 50 marinas...' -> 50).",
+    )
 
 
 class ResumeRequest(BaseModel):
@@ -165,6 +193,20 @@ def _decode_cursor(cursor: Optional[str]) -> int:
 # deployment would want this backed by a real cache with expiry (e.g.
 # Redis), same caveat as job_runner.py's in-process job store.
 _idempotency_store: Dict[str, Dict[str, Any]] = {}
+
+# Real gap found live (professional QA suite, AI-BDM-334 "concurrent
+# same-key requests -- only one underlying operation should execute"):
+# _idempotency_store only ever holds a COMPLETED result, so two requests
+# with the SAME Idempotency-Key arriving truly concurrently (not
+# sequentially, e.g. a client firing a retry before the first attempt's
+# response even comes back) both pass the lookup-finds-nothing check and
+# both run the full pipeline -- reproduced live, call count 2 for 2
+# concurrent requests with one key. This set reserves a key for the
+# duration of an in-flight request (checked/set synchronously, with no
+# `await` between the check and the add, so it can't itself race within
+# one process) -- a concurrent duplicate is rejected with 409 instead of
+# triggering a second expensive run.
+_idempotency_inflight: set = set()
 
 
 def _fingerprint_request(payload: Dict[str, Any]) -> str:
@@ -280,24 +322,36 @@ async def run_pipeline_endpoint(
         response.status_code = cached["status_code"]
         return cached["body"]
 
-    summary = await pipeline.run_pipeline(
-        req.query, concurrency=req.concurrency
-    )
-    if summary.get("blocked"):
-        # Query rejected by the moderation gate -- a client-side problem
-        # with the REQUEST itself, not a server/upstream failure, so 400
-        # (not 502) is the correct status. Detail is deliberately short and
-        # generic -- the specific category/reason stays in the server log
-        # (see moderate_user_query), not handed back to the caller.
-        detail = "This request violates our usage policy and was not processed."
-        _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 400, {"detail": detail})
-        raise HTTPException(status_code=400, detail=detail)
-    if summary.get("error"):
-        # Intent/LLM stage failed (e.g. provider down) -> surface as 502.
-        _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 502, {"detail": summary["error"]})
-        raise HTTPException(status_code=502, detail=summary["error"])
-    _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 200, summary)
-    return summary
+    inflight_key = f"pipeline_run:{idempotency_key}" if idempotency_key else None
+    if inflight_key is not None:
+        if inflight_key in _idempotency_inflight:
+            raise HTTPException(
+                status_code=409,
+                detail="A request with this Idempotency-Key is already in progress.",
+            )
+        _idempotency_inflight.add(inflight_key)
+    try:
+        summary = await pipeline.run_pipeline(
+            req.query, concurrency=req.concurrency
+        )
+        if summary.get("blocked"):
+            # Query rejected by the moderation gate -- a client-side problem
+            # with the REQUEST itself, not a server/upstream failure, so 400
+            # (not 502) is the correct status. Detail is deliberately short and
+            # generic -- the specific category/reason stays in the server log
+            # (see moderate_user_query), not handed back to the caller.
+            detail = "This request violates our usage policy and was not processed."
+            _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 400, {"detail": detail})
+            raise HTTPException(status_code=400, detail=detail)
+        if summary.get("error"):
+            # Intent/LLM stage failed (e.g. provider down) -> surface as 502.
+            _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 502, {"detail": summary["error"]})
+            raise HTTPException(status_code=502, detail=summary["error"])
+        _idempotency_remember("pipeline_run", idempotency_key, fingerprint, 200, summary)
+        return summary
+    finally:
+        if inflight_key is not None:
+            _idempotency_inflight.discard(inflight_key)
 
 
 @router.get("/leads", response_model=LeadsPage, tags=["leads"],
@@ -412,6 +466,102 @@ async def resume_job(job_id: str, req: ResumeRequest) -> Dict[str, Any]:
     except job_runner.DuplicateJobError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return job_runner.get_status(req.job_id)
+
+
+# --- Thin Laravel entry point ------------------------------------------------
+# Both routes below are pure reshaping over the EXISTING job_runner
+# machinery above (submit_job/get_status/get_result) -- no new pipeline
+# logic, no new job store, no new progress tracking. They exist only
+# because /jobs' JobRequest wants a structured `target.industry` +
+# `target.locations`, not the one-sentence `{"query": "..."}` shape a
+# Laravel caller has; `raw_query` (job_contracts.py) bypasses that
+# templating instead of re-deriving it. See docs/backend-handoff/
+# LARAVEL_QUICKSTART.md for the caller-facing contract.
+def _job_id_for_run_ai_bdm() -> str:
+    return f"aibdm_{uuid.uuid4().hex[:20]}"
+
+
+@router.post("/run-ai-bdm", status_code=202, tags=["jobs"], dependencies=[Depends(require_api_key)])
+async def run_ai_bdm(req: RunAiBdmRequest) -> Dict[str, Any]:
+    """Submit the pipeline for `req.query` as a background job and return
+    immediately with its job_id -- the async entry point requested for the
+    Laravel integration. Poll GET /api/v1/ai-bdm/{job_id} for progress and
+    the eventual result.
+    """
+    job_id = _job_id_for_run_ai_bdm()
+    job_req = JobRequest(
+        job_id=job_id,
+        tenant_ref="run-ai-bdm",
+        correlation_id=job_id,
+        requested_at=utc_now(),
+        raw_query=req.query,
+        limits=Limits(max_prospects=req.count),
+    )
+    job_runner.submit_job(job_req)
+    status = job_runner.get_status(job_id)
+    return {"success": True, "job_id": job_id, "status": status["status"]}
+
+
+@router.get("/ai-bdm/{job_id}", tags=["jobs"], dependencies=[Depends(require_api_key)])
+async def ai_bdm_status(job_id: str) -> Dict[str, Any]:
+    """Status/progress while running; results once terminal. Same envelope
+    shape (`success`/`job_id`/`status`) on every response so a caller can
+    branch on one field regardless of where the job currently is.
+    """
+    try:
+        status = job_runner.get_status(job_id)
+    except job_runner.JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}") from exc
+
+    if status["status"] in ("queued", "running"):
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": status["status"],
+            "progress": {
+                "stage": status["stage"],
+                "completed": status["completed_units"],
+                "total": status["total_units"],
+                "message": status["message_code"],
+            },
+        }
+
+    result = job_runner.get_result(job_id)
+    if result.status.value in ("failed", "cancelled"):
+        error_message = (
+            result.errors[0].message if result.errors
+            else f"Job ended with status {result.status.value!r}."
+        )
+        return {
+            "success": False,
+            "job_id": job_id,
+            "status": result.status.value,
+            "error": error_message,
+        }
+
+    results = [
+        {
+            "company_name": p.company.name,
+            "website": p.company.website,
+            "domain": p.source_identity.domain,
+            "score": p.score.value,
+        }
+        for p in result.prospects
+    ]
+    body: Dict[str, Any] = {
+        "success": True,
+        "job_id": job_id,
+        "status": result.status.value,
+        "results": results,
+    }
+    if result.warnings:
+        # Covers both genuine warnings (e.g. an unhonored feature flag) AND
+        # status == "awaiting_input", whose clarification questions are
+        # threaded through as warnings by job_runner._build_result() --
+        # surfaced here rather than silently dropped just because this
+        # envelope is a reshape of the richer JobResult.
+        body["warnings"] = result.warnings
+    return body
 
 
 app.include_router(router)

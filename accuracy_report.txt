@@ -1,40 +1,12 @@
 Accuracy check report
 Source file: leads_with_maps.csv
-Businesses audited: 3
+Businesses audited: 5
 Businesses with at least one flag: 2
-Total flags: 30
+Total flags: 2
 ======================================================================
 
-=== GharPar.co: Beauty Salon Services at Home in Pakistan (gharpar.co) -- 14 flag(s) ===
-  - [field]    address has no house/street number at all: Pakistan, Punjab, PK
-  - [review]   reddit review #1 never mentions the business name or geo -- possibly unrelated chatter: "Salons (for women) in commercial market with economic rates and good services An..."
-  - [review]   reddit review #4 never mentions the business name or geo -- possibly unrelated chatter: "Tony & Guy..."
-  - [review]   reddit review #6 never mentions the business name or geo -- possibly unrelated chatter: "Numras in DHA or Cantt..."
-  - [review]   reddit review #8 never mentions the business name or geo -- possibly unrelated chatter: "Canvas. Pretty good and reasonable price..."
-  - [review]   reddit review #12 never mentions the business name or geo -- possibly unrelated chatter: "Samiya's , Muniba's both are good and located in Gulberg..."
-  - [review]   reddit review #13 never mentions the business name or geo -- possibly unrelated chatter: "717..."
-  - [review]   reddit review #14 never mentions the business name or geo -- possibly unrelated chatter: "Andy harrison..."
-  - [review]   reddit review #16 never mentions the business name or geo -- possibly unrelated chatter: "Interested..."
-  - [review]   reddit review #17 never mentions the business name or geo -- possibly unrelated chatter: "Please send your CV and any relevant work experience via Reddit DM. Thanks!..."
-  - [review]   reddit review #18 never mentions the business name or geo -- possibly unrelated chatter: "I'm an undergrad student, I have related experience, am I eligible to apply for ..."
-  - [review]   reddit review #20 never mentions the business name or geo -- possibly unrelated chatter: "Honey trap..."
-  - [review]   reddit review #21 never mentions the business name or geo -- possibly unrelated chatter: "It’s a genuine job posting. If it’s not for you, no worries...."
-  - [review]   reddit review #24 never mentions the business name or geo -- possibly unrelated chatter: "You don't need a degree for that shit..."
+=== Tag: oregon (loveyogastudios.com) -- 1 flag(s) ===
+  - [identity] the website's own page title barely matches the company name (0% word overlap) -- title was 'Love Yoga Studios'
 
-=== Shelby's & Co. (shelbysandco.com) -- 16 flag(s) ===
-  - [review]   reddit review #2 never mentions the business name or geo -- possibly unrelated chatter: "do not take any files, only possession able plot. you can also take a commercial..."
-  - [review]   reddit review #4 never mentions the business name or geo -- possibly unrelated chatter: "Have you considered going a bit into commercial instead of just residential? Giv..."
-  - [review]   reddit review #5 never mentions the business name or geo -- possibly unrelated chatter: "I like your thought process. Only thing is i won't be renting out residential pl..."
-  - [review]   reddit review #7 never mentions the business name or geo -- possibly unrelated chatter: "Askari 10 and 11 is a great place for buying home. No qabza possible there. I wo..."
-  - [review]   reddit review #8 never mentions the business name or geo -- possibly unrelated chatter: "Very helpful. Appreciate you taking the time to share this...."
-  - [review]   reddit review #9 never mentions the business name or geo -- possibly unrelated chatter: "Forgot to add - Askari is entirely gated community, no outsiders allowed unless ..."
-  - [review]   reddit review #10 never mentions the business name or geo -- possibly unrelated chatter: "Well, this is really a critical thing and a lot of things need to be checked bef..."
-  - [review]   reddit review #11 never mentions the business name or geo -- possibly unrelated chatter: "Appreciate the information Please do share the contact info...."
-  - [review]   reddit review #12 never mentions the business name or geo -- possibly unrelated chatter: "Appreciate the information Please do share the contact info...."
-  - [review]   reddit review #14 never mentions the business name or geo -- possibly unrelated chatter: "According to your budget go with phase 9. But according to good place to live go..."
-  - [review]   reddit review #15 never mentions the business name or geo -- possibly unrelated chatter: "dont buy in phase 9 town. Choose lake city meadows right next to it instead or a..."
-  - [review]   reddit review #16 never mentions the business name or geo -- possibly unrelated chatter: "I've seen farmhouses on barki road. My main concern was the safety aspect of it...."
-  - [review]   reddit review #17 never mentions the business name or geo -- possibly unrelated chatter: "So many houses in Bahria are of overseas people. They usually have a caretaker g..."
-  - [review]   reddit review #18 never mentions the business name or geo -- possibly unrelated chatter: "How much it costs to have a caretaker guy for a whole year & does that guy stays..."
-  - [review]   reddit review #19 never mentions the business name or geo -- possibly unrelated chatter: "Appreciate your response! Would you have any recommendations for dha specificall..."
-  - [review]   reddit review #23 never mentions the business name or geo -- possibly unrelated chatter: "Lmao dont go to gwadar, the plots there are going for peanuts..."
+=== Web Design for Yoga Studios in Oregon City, OR (codinito.com) -- 1 flag(s) ===
+  - [field]    address has no house/street number at all: US
