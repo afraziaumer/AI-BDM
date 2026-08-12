@@ -77,6 +77,22 @@ logger = logging.getLogger("ai_bdm.main")
 MAX_CLARIFICATION_ROUNDS = 3
 
 
+def _is_zero_signal_plan(plan: Dict) -> bool:
+    """True when the planner found literally no usable lead-gen signal at
+    all -- industry, location, AND search query all blank -- as opposed to
+    a genuine but under-specified request (e.g. "find some dental clinics"
+    has an industry, just no location). Both cases set needs_clarification,
+    but they aren't the same situation: one just needs a detail filled in,
+    the other isn't a business search at all (e.g. "basit goes to work").
+    Distinguishing them lets the clarification message be honest instead
+    of implying every input was "almost there."""
+    return not (
+        (plan.get("broad_industry") or "").strip()
+        or (plan.get("geo_location") or "").strip()
+        or (plan.get("search_query") or "").strip()
+    )
+
+
 async def _plan_interactively(query: str, concurrency: int) -> Dict:
     """Run Step 1+2 (p1.run_pipeline), resolving clarification questions in
     THIS terminal session before any real discovery/scraping happens --
@@ -103,10 +119,24 @@ async def _plan_interactively(query: str, concurrency: int) -> Dict:
             return summary
 
         questions = summary.get("clarification_questions") or []
+        plan = summary.get("plan") or {}
         print("\n" + "=" * 64)
-        print("A bit more detail would help before I search:")
-        for i, q in enumerate(questions, start=1):
-            print(f"  {i}. {q}")
+        if _is_zero_signal_plan(plan):
+            # Real gap found live: "basit goes to work" (zero industry,
+            # location, or search-query signal at all) got the exact same
+            # "a bit more detail would help" framing as a genuine but
+            # under-specified request like "find some dental clinics"
+            # (which DOES have an industry, just no location) -- misleading
+            # the user into thinking their input was on the right track
+            # when the planner found literally nothing usable. Distinguish
+            # the two cases honestly instead of treating them identically.
+            print("I couldn't find a business/lead-generation request in that.")
+            print('This tool searches for businesses by industry and location --')
+            print('for example: "find 10 dental clinics in Austin, Texas".')
+        else:
+            print("A bit more detail would help before I search:")
+            for i, q in enumerate(questions, start=1):
+                print(f"  {i}. {q}")
         print("=" * 64)
 
         if round_num == MAX_CLARIFICATION_ROUNDS:
