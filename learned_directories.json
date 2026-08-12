@@ -1,0 +1,18 @@
+{
+  "yoga.com": {
+    "reason": "The homepage lists multiple yoga studios with details such as hours, styles, pricing, and reviews, indicating it serves as a directory of businesses rather than a single business’s official site. It contains no unique business content beyond the listings, so the crawler should extract the individual",
+    "learned_at": 1786514912.828159
+  },
+  "howmuchtostart.com": {
+    "reason": "The site provides informational content about starting a yoga studio, not a directory of multiple businesses or a single business’s official site. It offers guides, calculators, and FAQs rather than listings, so it should not be deep‑crawled for business intelligence.",
+    "learned_at": 1786515063.1461983
+  },
+  "oregon.gov": {
+    "reason": "The site is the official Oregon Secretary of State portal, a government website providing public services and information, not a business directory or marketplace. It does not list businesses for extraction, so it should be rejected for deep crawling.",
+    "learned_at": 1786515071.8466132
+  },
+  "sba.gov": {
+    "reason": "The site is the U.S. Small Business Administration, a federal government agency providing resources and information. It is not a single business, nor a directory or marketplace of businesses. Therefore it should be rejected for deep crawling.",
+    "learned_at": 1786515079.217628
+  }
+}
